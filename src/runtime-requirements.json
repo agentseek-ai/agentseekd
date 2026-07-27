@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "versions": {
+    "uv": { "minimum": "0.7.0" },
+    "node": { "minimum": "24.18.0", "managed": "24.18.0" },
+    "npm": { "minimum": "11.16.0", "managed": "11.16.0" },
+    "git": { "minimum": "2.30.0" },
+    "agentseek": { "minimum": "0.0.4" },
+    "nvm": { "managed": "0.40.3" }
+  },
+  "sources": {
+    "uvInstaller": "https://astral.sh/uv/install.sh",
+    "uvInstallerWindows": "https://astral.sh/uv/install.ps1",
+    "nvmInstallerTemplate": "https://raw.githubusercontent.com/nvm-sh/nvm/v{version}/install.sh",
+    "nodeDistribution": "https://nodejs.org/dist",
+    "agentseekPackageMetadata": "https://pypi.org/pypi/agentseek/json"
+  }
+}
