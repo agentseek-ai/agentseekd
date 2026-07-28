@@ -13,6 +13,9 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -58,6 +61,7 @@ jobs:
         run: npm ci
 
       - uses: tauri-apps/tauri-action@v0
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -67,6 +71,10 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Build Tauri app (no release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npx tauri build ${{ matrix.args }}
 
       - name: Upload build artifacts
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
