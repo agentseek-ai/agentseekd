@@ -617,6 +617,18 @@ cleanup_instance() {
   kill_tree "$dev_pid"
   wait "$dev_pid" 2>/dev/null || true
 
+  # Stop and remove Docker containers/networks to free ports for the next template.
+  # agentseek dev may leave seekdb containers running on port 2881.
+  if [[ -n "$instance_dir" && -d "$instance_dir" ]]; then
+    (cd "$instance_dir" && docker compose down --volumes --remove-orphans 2>/dev/null) || true
+  fi
+  # Fallback: remove any lingering containers with the instance directory name.
+  local dir_basename
+  dir_basename=$(basename "$instance_dir" 2>/dev/null || echo "")
+  if [[ -n "$dir_basename" ]]; then
+    docker ps -aq --filter "name=${dir_basename}" | xargs -r docker rm -f 2>/dev/null || true
+  fi
+
   # Kill any lingering processes from the instance directory.
   if [[ -n "$instance_dir" && -d "$instance_dir" ]]; then
     local pids
