@@ -712,9 +712,11 @@ test_template() {
 
   # Step 3: Install dependencies by running all lifecycle tasks.
   # `agentseek task --list` shows available tasks; each task is run by name.
-  # Critical tasks (sync, frontend, models, seekdb) must succeed.
-  # Non-critical tasks (ingest-sample, seekdb-skills) only produce a warning.
-  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills"
+  # Critical tasks (sync, models, seekdb) must succeed.
+  # Non-critical tasks (frontend, ingest-sample, seekdb-skills) only produce a warning.
+  # frontend is non-critical because E2E tests the API conversation, not the UI;
+  # some templates reference npm packages that may not exist yet (e.g. @copilotkit).
+  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills|frontend"
   log_info "  Installing dependencies..."
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
