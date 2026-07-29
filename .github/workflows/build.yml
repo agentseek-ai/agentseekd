@@ -98,7 +98,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -106,7 +106,7 @@ jobs:
         run: pipx install agentseek --python python3.12
 
       - name: Install uv (Python package manager)
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v8
         with:
           version: latest
 
