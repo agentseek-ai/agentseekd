@@ -111,20 +111,19 @@ function mockLog(store: MockStore, instance: InstanceRecord | null, category: Lo
 }
 
 const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-const mockText = (zh: string, en: string) => (localStorage.getItem("agentseek-language") === "en" ? en : zh);
 
 export const desktopApi = {
   async openExternalUrl(url: string): Promise<void> {
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new Error(mockText("只允许打开 HTTP 或 HTTPS 地址。", "Only HTTP and HTTPS URLs can be opened."));
+      throw new Error("Only HTTP and HTTPS URLs can be opened.");
     }
     if (isTauri()) {
       await openUrl(parsed.toString());
       return;
     }
     const opened = window.open(parsed.toString(), "_blank", "noopener,noreferrer");
-    if (!opened) throw new Error(mockText("浏览器阻止了新窗口。", "The browser blocked the new window."));
+    if (!opened) throw new Error("The browser blocked the new window.");
   },
 
   async cliStatus(checkLatest = true): Promise<CliStatus> {
@@ -196,14 +195,14 @@ export const desktopApi = {
   async prepareInstance(input: PrepareInstanceInput): Promise<PrepareInstanceResult> {
     if (isTauri()) return invoke("prepare_instance", { input });
     void input;
-    throw new Error(mockText("浏览器预览不能执行本地 CLI 或写入目录，请使用 Tauri 桌面端。", "The browser preview cannot run the local CLI or write files. Use the Tauri desktop app."));
+    throw new Error("The browser preview cannot run the local CLI or write files. Use the Tauri desktop app.");
   },
 
   async loadInstanceEnv(instanceId: string): Promise<EnvVariable[]> {
     if (isTauri()) return invoke("load_instance_env", { instanceId });
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId);
-    if (!instance) throw new Error(mockText("实例不存在", "Instance not found"));
+    if (!instance) throw new Error("Instance not found");
     return store.vault.map((entry) => ({ ...entry, source: "vault", modified: false }));
   },
 
@@ -211,7 +210,7 @@ export const desktopApi = {
     if (isTauri()) return invoke("save_instance_env", { input: { instanceId, entries, overwrite } });
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId);
-    if (!instance) throw new Error(mockText("实例不存在", "Instance not found"));
+    if (!instance) throw new Error("Instance not found");
     if (instance.envPath && !overwrite) throw new Error(`ENV_FILE_EXISTS:${instance.envPath}`);
     const changed = entries.filter((entry) => entry.modified);
     for (const entry of changed) {
@@ -229,10 +228,7 @@ export const desktopApi = {
       instance,
       "config",
       "success",
-      mockText(
-        `已生成 ${instance.envPath}（${entries.length} 个 key，同步 ${changed.length} 个到保险箱）`,
-        `Generated ${instance.envPath} (${entries.length} keys, synced ${changed.length} to the vault)`,
-      ),
+      `Generated ${instance.envPath} (${entries.length} keys, synced ${changed.length} to the vault)`,
     );
     saveMock(store);
     return {
@@ -249,13 +245,13 @@ export const desktopApi = {
     if (isTauri()) return invoke("continue_install", { instanceId });
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId);
-    if (!instance) throw new Error(mockText("实例不存在", "Instance not found"));
+    if (!instance) throw new Error("Instance not found");
     instance.status = "installing";
     saveMock(store);
     await wait(900);
-    mockLog(store, instance, "execution", "success", mockText("backend / frontend tasks 执行完成", "backend / frontend tasks completed"), "uvx agentseek task backend && uvx agentseek task frontend");
-    mockLog(store, instance, "execution", "success", mockText("Doctor 检查通过：0 failed", "Doctor passed: 0 failed"), "uvx agentseek doctor");
-    mockLog(store, instance, "install", "success", mockText("实例启动成功", "Instance started successfully"), "uvx agentseek dev");
+    mockLog(store, instance, "execution", "success", "backend / frontend tasks completed", "uvx agentseek task backend && uvx agentseek task frontend");
+    mockLog(store, instance, "execution", "success", "Doctor passed: 0 failed", "uvx agentseek doctor");
+    mockLog(store, instance, "install", "success", "Instance started successfully", "uvx agentseek dev");
     instance.status = "running";
     instance.updatedAt = Math.floor(Date.now() / 1000);
     instance.agentUrl = "http://127.0.0.1:8089";
@@ -279,10 +275,10 @@ export const desktopApi = {
     if (isTauri()) return invoke("stop_instance", { instanceId });
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId);
-    if (!instance) throw new Error(mockText("实例不存在", "Instance not found"));
+    if (!instance) throw new Error("Instance not found");
     instance.status = "stopped";
     instance.updatedAt = Math.floor(Date.now() / 1000);
-    mockLog(store, instance, "install", "success", mockText("实例已停止", "Instance stopped"));
+    mockLog(store, instance, "install", "success", "Instance stopped");
     saveMock(store);
     return instance;
   },
@@ -291,12 +287,12 @@ export const desktopApi = {
     if (isTauri()) return invoke("restart_instance", { instanceId });
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId);
-    if (!instance) throw new Error(mockText("实例不存在", "Instance not found"));
+    if (!instance) throw new Error("Instance not found");
     await wait(500);
     instance.status = "running";
     instance.needsDoctor = false;
     instance.updatedAt = Math.floor(Date.now() / 1000);
-    mockLog(store, instance, "execution", "success", mockText("Doctor 通过，实例已重启", "Doctor passed; instance restarted"), "uvx agentseek doctor && uvx agentseek dev");
+    mockLog(store, instance, "execution", "success", "Doctor passed; instance restarted", "uvx agentseek doctor && uvx agentseek dev");
     saveMock(store);
     return instance;
   },
@@ -317,7 +313,7 @@ export const desktopApi = {
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId) ?? null;
     store.instances = store.instances.filter((item) => item.id !== instanceId);
-    mockLog(store, instance, "install", "success", mockText("实例进程、工作目录及记录已删除", "Instance processes, working directory, and record deleted"));
+    mockLog(store, instance, "install", "success", "Instance processes, working directory, and record deleted");
     saveMock(store);
   },
 
@@ -339,7 +335,7 @@ export const desktopApi = {
   async saveLogSettings(settings: LogSettings): Promise<LogSettings> {
     if (isTauri()) return invoke("save_log_settings", { settings });
     if (!Number.isInteger(settings.runtimeRetentionDays) || settings.runtimeRetentionDays < 1 || settings.runtimeRetentionDays > 3650) {
-      throw new Error(mockText("运行日志保留天数必须在 1 到 3650 天之间", "Runtime log retention must be between 1 and 3650 days"));
+      throw new Error("Runtime log retention must be between 1 and 3650 days");
     }
     localStorage.setItem(mockLogSettingsKey, String(settings.runtimeRetentionDays));
     const store = loadMock();
@@ -355,7 +351,7 @@ export const desktopApi = {
     const existing = store.vault.find((item) => item.key === imported.key);
     if (existing) Object.assign(existing, imported);
     else store.vault.push(imported);
-    mockLog(store, null, "config", "success", mockText(`从 ${path} 导入 1 个变量`, `Imported 1 variable from ${path}`));
+    mockLog(store, null, "config", "success", `Imported 1 variable from ${path}`);
     saveMock(store);
     return 1;
   },

@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    # Run E2E tests nightly at 02:00 UTC.
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 env:
@@ -17,7 +20,102 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm run test
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+  e2e:
+    runs-on: ubuntu-22.04
+    needs: test
+    # E2E tests run nightly or on manual dispatch. No secrets required —
+    # the script auto-starts a Mock API server when no API key is provided.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Install agentseek CLI
+        run: pipx install agentseek
+
+      - name: Verify Docker (for Docker-dependent templates)
+        run: docker info
+
+      - name: Run E2E template tests
+        # No secrets required — the script auto-starts a Mock API server
+        # when no real API key is available.
+        # Docker is available on CI runners, so Docker-dependent templates
+        # (langchain/default, langchain/agentic-rag, langchain/agentic-rag-hybrid,
+        #  langchain/agentic-rag-openvino) are tested.
+        # langchain/agentic-rag-openvino downloads small models via `agentseek task models`.
+        # deepagents/sandbox is tested when DAYTONA_API_KEY is provided (free at app.daytona.io).
+        env:
+          # Optional: provide real API keys for testing actual LLM responses.
+          # If unset, the built-in Mock API server is used (zero cost).
+          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+          E2E_API_BASE: ${{ secrets.E2E_API_BASE }}
+          E2E_MODEL: ${{ secrets.E2E_MODEL }}
+          TAVILY_API_KEY: ${{ secrets.E2E_TAVILY_API_KEY }}
+          # Optional: provide a Daytona API key to test deepagents/sandbox.
+          # Get a free key at https://app.daytona.io/
+          # If unset, deepagents/sandbox is skipped.
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          # Skip templates that need local hardware or external services.
+          SKIP_CI_ONLY: 1
+        run: npm run test:e2e
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

@@ -3,6 +3,8 @@ import {
   Boxes,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   CircleStop,
   Container,
@@ -222,10 +224,8 @@ function statusTone(status: string) {
   return "ready";
 }
 
-// Templates whose install buttons are temporarily disabled.
-// All langchain/* templates are disabled until their integration is ready.
-const isTemplateInstallDisabled = (template: TemplateInfo) =>
-  template.id.startsWith("langchain/");
+/// Number of log groups displayed per page in the log center.
+const LOGS_PER_PAGE = 10;
 
 export default function App() {
   const [page, setPage] = useState<Page>("instances");
@@ -235,7 +235,6 @@ export default function App() {
   const [instances, setInstances] = useState<InstanceRecord[]>([]);
   const [vault, setVault] = useState<EnvVariable[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logsHasMore, setLogsHasMore] = useState(false);
   const [logGroupCount, setLogGroupCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshingTemplates, setRefreshingTemplates] = useState(false);
@@ -280,6 +279,7 @@ export default function App() {
   const [runtimeRetentionDays, setRuntimeRetentionDays] = useState(7);
   const [logSettingsBusy, setLogSettingsBusy] = useState(false);
   const [expandedLogGroups, setExpandedLogGroups] = useState<Set<string>>(new Set());
+  const [logPage, setLogPage] = useState(1);
   const [importOpen, setImportOpen] = useState(false);
   const [importPath, setImportPath] = useState("");
   const [exportOpen, setExportOpen] = useState(false);
@@ -347,7 +347,6 @@ export default function App() {
     setInstances(nextInstances);
     setVault(nextVault);
     setLogs(nextLogPage.entries);
-    setLogsHasMore(nextLogPage.hasMore);
     setLogGroupCount(nextLogPage.groupCount);
     latestLogSequenceRef.current = Math.max(0, ...nextLogPage.entries.map((entry) => logSequence(entry)));
     setSelectedConfigId((current) => nextInstances.some((instance) => instance.id === current) ? current : nextInstances[0]?.id || "");
@@ -356,7 +355,6 @@ export default function App() {
   const refreshLatestLogs = useCallback(async () => {
     const page = await desktopApi.listLogs({ limit: 500 });
     setLogs(page.entries);
-    setLogsHasMore(page.hasMore);
     setLogGroupCount(page.groupCount);
     latestLogSequenceRef.current = Math.max(0, ...page.entries.map((entry) => logSequence(entry)));
   }, []);
@@ -437,6 +435,10 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
+    setLogPage(1);
+  }, [logCategory, logInstance]);
+
+  useEffect(() => {
     if (page !== "logs") return;
     let active = true;
     let polling = false;
@@ -484,7 +486,6 @@ export default function App() {
       setRuntimeRetentionDays(saved.runtimeRetentionDays);
       const page = await desktopApi.listLogs({ limit: 500 });
       setLogs(page.entries);
-      setLogsHasMore(page.hasMore);
       setLogGroupCount(page.groupCount);
       latestLogSequenceRef.current = Math.max(0, ...page.entries.map((entry) => logSequence(entry)));
       notify(tr("retentionSaved"));
@@ -492,22 +493,6 @@ export default function App() {
       notify(errorMessage(error));
     } finally {
       setLogSettingsBusy(false);
-    }
-  };
-
-  const loadOlderLogs = async () => {
-    const oldest = Math.min(...logs.map((entry) => logSequence(entry)));
-    if (!Number.isFinite(oldest)) return;
-    try {
-      const page = await desktopApi.listLogs({ beforeSequence: oldest, limit: 500 });
-      setLogs((current) => {
-        const known = new Set(current.map((entry) => entry.id));
-        return [...current, ...page.entries.filter((entry) => !known.has(entry.id))];
-      });
-      setLogsHasMore(page.hasMore);
-      setLogGroupCount(page.groupCount);
-    } catch (error) {
-      notify(errorMessage(error));
     }
   };
 
@@ -711,6 +696,13 @@ export default function App() {
       return (instanceB?.createdAt || 0) - (instanceA?.createdAt || 0);
     });
   }, [filteredLogs, instances]);
+
+  const totalLogPages = Math.max(1, Math.ceil(logGroups.length / LOGS_PER_PAGE));
+  const currentLogPage = Math.min(logPage, totalLogPages);
+  const paginatedLogGroups = logGroups.slice(
+    (currentLogPage - 1) * LOGS_PER_PAGE,
+    currentLogPage * LOGS_PER_PAGE,
+  );
 
   const lifecycleCount = logGroupCount;
 
@@ -1346,7 +1338,7 @@ export default function App() {
                     <div className={`framework-mark ${template.framework}`}>{template.framework.slice(0, 2).toUpperCase()}</div>
                     <div className="template-copy"><strong>{template.name}</strong><code>{template.id}</code><p>{template.description}</p></div>
                     <span className="framework-label">{template.framework}</span>
-                    <button className="button secondary" type="button" onClick={() => openInstall(template)} disabled={isTemplateInstallDisabled(template)}>{tr("install")}</button>
+                    <button className="button secondary" type="button" onClick={() => openInstall(template)}>{tr("install")}</button>
                   </div>
                 ))}
               </div>
@@ -1392,7 +1384,7 @@ export default function App() {
               </div>
               <div className={`log-head lifecycle-grid ${logCategory !== "all" ? "without-type" : ""}`}><span>{tr("time")}</span><span>{tr("instance")}</span>{logCategory === "all" && <span>{tr("lifecycle")}</span>}<span>{tr("status")}</span><span>{tr("latestEvent")}</span><span /></div>
               <div className="log-list lifecycle-list">
-                {logGroups.map((group) => {
+                {paginatedLogGroups.map((group) => {
                   const expanded = expandedLogGroups.has(group.id);
                   const inProgress = group.instanceStatus === "installing" || group.instanceStatus === "starting" || group.instanceStatus === "checking" || group.instanceStatus === "deleting";
                   const waiting = group.instanceStatus === "configuring" || group.instanceStatus === "ready-to-install";
@@ -1412,8 +1404,15 @@ export default function App() {
                   </section>;
                 })}
                 {!logGroups.length && <div className="empty-state small"><FileText /><span>{tr("noLogs")}</span></div>}
-                {logsHasMore && <button className="load-more-logs" onClick={() => void loadOlderLogs()} type="button">{tr("loadOlderLogs")}</button>}
               </div>
+              {logGroups.length > 0 && (
+                <div className="log-pagination">
+                  <span className="log-pagination-count">{logGroups.length} {tr("logGroupsLabel")}</span>
+                  <button className="button secondary compact" disabled={currentLogPage <= 1} onClick={() => setLogPage(currentLogPage - 1)} type="button"><ChevronLeft /></button>
+                  <span className="log-pagination-info">{currentLogPage} / {totalLogPages}</span>
+                  <button className="button secondary compact" disabled={currentLogPage >= totalLogPages} onClick={() => setLogPage(currentLogPage + 1)} type="button"><ChevronRight /></button>
+                </div>
+              )}
             </div>
           )}
         </section>
