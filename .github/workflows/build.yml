@@ -84,19 +84,6 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-
-      - name: Install dependencies (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
-
       - name: Install npm dependencies
         run: npm ci
 
@@ -113,6 +100,20 @@ jobs:
         with:
           version: latest
 
+      - name: Free up disk space
+        # Remove tools not needed for E2E (Rust, .NET, Android SDK, etc.)
+        # to make room for model downloads (openvino template needs ~4GB).
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          docker system prune -af --volumes
+          df -h /
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-models-${{ runner.os }}
+
       - name: Verify Docker (for Docker-dependent templates)
         run: docker info
 
@@ -122,7 +123,8 @@ jobs:
         # Docker is available on CI runners, so Docker-dependent templates
         # (langchain/default, langchain/agentic-rag, langchain/agentic-rag-hybrid,
         #  langchain/agentic-rag-openvino) are tested.
-        # langchain/agentic-rag-openvino downloads small models via `agentseek task models`.
+        # langchain/agentic-rag-openvino downloads small models via `agentseek task models`
+        # (cached in ~/.cache/huggingface to avoid re-downloading).
         # deepagents/sandbox is tested when DAYTONA_API_KEY is provided (free at app.daytona.io).
         env:
           # Optional: provide real API keys for testing actual LLM responses.

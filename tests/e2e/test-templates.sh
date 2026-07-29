@@ -735,11 +735,9 @@ test_template() {
 
   # Step 3: Install dependencies by running all lifecycle tasks.
   # `agentseek task --list` shows available tasks; each task is run by name.
-  # Critical tasks (sync, frontend, seekdb) must succeed.
-  # Non-critical tasks (models, ingest-sample, seekdb-skills) only produce a warning.
-  # models is non-critical: model download/conversion may fail due to network/disk;
-  # the conversation test will still verify the backend API is responsive.
-  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills|models"
+  # Critical tasks (sync, frontend, models, seekdb) must succeed.
+  # Non-critical tasks (ingest-sample, seekdb-skills) only produce a warning.
+  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills"
   log_info "  Installing dependencies..."
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
