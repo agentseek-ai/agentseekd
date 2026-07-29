@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -69,10 +68,10 @@ jobs:
   e2e:
     runs-on: ubuntu-22.04
     needs: test
-    # E2E tests run on push to main, nightly, and manual dispatch.
+    # E2E tests run nightly and on manual dispatch.
     # No secrets required — the script auto-starts a Mock API server
     # when no API key is provided.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v5
 
