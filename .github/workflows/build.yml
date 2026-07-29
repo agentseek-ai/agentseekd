@@ -78,6 +78,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Free up disk space
+        # Remove pre-installed tools not needed for E2E (.NET, Android SDK, GHC)
+        # to make room for model downloads (openvino template needs ~4GB).
+        # Must run BEFORE actions/setup-python — otherwise /opt/hostedtoolcache
+        # (where Python is installed) gets deleted and pipx venvs break.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker system prune -af --volumes
+          df -h /
+
       - name: Install Node.js
         uses: actions/setup-node@v5
         with:
@@ -99,14 +109,6 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           version: latest
-
-      - name: Free up disk space
-        # Remove tools not needed for E2E (Rust, .NET, Android SDK, etc.)
-        # to make room for model downloads (openvino template needs ~4GB).
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          docker system prune -af --volumes
-          df -h /
 
       - name: Cache HuggingFace models
         uses: actions/cache@v5
