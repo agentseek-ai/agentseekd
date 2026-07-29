@@ -342,11 +342,12 @@ check_prerequisites() {
 
 # Configure .env for a template instance.
 # Copies .env.example to .env if it does not exist, then appends API keys.
-# Usage: configure_env <instance_dir> <template_type> <extra_env_vars>
+# Usage: configure_env <instance_dir> <template_type> <extra_env_vars> <needs_docker>
 configure_env() {
   local dir="$1"
   local tpl_type="$2"
   local extra_env="$3"
+  local needs_docker="$4"
   local env_file="$dir/.env"
   local env_example="$dir/.env.example"
 
@@ -380,15 +381,22 @@ configure_env() {
   agentseek_base=$(resolve_api_base AGENTSEEK_API_BASE)
   agentseek_model=$(resolve_model AGENTSEEK_MODEL)
 
+  # For Docker-based templates, replace 127.0.0.1 with host.docker.internal
+  # so containers can reach the Mock API Server on the host.
+  local _host="127.0.0.1"
+  if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
+    _host="host.docker.internal"
+  fi
+
   [[ -n "$bub_key" ]]       && echo "BUB_API_KEY=$bub_key" >> "$env_file"
-  [[ -n "$bub_base" ]]      && echo "BUB_API_BASE=$bub_base" >> "$env_file"
+  [[ -n "$bub_base" ]]      && echo "BUB_API_BASE=$(echo "$bub_base" | sed "s/127\.0\.0\.1/$_host/")" >> "$env_file"
   [[ -n "$bub_model" ]]     && echo "BUB_MODEL=$bub_model" >> "$env_file"
 
   [[ -n "$openai_key" ]]    && echo "OPENAI_API_KEY=$openai_key" >> "$env_file"
-  [[ -n "$openai_base" ]]   && echo "OPENAI_API_BASE=$openai_base" >> "$env_file"
+  [[ -n "$openai_base" ]]   && echo "OPENAI_API_BASE=$(echo "$openai_base" | sed "s/127\.0\.0\.1/$_host/")" >> "$env_file"
 
   [[ -n "$agentseek_key" ]]   && echo "AGENTSEEK_API_KEY=$agentseek_key" >> "$env_file"
-  [[ -n "$agentseek_base" ]]  && echo "AGENTSEEK_API_BASE=$agentseek_base" >> "$env_file"
+  [[ -n "$agentseek_base" ]]  && echo "AGENTSEEK_API_BASE=$(echo "$agentseek_base" | sed "s/127\.0\.0\.1/$_host/")" >> "$env_file"
   [[ -n "$agentseek_model" ]] && echo "AGENTSEEK_MODEL=$agentseek_model" >> "$env_file"
   # LangChain init_chat_model accepts OPENAI_MODEL as alias.
   [[ -n "$agentseek_model" ]] && echo "OPENAI_MODEL=$agentseek_model" >> "$env_file"
@@ -722,7 +730,7 @@ test_template() {
 
   # Step 2: Configure .env.
   log_info "  Configuring .env..."
-  configure_env "$instance_dir" "$tpl_type" "$extra_env"
+  configure_env "$instance_dir" "$tpl_type" "$extra_env" "$needs_docker"
 
   # Step 3: Install dependencies by running all lifecycle tasks.
   # `agentseek task --list` shows available tasks; each task is run by name.
@@ -786,6 +794,10 @@ test_template() {
   local _openai_key _openai_base
   _openai_key=$(resolve_api_key OPENAI_API_KEY)
   _openai_base=$(resolve_api_base OPENAI_API_BASE)
+  # For Docker templates, use host.docker.internal so containers can reach the mock server.
+  if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
+    _openai_base=$(echo "$_openai_base" | sed 's/127\.0\.0\.1/host.docker.internal/')
+  fi
   (cd "$instance_dir" && \
     OPENAI_API_KEY="$_openai_key" \
     OPENAI_API_BASE="$_openai_base" \
