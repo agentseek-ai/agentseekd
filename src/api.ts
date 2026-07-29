@@ -369,7 +369,7 @@ export const desktopApi = {
 
   async systemInfo(): Promise<SystemInfo> {
     if (isTauri()) return invoke("system_info");
-    return { appName: "AgentSeek", version: "0.1.0", dataPath: "Browser localStorage preview", cliStrategy: "uv run agentseek", storage: "Embedded SQLite (desktop state only; isolated from template instances)", dockerAvailable: false, dockerComposeAvailable: false, dockerRunning: false };
+    return { appName: "AgentSeek", version: __APP_VERSION__, dataPath: "Browser localStorage preview", cliStrategy: "uv run agentseek", storage: "Embedded SQLite (desktop state only; isolated from template instances)", dockerAvailable: false, dockerComposeAvailable: false, dockerRunning: false };
   },
 
   async storageStatus(): Promise<StorageStatus> {

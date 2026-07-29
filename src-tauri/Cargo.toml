@@ -1,5 +1,7 @@
 [package]
 name = "agentseek-desktop"
+# Keep in sync with ../package.json (single source of truth).
+# Rust code reads this via env!("CARGO_PKG_VERSION").
 version = "1.0.0"
 description = "AgentSeek template instance deployment and runtime manager"
 authors = ["AgentSeek Contributors"]
