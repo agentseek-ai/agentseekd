@@ -47,6 +47,18 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Cache agentseek templates
+        uses: actions/cache@v4
+        with:
+          path: ~/.cookiecutters/agentseek
+          key: agentseek-templates-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Fetch agentseek templates
+        run: |
+          if [ ! -d ~/.cookiecutters/agentseek/templates ]; then
+            git clone --depth 1 https://github.com/ob-labs/agentseek.git ~/.cookiecutters/agentseek
+          fi
+
       - name: Run frontend tests
         run: npm run test
 
