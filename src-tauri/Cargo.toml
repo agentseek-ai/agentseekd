@@ -1,6 +1,6 @@
 [package]
 name = "agentseek-desktop"
-version = "0.1.0"
+version = "1.0.0"
 description = "AgentSeek template instance deployment and runtime manager"
 authors = ["AgentSeek Contributors"]
 edition = "2021"
