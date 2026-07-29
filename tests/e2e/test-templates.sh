@@ -53,7 +53,7 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-E2E_TIMEOUT="${E2E_TIMEOUT:-120}"
+E2E_TIMEOUT="${E2E_TIMEOUT:-300}"
 E2E_WORK_DIR="${E2E_WORK_DIR:-/tmp/agentseek-e2e}"
 SKIP_DOCKER_TEMPLATES="${SKIP_DOCKER_TEMPLATES:-0}"
 SKIP_CI_ONLY="${SKIP_CI_ONLY:-0}"
@@ -218,18 +218,20 @@ declare -a SKIPPED=()
 # ci_only_skip:   Non-empty reason string if template should be skipped in CI
 #                 (needs local hardware, external service, etc.)
 # ---------------------------------------------------------------------------
+#   Field format: tpl_id|tpl_type|graph_id|needs_docker|extra_env|ci_only_skip|tpl_exports
+#   tpl_exports: comma-separated KEY=VALUE pairs exported when running tasks
 TEMPLATES=(
-  "bub/default|bub||0||"
-  "deepagents/default|bub||0||"
-  "deepagents/research|langgraph|research|0|TAVILY_API_KEY|"
-  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY|"
-  "deepagents/content-builder|langgraph|content_builder|0||"
-  "langchain/default|bub||1||"
-  "langchain/cli-remote|langgraph|agent|0||"
-  "langchain/agentic-rag|langgraph|rag|1||"
-  "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1||"
-  "langchain/agentic-rag-openvino|langgraph|rag|1||"
-  "langchain/markdown-messages|langgraph|agent|0||"
+  "bub/default|bub||0|||"
+  "deepagents/default|bub||0|||"
+  "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
+  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
+  "deepagents/content-builder|langgraph|content_builder|0|||"
+  "langchain/default|bub||1|||"
+  "langchain/cli-remote|langgraph|agent|0|||"
+  "langchain/agentic-rag|langgraph|rag|1|||"
+  "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1|||"
+  "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
+  "langchain/markdown-messages|langgraph|agent|0|||"
 )
 
 # ---------------------------------------------------------------------------
@@ -443,7 +445,9 @@ send_message_bub() {
   
   # Check for error events in the SSE stream.
   if echo "$response" | grep -qi 'RUN_ERROR\|"type":"error"'; then
-    log_warn "  Response contains error event (agent may have API issues)"
+    log_fail "  Response contains error event (agent has API issues)"
+    log_info "  Response: $(echo "$response" | head -5)"
+    return 1
   fi
   
   log_info "  Response received ($event_count events, ${#response} bytes)"
@@ -483,6 +487,10 @@ else:
     print('(no text content extracted)')
 " 2>/dev/null || echo "(failed to parse response)")
   log_info "  Assistant reply: ${reply}"
+  if [[ "$reply" == "(no text content extracted)" || "$reply" == "(failed to parse response)" ]]; then
+    log_fail "  No text content in assistant reply"
+    return 1
+  fi
   return 0
 }
 
@@ -527,7 +535,9 @@ send_message_langgraph() {
   event_count=$(echo "$run_response" | grep -c "^event:\|^data:" 2>/dev/null || echo "0")
 
   if [[ "$event_count" -lt 1 ]]; then
-    log_warn "  No SSE events in response (may still be processing)"
+    log_fail "  No SSE events in response"
+    log_info "  Response: $(echo "$run_response" | head -5)"
+    return 1
   fi
 
   log_info "  Response received ($event_count SSE events, ${#run_response} bytes)"
@@ -567,6 +577,10 @@ else:
     print('(no text content extracted)')
 " 2>/dev/null || echo "(failed to parse response)")
   log_info "  Assistant reply: ${reply}"
+  if [[ "$reply" == "(no text content extracted)" || "$reply" == "(failed to parse response)" ]]; then
+    log_fail "  No text content in assistant reply"
+    return 1
+  fi
   return 0
 }
 
@@ -609,7 +623,7 @@ cleanup_instance() {
 # Usage: test_template "template_id|type|graph_id|needs_docker|extra_env|ci_only_skip"
 test_template() {
   local entry="$1"
-  IFS='|' read -r tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip <<< "$entry"
+  IFS='|' read -r tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip tpl_exports <<< "$entry"
 
   local instance_name="e2e-$(echo "$tpl_id" | tr '/' '-')"
   local instance_dir="${E2E_WORK_DIR}/${instance_name}"
@@ -719,6 +733,17 @@ test_template() {
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
   task_list=$(cd "$instance_dir" && agentseek task --list 2>&1 | awk '{print $1}' | grep -v '^$')
+  # Export per-template environment variables (e.g. CPU-only PyTorch for openvino).
+  local _export_cmd=""
+  if [[ -n "$tpl_exports" ]]; then
+    IFS=',' read -ra _EXPORTS <<< "$tpl_exports"
+    for _exp in "${_EXPORTS[@]}"; do
+      local _key="${_exp%%=*}"
+      local _val="${_exp#*=}"
+      export "$_key=$_val"
+      log_info "  Exported: $_key"
+    done
+  fi
   if [[ -n "$task_list" ]]; then
     while IFS= read -r task_name; do
       log_info "    Running task: $task_name"
@@ -827,6 +852,14 @@ test_template() {
   else
     log_fail "  $tpl_id — conversation test failed"
     FAILED+=("$tpl_id (no response)")
+  fi
+
+  # Clean up per-template exports so they don't leak to the next template.
+  if [[ -n "$tpl_exports" ]]; then
+    IFS=',' read -ra _EXPORTS <<< "$tpl_exports"
+    for _exp in "${_EXPORTS[@]}"; do
+      unset "${_exp%%=*}"
+    done
   fi
 }
 
