@@ -69,9 +69,10 @@ jobs:
   e2e:
     runs-on: ubuntu-22.04
     needs: test
-    # E2E tests run nightly or on manual dispatch. No secrets required —
-    # the script auto-starts a Mock API server when no API key is provided.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # E2E tests run on push to main, nightly, and manual dispatch.
+    # No secrets required — the script auto-starts a Mock API server
+    # when no API key is provided.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
 
@@ -134,7 +135,7 @@ jobs:
         include:
           - platform: macos-14
             args: "--target aarch64-apple-darwin"
-          - platform: macos-13
+          - platform: macos-14
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu-22.04
             args: ""
@@ -154,7 +155,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-14' && (matrix.args == '--target aarch64-apple-darwin' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin') || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
