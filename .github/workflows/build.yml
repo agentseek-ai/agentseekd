@@ -197,8 +197,45 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "AgentSeek Desktop ${{ github.ref_name }}"
-          releaseBody: ""
-          releaseDraft: true
+          releaseBody: |
+            ## AgentSeek Desktop ${{ github.ref_name }}
+
+            ### Downloads
+            - **macOS (Apple Silicon)**: `.dmg` (aarch64)
+            - **macOS (Intel)**: `.dmg` (x86_64)
+            - **Linux**: `.deb` / `.AppImage`
+            - **Windows**: `.msi` / `.exe`
+
+            ### Requirements
+            - **Node.js** 24 or newer
+            - **Python** 3.12 or newer
+            - **uv** (auto-installed by agentseek CLI)
+            - **Docker** (for Docker-based templates)
+
+            ### Quick Start
+            ```bash
+            # Install agentseek CLI
+            pipx install agentseek
+
+            # Launch AgentSeek Desktop
+            # Browse templates, create instances, and manage deployments
+            ```
+
+            ### Supported Templates (11)
+            | Template | Protocol | Docker |
+           |---|---|---|
+            | bub/default | Bub AG-UI | No |
+            | deepagents/default | Bub AG-UI | No |
+            | deepagents/research | LangGraph | No |
+            | deepagents/sandbox | LangGraph | No |
+            | deepagents/content-builder | LangGraph | No |
+            | langchain/default | Bub AG-UI | Yes |
+            | langchain/cli-remote | LangGraph | No |
+            | langchain/agentic-rag | LangGraph | Yes |
+            | langchain/agentic-rag-hybrid | LangGraph | Yes |
+            | langchain/agentic-rag-openvino | LangGraph | Yes |
+            | langchain/markdown-messages | LangGraph | No |
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
