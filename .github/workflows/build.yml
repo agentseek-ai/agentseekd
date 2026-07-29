@@ -223,7 +223,7 @@ jobs:
 
             ### Supported Templates (11)
             | Template | Protocol | Docker |
-           |---|---|---|
+            |---|---|---|
             | bub/default | Bub AG-UI | No |
             | deepagents/default | Bub AG-UI | No |
             | deepagents/research | LangGraph | No |
