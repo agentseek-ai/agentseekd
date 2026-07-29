@@ -86,7 +86,7 @@ start_mock_api() {
   # Kill any process using the mock API port.
   lsof -ti:"$MOCK_API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
   sleep 1
-  python3 "$MOCK_API_SCRIPT" --port "$MOCK_API_PORT" &
+  python3 "$MOCK_API_SCRIPT" --port "$MOCK_API_PORT" --host 0.0.0.0 &
   MOCK_API_PID=$!
 
   # Wait for the mock server to be ready.
@@ -381,11 +381,12 @@ configure_env() {
   agentseek_base=$(resolve_api_base AGENTSEEK_API_BASE)
   agentseek_model=$(resolve_model AGENTSEEK_MODEL)
 
-  # For Docker-based templates, replace 127.0.0.1 with host.docker.internal
+  # For Docker-based templates, replace 127.0.0.1 with the Docker bridge gateway
   # so containers can reach the Mock API Server on the host.
+  # 172.17.0.1 is the default Docker bridge gateway on Linux.
   local _host="127.0.0.1"
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _host="host.docker.internal"
+    _host="172.17.0.1"
   fi
 
   [[ -n "$bub_key" ]]       && echo "BUB_API_KEY=$bub_key" >> "$env_file"
@@ -734,9 +735,11 @@ test_template() {
 
   # Step 3: Install dependencies by running all lifecycle tasks.
   # `agentseek task --list` shows available tasks; each task is run by name.
-  # Critical tasks (sync, frontend, models, seekdb) must succeed.
-  # Non-critical tasks (ingest-sample, seekdb-skills) only produce a warning.
-  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills"
+  # Critical tasks (sync, frontend, seekdb) must succeed.
+  # Non-critical tasks (models, ingest-sample, seekdb-skills) only produce a warning.
+  # models is non-critical: model download/conversion may fail due to network/disk;
+  # the conversation test will still verify the backend API is responsive.
+  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills|models"
   log_info "  Installing dependencies..."
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
@@ -794,9 +797,9 @@ test_template() {
   local _openai_key _openai_base
   _openai_key=$(resolve_api_key OPENAI_API_KEY)
   _openai_base=$(resolve_api_base OPENAI_API_BASE)
-  # For Docker templates, use host.docker.internal so containers can reach the mock server.
+  # For Docker templates, use Docker bridge gateway so containers can reach the mock server.
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _openai_base=$(echo "$_openai_base" | sed 's/127\.0\.0\.1/host.docker.internal/')
+    _openai_base=$(echo "$_openai_base" | sed 's/127\.0\.0\.1/172.17.0.1/')
   fi
   (cd "$instance_dir" && \
     OPENAI_API_KEY="$_openai_key" \

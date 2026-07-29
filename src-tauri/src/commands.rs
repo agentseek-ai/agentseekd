@@ -1375,7 +1375,7 @@ fn ensure_seekdb_runtime(data_dir: &Path) -> Result<PathBuf, String> {
             "Creating AgentSeek Desktop SeekDB private Python environment",
         )?;
     }
-    let marker = runtime.join(".pyseekdb-1.4.0");
+    let marker = runtime.join(".pyseekdb-installed");
     if !marker.is_file() {
         let uv = uv_program().ok_or_else(|| "Please install uv before configuring SeekDB".to_string())?;
         run_dependency_command(
@@ -1385,11 +1385,12 @@ fn ensure_seekdb_runtime(data_dir: &Path) -> Result<PathBuf, String> {
                 "install",
                 "--python",
                 &python.to_string_lossy(),
-                "pyseekdb==1.4.0",
+                "--upgrade",
+                "pyseekdb",
             ],
-            "Installing AgentSeek Desktop private pyseekdb 1.4.0",
+            "Installing AgentSeek Desktop private pyseekdb",
         )?;
-        fs::write(&marker, "pyseekdb 1.4.0").map_err(|error| error.to_string())?;
+        fs::write(&marker, "pyseekdb").map_err(|error| error.to_string())?;
     }
     Ok(python)
 }
