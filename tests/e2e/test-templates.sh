@@ -757,7 +757,7 @@ test_template() {
     while IFS= read -r task_name; do
       log_info "    Running task: $task_name"
       if ! (cd "$instance_dir" && agentseek task "$task_name" >> "$setup_log" 2>&1); then
-        if echo "$NON_CRITICAL_TASKS" | grep -qw "$task_name"; then
+        if echo "|$NON_CRITICAL_TASKS|" | grep -q "|$task_name|"; then
           log_warn "  Task '$task_name' failed (non-critical, continuing)"
         else
           log_fail "  Task '$task_name' failed (see $setup_log)"
