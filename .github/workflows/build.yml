@@ -98,8 +98,13 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install agentseek CLI
-        run: pipx install agentseek
+        run: pipx install agentseek --python python3.12
 
       - name: Verify Docker (for Docker-dependent templates)
         run: docker info
