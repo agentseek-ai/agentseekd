@@ -1,14 +1,14 @@
 name: Build
 
+# Expensive desktop bundle builds only run on release-track events:
+#   - tag push v*       (actual release)
+#   - workflow_dispatch  (manual)
+# Push to main / PR / schedule do NOT trigger this workflow.
+# The CI workflow (ci.yml) handles testing on those branches.
+
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-    branches: [main]
-  schedule:
-    # Run E2E tests nightly at 02:00 UTC.
-    - cron: "0 2 * * *"
   workflow_dispatch:
 
 env:
@@ -17,10 +17,16 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  # ─── Verify Release Gate (fast, gates the expensive build matrix) ────
+  verify:
+    name: Verify Release Gate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -47,119 +53,36 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Cache agentseek templates
-        uses: actions/cache@v5
-        with:
-          path: ~/.cookiecutters/agentseek
-          key: agentseek-templates-${{ hashFiles('src-tauri/Cargo.lock') }}
-
-      - name: Fetch agentseek templates
-        run: |
-          if [ ! -d ~/.cookiecutters/agentseek/templates ]; then
-            git clone --depth 1 https://github.com/ob-labs/agentseek.git ~/.cookiecutters/agentseek
-          fi
-
       - name: Run frontend tests
         run: npm run test
 
-      - name: Run Rust tests
+      - name: Build frontend
+        run: npm run build
+
+      - name: Rust type-check
         working-directory: src-tauri
-        run: cargo test
+        run: cargo check
 
-  e2e:
-    runs-on: ubuntu-22.04
-    needs: test
-    # E2E runs on schedule/dispatch (blocking), PR/tag (non-blocking reference).
-    # Skipped on push to main (test + build already cover basic health).
-    # No secrets required — the script auto-starts a Mock API server
-    # when no API key is provided.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    continue-on-error: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Free up disk space
-        # Remove pre-installed tools not needed for E2E (.NET, Android SDK, GHC)
-        # to make room for model downloads (openvino template needs ~4GB).
-        # Must run BEFORE actions/setup-python — otherwise /opt/hostedtoolcache
-        # (where Python is installed) gets deleted and pipx venvs break.
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          docker system prune -af --volumes
-          df -h /
-
-      - name: Install Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install agentseek CLI
-        run: pipx install agentseek --python python3.12
-
-      - name: Install uv (Python package manager)
-        uses: astral-sh/setup-uv@v8.3.2
-        with:
-          version: latest
-          enable-cache: false
-
-      - name: Cache HuggingFace models
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/huggingface
-          key: huggingface-models-${{ runner.os }}
-
-      - name: Verify Docker (for Docker-dependent templates)
-        run: docker info
-
-      - name: Run E2E template tests
-        # No secrets required — the script auto-starts a Mock API server
-        # when no real API key is available.
-        # Docker is available on CI runners, so Docker-dependent templates
-        # (langchain/default, langchain/agentic-rag, langchain/agentic-rag-hybrid,
-        #  langchain/agentic-rag-openvino) are tested.
-        # langchain/agentic-rag-openvino downloads small models via `agentseek task models`
-        # (cached in ~/.cache/huggingface to avoid re-downloading).
-        # deepagents/sandbox is tested when DAYTONA_API_KEY is provided (free at app.daytona.io).
-        env:
-          # Optional: provide real API keys for testing actual LLM responses.
-          # If unset, the built-in Mock API server is used (zero cost).
-          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
-          E2E_API_BASE: ${{ secrets.E2E_API_BASE }}
-          E2E_MODEL: ${{ secrets.E2E_MODEL }}
-          TAVILY_API_KEY: ${{ secrets.E2E_TAVILY_API_KEY }}
-          # Optional: provide a Daytona API key to test deepagents/sandbox.
-          # Get a free key at https://app.daytona.io/
-          # If unset, deepagents/sandbox is skipped.
-          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
-          # Skip templates that need local hardware or external services.
-          SKIP_CI_ONLY: 1
-        run: npm run test:e2e
-
+  # ─── Build Desktop Bundles (4-platform matrix) ──────────────────────
   build:
-    needs: test
-    # Skip build on nightly schedule (only test + e2e for deep inspection).
-    if: github.event_name != 'schedule'
+    name: Build (${{ matrix.label }})
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-14
-            args: "--target aarch64-apple-darwin"
+            target: aarch64-apple-darwin
+            label: macOS Apple Silicon
           - platform: macos-14
-            args: "--target x86_64-apple-darwin"
+            target: x86_64-apple-darwin
+            label: macOS Intel
           - platform: ubuntu-22.04
-            args: ""
+            target: x86_64-unknown-linux-gnu
+            label: Linux x64
           - platform: windows-latest
-            args: ""
+            target: x86_64-pc-windows-msvc
+            label: Windows x64
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -174,12 +97,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && (matrix.args == '--target aarch64-apple-darwin' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin') || '' }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
 
       - name: Install dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
@@ -190,36 +114,267 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Read release notes
-        id: release_notes
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          cat RELEASE_NOTES.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Build Tauri app
+        run: npx tauri build --target ${{ matrix.target }}
 
-      - uses: tauri-apps/tauri-action@v0
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Collect bundle files
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "AgentSeek Desktop ${{ github.ref_name }}"
-          releaseBody: ${{ steps.release_notes.outputs.body }}
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
+          TARGET_BUNDLE_ROOT: src-tauri/target/${{ matrix.target }}/release/bundle
+          DEFAULT_BUNDLE_ROOT: src-tauri/target/release/bundle
+          ARTIFACT_DIR: ci-artifacts/${{ matrix.label }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
 
-      - name: Build Tauri app (no release)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: npx tauri build ${{ matrix.args }}
+          BUNDLE_ROOTS=()
+          if [ -d "$TARGET_BUNDLE_ROOT" ]; then
+            BUNDLE_ROOTS+=("$TARGET_BUNDLE_ROOT")
+          fi
+          if [ -d "$DEFAULT_BUNDLE_ROOT" ] && [ "$DEFAULT_BUNDLE_ROOT" != "$TARGET_BUNDLE_ROOT" ]; then
+            BUNDLE_ROOTS+=("$DEFAULT_BUNDLE_ROOT")
+          fi
 
-      - name: Upload build artifacts
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+          if [ "${#BUNDLE_ROOTS[@]}" -eq 0 ]; then
+            echo "No bundle directory found" >&2
+            echo "Checked:" >&2
+            echo "  - $TARGET_BUNDLE_ROOT" >&2
+            echo "  - $DEFAULT_BUNDLE_ROOT" >&2
+            exit 1
+          fi
+
+          case "$RUNNER_OS" in
+            Linux)
+              for root in "${BUNDLE_ROOTS[@]}"; do
+                find "$root" -maxdepth 3 -type f \
+                  \( -name '*.AppImage' -o -name '*.deb' \) \
+                  -exec cp '{}' "$ARTIFACT_DIR"/ \;
+              done
+              ;;
+            macOS)
+              for root in "${BUNDLE_ROOTS[@]}"; do
+                find "$root" -maxdepth 3 -type f \
+                  \( -name '*.dmg' -o -name '*.app.tar.gz' \) \
+                  -exec cp '{}' "$ARTIFACT_DIR"/ \;
+              done
+              ;;
+            Windows)
+              for root in "${BUNDLE_ROOTS[@]}"; do
+                find "$root" -maxdepth 3 -type f \
+                  \( -name '*.msi' -o -name '*.exe' \) \
+                  -exec cp '{}' "$ARTIFACT_DIR"/ \;
+              done
+              ;;
+            *)
+              echo "Unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -print -quit)" ]; then
+            echo "No bundle files were collected for $RUNNER_OS" >&2
+            for root in "${BUNDLE_ROOTS[@]}"; do
+              echo "--- $root ---" >&2
+              find "$root" -maxdepth 4 -type f | sort >&2
+            done
+            exit 1
+          fi
+
+          {
+            echo "### ${{ matrix.label }}"
+            while IFS= read -r file; do
+              echo "- $(basename "$file")"
+            done < <(find "$ARTIFACT_DIR" -maxdepth 1 -type f | sort)
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agentseek-desktop-${{ matrix.platform }}
-          path: |
-            src-tauri/target/*/release/bundle/
-            src-tauri/target/release/bundle/
-          if-no-files-found: ignore
+          name: agentseek-${{ matrix.label }}
+          path: ci-artifacts/${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─── Publish GitHub Release (tag push only) ─────────────────────────
+  publish-release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          EXPECTED_VERSION="${TAG#v}"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$EXPECTED_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Release tag $TAG does not match package.json version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          echo "✓ Tag $TAG matches package.json version $PACKAGE_VERSION"
+
+      - name: Resolve release notes base tag
+        id: release_notes_base
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          previous_ancestor_tag=""
+          if git rev-parse --verify "${TAG}^{tag}" >/dev/null 2>&1 || git rev-parse --verify "${TAG}^{commit}" >/dev/null 2>&1; then
+            previous_ancestor_tag="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+          fi
+
+          previous_tag="$previous_ancestor_tag"
+          # Stable releases compare against the previous stable tag (skip
+          # rc/beta/alpha); prereleases compare against the ancestor tag.
+          if printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            previous_stable_tag=""
+            while IFS= read -r candidate; do
+              if [ "$candidate" = "$TAG" ]; then
+                break
+              fi
+              previous_stable_tag="$candidate"
+            done < <(git tag -l 'v*' --sort=v:refname 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
+            first_release_tag="$(git tag -l 'v*' --sort=v:refname 2>/dev/null | head -n 1 || true)"
+            previous_tag="${previous_stable_tag:-$first_release_tag}"
+          fi
+
+          if [ "$previous_tag" = "$TAG" ]; then
+            previous_tag=""
+          fi
+
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-bundles
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find release-bundles -type f \
+            \( -name '*.AppImage' -o -name '*.deb' \
+               -o -name '*.dmg' -o -name '*.app.tar.gz' \
+               -o -name '*.msi' -o -name '*.exe' \) \
+            -exec cp '{}' release-assets/ \;
+
+          if [ -z "$(find release-assets -maxdepth 1 -type f -print -quit)" ]; then
+            echo "No desktop bundle files were found to publish" >&2
+            find release-bundles -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+
+      - name: Create release preface
+        env:
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${GH_REPO}/releases/download/${TAG}"
+          checksums_url="${BASE}/SHA256SUMS.txt"
+
+          # Group actual asset files by platform to build download links
+          # that always match the real published filenames.
+          linux=""; macos_intel=""; macos_arm=""; windows=""
+          for f in release-assets/*; do
+            b=$(basename "$f")
+            case "$b" in
+              *.AppImage)          linux="${linux} · [AppImage](${BASE}/${b})" ;;
+              *.deb)               linux="${linux} · [deb](${BASE}/${b})" ;;
+              *aarch64*.dmg)       macos_arm="[dmg](${BASE}/${b})" ;;
+              *_x64.dmg|*x64*.dmg) macos_intel="[dmg](${BASE}/${b})" ;;
+              *.dmg)               macos_arm="${macos_arm:-[dmg](${BASE}/${b})}" ;;
+              *.msi)               windows="${windows} · [msi](${BASE}/${b})" ;;
+              *.exe)               windows="${windows} · [exe](${BASE}/${b})" ;;
+              *.sig|SHA256SUMS.txt) ;;
+            esac
+          done
+          linux="${linux# · }"; linux="${linux:-—}"
+          windows="${windows# · }"; windows="${windows:-—}"
+          macos_intel="${macos_intel:-—}"
+          macos_arm="${macos_arm:-—}"
+
+          {
+            printf '## Install\n\n'
+            printf '### Desktop App\n\n'
+            printf 'Direct downloads for this release. Checksums: [`SHA256SUMS.txt`](%s)\n\n' "$checksums_url"
+            printf '| Platform | Downloads |\n'
+            printf '|---|---|\n'
+            printf '| Linux x64 | %s |\n' "$linux"
+            printf '| macOS Intel | %s |\n' "$macos_intel"
+            printf '| macOS Apple Silicon | %s |\n' "$macos_arm"
+            printf '| Windows x64 | %s |\n\n' "$windows"
+          } > RELEASE_PREFACE.md
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          chmod +x scripts/generate-release-notes.sh
+          {
+            cat RELEASE_PREFACE.md
+            echo ""
+            bash scripts/generate-release-notes.sh "${{ github.ref_name }}" "${{ steps.release_notes_base.outputs.previous_tag }}"
+          } > RELEASE_BODY.md
+          echo "Generated release body ($(wc -l < RELEASE_BODY.md) lines)"
+
+      - name: Resolve release options
+        id: release_options
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease="false"
+          # 0.0.x and -rc/-beta/-alpha suffixes are prerelease
+          if printf '%s' "$TAG" | grep -Eq '^v0\.0\.|-(rc|beta|alpha)'; then
+            prerelease="true"
+          fi
+          make_latest="true"
+          if [ "$prerelease" = "true" ]; then
+            make_latest="false"
+          fi
+          echo "prerelease=$prerelease" >> $GITHUB_OUTPUT
+          echo "make_latest=$make_latest" >> $GITHUB_OUTPUT
+
+      - name: Create or update GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: AgentSeek Desktop ${{ github.ref_name }}
+          bodyFile: RELEASE_BODY.md
+          artifacts: release-assets/*
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          replacesArtifacts: true
+          draft: false
+          prerelease: ${{ steps.release_options.outputs.prerelease }}
+          makeLatest: ${{ steps.release_options.outputs.make_latest }}
+
+      - name: Add workflow summary
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## Desktop Downloads"
+            echo
+            echo "GitHub Release: https://github.com/$REPOSITORY/releases/tag/$TAG"
+            echo
+            echo "Artifacts in this release:"
+            while IFS= read -r file; do
+              echo "- $(basename "$file")"
+            done < <(find release-assets -maxdepth 1 -type f | sort)
+          } >> "$GITHUB_STEP_SUMMARY"

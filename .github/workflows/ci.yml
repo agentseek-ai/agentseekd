@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  schedule:
+    # Run E2E tests nightly at 02:00 UTC.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Unit + Rust Tests (fast, every push) ───────────────────────────
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Cache agentseek templates
+        uses: actions/cache@v5
+        with:
+          path: ~/.cookiecutters/agentseek
+          key: agentseek-templates-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Fetch agentseek templates
+        run: |
+          if [ ! -d ~/.cookiecutters/agentseek/templates ]; then
+            git clone --depth 1 https://github.com/ob-labs/agentseek.git ~/.cookiecutters/agentseek
+          fi
+
+      - name: Run frontend tests
+        run: npm run test
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+  # ─── E2E Template Tests (slow, runs after test) ─────────────────────
+  e2e:
+    runs-on: ubuntu-22.04
+    needs: test
+    # E2E runs on schedule/dispatch (blocking), PR/push-to-main (non-blocking
+    # reference). No secrets required — the script auto-starts a Mock API
+    # server when no API key is provided.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    continue-on-error: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free up disk space
+        # Remove pre-installed tools not needed for E2E (.NET, Android SDK, GHC)
+        # to make room for model downloads (openvino template needs ~4GB).
+        # Must run BEFORE actions/setup-python — otherwise /opt/hostedtoolcache
+        # (where Python is installed) gets deleted and pipx venvs break.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker system prune -af --volumes
+          df -h /
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install agentseek CLI
+        run: pipx install agentseek --python python3.12
+
+      - name: Install uv (Python package manager)
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: latest
+          enable-cache: false
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-models-${{ runner.os }}
+
+      - name: Verify Docker (for Docker-dependent templates)
+        run: docker info
+
+      - name: Run E2E template tests
+        env:
+          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+          E2E_API_BASE: ${{ secrets.E2E_API_BASE }}
+          E2E_MODEL: ${{ secrets.E2E_MODEL }}
+          TAVILY_API_KEY: ${{ secrets.E2E_TAVILY_API_KEY }}
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          SKIP_CI_ONLY: 1
+        run: npm run test:e2e
