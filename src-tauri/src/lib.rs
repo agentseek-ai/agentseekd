@@ -2343,6 +2343,8 @@ url = \"http://127.0.0.1:5174\"\n";
         let path = src.join("agent.py");
         fs::write(&path, "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n")
             .expect("write");
+        // pyproject.toml must list langchain-huggingface for the shim to be added.
+        fs::write(dir.join("pyproject.toml"), "\"langchain-huggingface>=1.0\",\n").expect("write");
         patch_agent_async_if_needed(&dir);
         let patched = fs::read_to_string(&path).expect("read");
         assert!(patched.contains("_patched_agenerate"));
@@ -2361,6 +2363,7 @@ url = \"http://127.0.0.1:5174\"\n";
         let path = src.join("agent.py");
         fs::write(&path, "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n")
             .expect("write");
+        fs::write(dir.join("pyproject.toml"), "\"langchain-huggingface>=1.0\",\n").expect("write");
         patch_agent_async_if_needed(&dir);
         let after_first = fs::read_to_string(&path).expect("read");
         patch_agent_async_if_needed(&dir);
@@ -2370,13 +2373,30 @@ url = \"http://127.0.0.1:5174\"\n";
     }
 
     #[test]
-    fn agent_async_patch_skips_when_no_marker() {
-        let dir = patch_test_dir("agent-nomarker");
+    fn agent_async_patch_skips_when_no_hf_dep() {
+        let dir = patch_test_dir("agent-nohf");
         let src = dir.join("src");
         fs::create_dir_all(&src).expect("mkdir");
         let path = src.join("agent.py");
         let original = "from langchain_core.prompts import ChatPromptTemplate\nprint('hi')\n";
         fs::write(&path, original).expect("write");
+        // No langchain-huggingface in pyproject.toml — patch should skip.
+        fs::write(dir.join("pyproject.toml"), "[project]\n").expect("write");
+        patch_agent_async_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_async_patch_skips_with_marker_but_no_hf_dep() {
+        let dir = patch_test_dir("agent-markerno");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("agent.py");
+        let original = "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n";
+        fs::write(&path, original).expect("write");
+        // Has OceanbaseVectorStore marker but no langchain-huggingface dep — should skip.
+        fs::write(dir.join("pyproject.toml"), "[project]\n").expect("write");
         patch_agent_async_if_needed(&dir);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         fs::remove_dir_all(&dir).ok();
@@ -2627,10 +2647,10 @@ url = \"http://127.0.0.1:5174\"\n";
         let dir = patch_test_dir("tpl-lc-rag");
         if !setup_template_instance("langchain/agentic-rag", &dir) { return; }
         apply_all_patches(&dir);
-        // agent.py should have the async shim (has OceanbaseVectorStore marker).
+        // agent.py has no langchain-huggingface dependency — patch should be no-op.
         let agent_py = find_file_recursive(&dir, "agent.py", 5).expect("agent.py");
         let content = fs::read_to_string(&agent_py).expect("read");
-        assert!(content.contains("_patched_agenerate"), "async shim not added");
+        assert!(!content.contains("_patched_agenerate"), "async shim should not be added");
         // langgraph.json has no cors section — should remain valid JSON.
         if let Some(path) = find_file_recursive(&dir, "langgraph.json", 5) {
             let content = fs::read_to_string(&path).expect("read");
@@ -2653,7 +2673,7 @@ url = \"http://127.0.0.1:5174\"\n";
         assert!(cors.get("allow_origins").is_none());
         assert_eq!(cors["allow_methods"], serde_json::json!(["*"]));
         assert_eq!(cors["allow_headers"], serde_json::json!(["*"]));
-        // agent.py has no OceanbaseVectorStore marker — patch should be no-op.
+        // agent.py has no langchain-huggingface dependency — patch should be no-op.
         if let Some(path) = find_file_recursive(&dir, "agent.py", 5) {
             let content = fs::read_to_string(&path).expect("read");
             assert!(!content.contains("_patched_agenerate"));
@@ -2693,7 +2713,7 @@ url = \"http://127.0.0.1:5174\"\n";
             let content = fs::read_to_string(&path).expect("read");
             assert!(serde_json::from_str::<serde_json::Value>(&content).is_ok());
         }
-        // agent.py has no OceanbaseVectorStore marker.
+        // agent.py has no langchain-huggingface dependency.
         if let Some(path) = find_file_recursive(&dir, "agent.py", 5) {
             let content = fs::read_to_string(&path).expect("read");
             assert!(!content.contains("_patched_agenerate"));

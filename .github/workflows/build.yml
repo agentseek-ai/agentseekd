@@ -114,8 +114,52 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Normalize version for MSI (numeric-only required)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          RAW=$(node -p "require('./package.json').version")
+          NUMERIC="${RAW%%-*}"
+          # Rewrite tauri.conf.json in-place — MSI rejects semver pre-release suffixes
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+            c.version = '$NUMERIC';
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+          "
+          echo "Normalized tauri.conf.json version to $NUMERIC"
+
       - name: Build Tauri app
         run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Create DMG with custom background
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP=$(find src-tauri/target -path '*/release/bundle/macos/*.app' -maxdepth 7 | head -1)
+          if [ -z "$APP" ]; then
+            echo "No .app found — skipping DMG beautification"
+            exit 0
+          fi
+          APP_NAME=$(basename "$APP" .app)
+          BUNDLE_ROOT=$(echo "$APP" | sed 's|/macos/.*||')
+          DMG_DIR="$BUNDLE_ROOT/dmg"
+          mkdir -p "$DMG_DIR"
+          rm -f "$DMG_DIR"/*.dmg 2>/dev/null || true
+
+          VERSION=$(node -p "require('./package.json').version")
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) ARCH=aarch64 ;;
+            x86_64-apple-darwin)  ARCH=x64 ;;
+            *)                    ARCH=universal ;;
+          esac
+          OUTPUT="$DMG_DIR/${APP_NAME}_${VERSION}_${ARCH}.dmg"
+          BG="src-tauri/resources/dmg-background.png"
+
+          bash scripts/create-dmg.sh "$APP" "$OUTPUT" "$BG"
 
       - name: Collect bundle files
         shell: bash

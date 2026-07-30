@@ -12,7 +12,7 @@ on:
       - '**.md'
       - 'docs/**'
   schedule:
-    # Run E2E tests nightly at 02:00 UTC.
+    # Nightly E2E tests at 02:00 UTC.
     - cron: "0 2 * * *"
   workflow_dispatch:
 

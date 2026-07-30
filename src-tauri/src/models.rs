@@ -276,7 +276,11 @@ pub(crate) fn default_runtime_log_retention_days() -> u32 {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            mode: "seekdb_embedded".to_string(),
+            mode: if cfg!(windows) {
+                "sqlite_embedded".to_string()
+            } else {
+                "seekdb_embedded".to_string()
+            },
             path: String::new(),
             host: String::new(),
             port: default_database_port(),

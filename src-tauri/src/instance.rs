@@ -82,8 +82,12 @@ fn patch_convert_models_if_needed(instance_dir: &Path) {
     let _ = fs::write(&path, patched);
 }
 
-/// Patch agent.py in agentic-rag-openvino instances to add an async
-/// compatibility shim for HuggingFacePipeline.
+/// Patch agent.py to add an async compatibility shim for HuggingFacePipeline.
+///
+/// The shim is added only when the instance depends on `langchain-huggingface`
+/// (checked via `pyproject.toml`), which provides `ChatHuggingFace` /
+/// `HuggingFacePipeline` — the classes affected by the `async_client` bug
+/// (langchain issue #34134, closed as not planned).
 fn patch_agent_async_if_needed(instance_dir: &Path) {
     let Some(path) = find_file_recursive(instance_dir, "agent.py", 5) else {
         return;
@@ -94,12 +98,25 @@ fn patch_agent_async_if_needed(instance_dir: &Path) {
     if content.contains("_patched_agenerate") {
         return;
     }
-    let marker = "from langchain_oceanbase.vectorstores import OceanbaseVectorStore";
-    if !content.contains(marker) {
+    // Only add the shim when the instance depends on langchain-huggingface,
+    // which provides ChatHuggingFace / HuggingFacePipeline (the classes
+    // affected by the async_client bug).
+    let uses_hf = find_file_recursive(instance_dir, "pyproject.toml", 5)
+        .and_then(|p| fs::read_to_string(&p).ok())
+        .map(|c| c.contains("langchain-huggingface"))
+        .unwrap_or(false);
+    if !uses_hf {
         return;
     }
+    let marker = "from langchain_oceanbase.vectorstores import OceanbaseVectorStore";
     let shim = "\n# --- Async compatibility shim for HuggingFacePipeline ---\n# ChatHuggingFace._astream doesn't check for HuggingFacePipeline and tries\n# to access async_client (which only exists on HuggingFaceEndpoint).\n# Route async calls through asyncio.to_thread to the sync _generate method.\nimport asyncio\nfrom langchain_core.messages import AIMessageChunk\nfrom langchain_core.outputs import ChatGenerationChunk as _ChatGenChunk\ntry:\n    from langchain_huggingface.chat_models.huggingface import ChatHuggingFace\n    from langchain_huggingface.chat_models.huggingface import HuggingFacePipeline\nexcept ImportError:\n    try:\n        from langchain_community.chat_models.huggingface import ChatHuggingFace\n        from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline\n    except ImportError:\n        ChatHuggingFace = None\n        HuggingFacePipeline = None\n\nif ChatHuggingFace is not None:\n    _orig_agenerate = ChatHuggingFace._agenerate\n    _orig_astream = ChatHuggingFace._astream\n\n    async def _patched_agenerate(self, messages, stop=None, run_manager=None, stream=None, **kwargs):\n        if isinstance(self.llm, HuggingFacePipeline):\n            return await asyncio.to_thread(self._generate, messages, stop, run_manager, **kwargs)\n        return await _orig_agenerate(self, messages, stop, run_manager, stream, **kwargs)\n\n    async def _patched_astream(self, messages, stop=None, run_manager=None, *, stream_usage=None, **kwargs):\n        if isinstance(self.llm, HuggingFacePipeline):\n            result = await asyncio.to_thread(self._generate, messages, stop, run_manager, **kwargs)\n            for gen in result.generations:\n                yield _ChatGenChunk(message=AIMessageChunk(content=gen.text), generation_info=gen.generation_info)\n            return\n        async for chunk in _orig_astream(self, messages, stop, run_manager, stream_usage=stream_usage, **kwargs):\n            yield chunk\n\n    ChatHuggingFace._agenerate = _patched_agenerate\n    ChatHuggingFace._astream = _patched_astream\n";
-    let patched = content.replacen(marker, &format!("{shim}\n{marker}"), 1);
+    let patched = if content.contains(marker) {
+        // Insert shim before the OceanbaseVectorStore marker in agent.py.
+        content.replacen(marker, &format!("{shim}\n{marker}"), 1)
+    } else {
+        // No marker in agent.py — prepend shim.
+        format!("{shim}\n{content}")
+    };
     let _ = fs::write(&path, patched);
 }
 

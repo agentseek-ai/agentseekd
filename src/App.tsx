@@ -1208,8 +1208,8 @@ export default function App() {
                       setStorageConfig({ ...storageConfig, mode, path: storagePathForMode(storageConfig, mode), database: storageDatabaseForMode(storageConfig, mode) });
                       setStorageConfigDirty(true);
                     }}>
-                      <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                       <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
+                      {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
                       <option value="seekdb_server">{tr("seekdbServer")}</option>
                     </select><ChevronDown /></div>
                   </label>
@@ -1525,8 +1525,8 @@ export default function App() {
                   setStorageConfig({ ...storageConfig, mode, path: storagePathForMode(storageConfig, mode), database: storageDatabaseForMode(storageConfig, mode) });
                   setStorageConfigDirty(true);
                 }}>
-                  <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                   <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
+                  {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
                   <option value="seekdb_server">{tr("seekdbServer")}</option>
                 </select><ChevronDown /></div>
               </label>

@@ -178,7 +178,7 @@ describe("type serialization shapes", () => {
   it("SystemInfo has all fields", () => {
     const obj: SystemInfo = {
       appName: "AgentSeek",
-      version: "1.0.0",
+      version: "0.0.1-rc.1",
       dataPath: "/tmp",
       cliStrategy: "uv run agentseek",
       storage: "SQLite",
