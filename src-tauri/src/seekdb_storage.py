@@ -1,7 +1,32 @@
+"""SeekDB storage bridge for AgentSeek Desktop.
+
+This script acts as a JSON-RPC-like bridge between the Rust backend (storage.rs)
+and the SeekDB database (via the pyseekdb client library).
+
+Communication protocol:
+  - Rust spawns this script as a child process with stdin/stdout piped.
+  - Rust sends one JSON object per line on stdin (a command/request).
+  - This script executes the command and prints one JSON response line to stdout.
+
+Supported commands:
+  - open:       Open a SeekDB connection (embedded or server mode).
+  - exec:       Execute a SQL statement with optional parameters.
+  - query:      Execute a SQL query and return rows as JSON arrays.
+  - close:      Close the connection and exit.
+
+The script maintains a single global connection. If a new `open` command is
+received while a connection is already open, the old connection is closed first.
+"""
+
 import json
 import sys
 
 import pyseekdb
+
+# Default connection parameters (must stay in sync with models.rs defaults).
+DEFAULT_PORT = 2881
+DEFAULT_DATABASE = "agentseek_desktop"
+DEFAULT_USER = "root"
 
 
 def respond(**payload):
@@ -13,29 +38,29 @@ def open_client(config):
     if mode == "seekdb_embedded":
         return pyseekdb.Client(
             path=config["path"],
-            database=config.get("database") or "agentseek_desktop",
+            database=config.get("database") or DEFAULT_DATABASE,
         )
     return pyseekdb.Client(
         host=config["host"],
-        port=int(config.get("port") or 2881),
+        port=int(config.get("port") or DEFAULT_PORT),
         tenant=config.get("tenant") or ("sys" if mode == "seekdb_server" else "test"),
-        database=config.get("database") or "agentseek_desktop",
-        user=config.get("user") or "root",
+        database=config.get("database") or DEFAULT_DATABASE,
+        user=config.get("user") or DEFAULT_USER,
         password=config.get("password") or "",
     )
 
 
 def ensure_database(config):
-    database = config.get("database") or "agentseek_desktop"
+    database = config.get("database") or DEFAULT_DATABASE
     mode = config["mode"]
     if mode == "seekdb_embedded":
         admin = pyseekdb.AdminClient(path=config["path"])
     else:
         admin = pyseekdb.AdminClient(
             host=config["host"],
-            port=int(config.get("port") or 2881),
+            port=int(config.get("port") or DEFAULT_PORT),
             tenant=config.get("tenant") or ("sys" if mode == "seekdb_server" else "test"),
-            user=config.get("user") or "root",
+            user=config.get("user") or DEFAULT_USER,
             password=config.get("password") or "",
         )
     existing = {item.name for item in admin.list_databases()}
@@ -280,6 +305,22 @@ def main():
             elif request["op"] == "ping":
                 for collection in collections.values():
                     collection.count()
+                respond(ok=True)
+            elif request["op"] == "get_config":
+                key = request["key"]
+                result = legacy.get(ids=[f"_config:{key}"], include=["metadatas"])
+                rows = result.get("ids") or []
+                if rows:
+                    payload = result["metadatas"][0].get("payload", "")
+                    value = json.loads(payload) if payload else None
+                else:
+                    value = None
+                respond(ok=True, value=value)
+            elif request["op"] == "set_config":
+                legacy.upsert(
+                    ids=[f"_config:{request['key']}"],
+                    metadatas=[{"payload": json.dumps(request["value"])}],
+                )
                 respond(ok=True)
             else:
                 respond(ok=False, error="unsupported operation")

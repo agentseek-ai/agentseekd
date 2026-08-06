@@ -26,14 +26,18 @@ pub(crate) struct RuntimeVersions {
     pub(crate) git: DependencyVersion,
     pub(crate) agentseek: DependencyVersion,
     pub(crate) nvm: DependencyVersion,
+    #[serde(default)]
+    pub(crate) pyseekdb: DependencyVersion,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Default)]
 pub(crate) struct DependencyVersion {
     #[serde(default)]
     pub(crate) minimum: String,
     #[serde(default)]
     pub(crate) managed: String,
+    #[serde(default)]
+    pub(crate) pinned: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -71,7 +75,7 @@ pub(crate) fn load_runtime_requirements(
 }
 
 pub(crate) fn validate_runtime_requirements(requirements: &RuntimeRequirements) -> Result<(), String> {
-    let required_versions = [
+    for (field, value) in [
         ("versions.uv.minimum", &requirements.versions.uv.minimum),
         ("versions.node.minimum", &requirements.versions.node.minimum),
         ("versions.node.managed", &requirements.versions.node.managed),
@@ -83,13 +87,21 @@ pub(crate) fn validate_runtime_requirements(requirements: &RuntimeRequirements) 
             &requirements.versions.agentseek.minimum,
         ),
         ("versions.nvm.managed", &requirements.versions.nvm.managed),
-    ];
-    for (field, value) in required_versions {
+    ] {
         if numeric_version(value).is_empty() {
             return Err(format!(
                 "Runtime requirements manifest field {field} is not a valid version number"
             ));
         }
+    }
+    // versions.pyseekdb.pinned is optional; when present it must be a valid version number.
+    if !requirements.versions.pyseekdb.pinned.is_empty()
+        && numeric_version(&requirements.versions.pyseekdb.pinned).is_empty()
+    {
+        return Err(
+            "Runtime requirements manifest field versions.pyseekdb.pinned is not a valid version number"
+                .to_string(),
+        );
     }
     if !requirements
         .sources
@@ -158,6 +170,14 @@ pub(crate) struct TemplateInfo {
     pub(crate) framework: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TemplateUpdateCheck {
+    pub(crate) current_version: String,
+    pub(crate) latest_version: String,
+    pub(crate) has_update: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstanceRecord {
@@ -185,7 +205,7 @@ pub(crate) struct InstanceRecord {
     pub(crate) service_endpoints: Vec<ServiceEndpoint>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServiceEndpoint {
     pub(crate) name: String,
@@ -257,6 +277,29 @@ pub(crate) struct StorageConfig {
     pub(crate) setup_completed: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TemplateConfig {
+    /// Git repository URL (defaults to the official agentseek-templates repo, never empty).
+    pub(crate) repo_url: String,
+    /// Tag, branch, or full 40-char commit SHA. Empty means auto-detect (latest release → "main").
+    #[serde(default)]
+    pub(crate) checkout: String,
+    /// Optional custom catalog JSON URL. Empty means use the repo's built-in catalog.
+    #[serde(default)]
+    pub(crate) catalog_url: String,
+}
+
+impl Default for TemplateConfig {
+    fn default() -> Self {
+        Self {
+            repo_url: "https://github.com/agentseek-ai/agentseek-templates.git".to_string(),
+            checkout: String::new(),
+            catalog_url: String::new(),
+        }
+    }
+}
+
 pub(crate) fn default_database_port() -> u16 {
     2881
 }
@@ -272,6 +315,23 @@ pub(crate) fn default_storage_user() -> String {
 pub(crate) fn default_runtime_log_retention_days() -> u32 {
     super::DEFAULT_RUNTIME_LOG_RETENTION_DAYS
 }
+
+// ---------------------------------------------------------------------------
+// China-region mirror URLs (centralized for maintainability)
+// ---------------------------------------------------------------------------
+
+/// npm registry mirror (npmmirror).
+pub(crate) const NPM_REGISTRY_MIRROR: &str = "https://registry.npmmirror.com";
+/// Node.js binary mirror (for NVM).
+pub(crate) const NVM_NODEJS_MIRROR: &str = "https://cdn.npmmirror.com/binaries/node";
+/// NVM install script mirror (Gitee).
+pub(crate) const NVM_INSTALL_MIRROR: &str = "https://gitee.com/mirrors/nvm";
+/// apt (Debian) mirror.
+pub(crate) const APT_MIRROR: &str = "mirrors.aliyun.com";
+/// PyPI mirror mirror.
+pub(crate) const PYPI_MIRROR: &str = "https://mirrors.aliyun.com/pypi/simple/";
+/// HuggingFace mirror.
+pub(crate) const HF_MIRROR: &str = "https://hf-mirror.com";
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -512,4 +572,73 @@ pub(crate) struct LifecycleManifest {
 pub(crate) struct LifecycleServiceSpec {
     #[serde(default)]
     pub(crate) url: String,
+}
+
+/// Truncate a string to at most `max` characters (char-boundary safe).
+/// Appends "..." when the string was cut; used for trace input/output summaries.
+pub(crate) fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        let mut truncated: String = value.chars().take(max.saturating_sub(3)).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace models (ATOF)
+// ---------------------------------------------------------------------------
+
+/// Lightweight trace row for the list page.
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TraceSummary {
+    pub trace_id: String,
+    pub status: String,
+    pub kind: String,
+    pub name: String,
+    pub input_summary: Option<String>,
+    pub output_summary: Option<String>,
+    pub start_time: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub span_count: usize,
+}
+
+/// Full trace with span tree for the detail page.
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TraceDetail {
+    pub trace_id: String,
+    pub status: String,
+    pub latency_ms: Option<u64>,
+    pub start_time: Option<String>,
+    pub spans: Vec<SpanNode>,
+}
+
+/// One node in the span execution tree.
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SpanNode {
+    pub span_id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub input: Option<serde_json::Value>,
+    pub output: Option<serde_json::Value>,
+    pub attributes: Option<serde_json::Value>,
+    pub children: Vec<SpanNode>,
+}
+
+/// Paginated trace list result.
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TracePage {
+    pub entries: Vec<TraceSummary>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }

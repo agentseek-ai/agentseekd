@@ -5,3 +5,4 @@ src-tauri/target/
 .DS_Store
 src-tauri/gen/schemas/
 tests/e2e/__pycache__/
+src-tauri/src/__pycache__/

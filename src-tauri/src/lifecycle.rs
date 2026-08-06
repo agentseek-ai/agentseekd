@@ -81,15 +81,27 @@ fn service_env_port(name: &str, env: &HashMap<String, String>) -> Option<u16> {
     })
 }
 
-fn enrich_service_endpoints(instance: &mut InstanceRecord) {
+/// Re-calibrate an instance from its on-disk lifecycle.toml / .env.
+/// Returns `true` when any calibratable field drifted, so callers can decide
+/// whether the change is worth persisting back to the DB.
+fn enrich_service_endpoints(instance: &mut InstanceRecord) -> bool {
     let path = Path::new(&instance.work_dir).join(".agentseek/lifecycle.toml");
     let Some(manifest) = fs::read_to_string(path)
         .ok()
         .and_then(|content| toml::from_str::<LifecycleManifest>(&content).ok())
     else {
-        return;
+        return false;
     };
-    if instance.project_name.is_none() && !manifest.name.trim().is_empty() {
+    // Snapshot the calibratable fields to detect drift.
+    let before = (
+        instance.project_name.clone(),
+        instance.lifecycle_version,
+        instance.service_endpoints.clone(),
+        instance.agent_url.clone(),
+        instance.ui_url.clone(),
+        instance.studio_url.clone(),
+    );
+    if !manifest.name.trim().is_empty() {
         instance.project_name = Some(manifest.name.clone());
     }
     instance.lifecycle_version = (manifest.version > 0).then_some(manifest.version);
@@ -145,6 +157,18 @@ fn enrich_service_endpoints(instance: &mut InstanceRecord) {
             _ => {}
         }
     }
+    let changed = before != (
+        instance.project_name.clone(),
+        instance.lifecycle_version,
+        instance.service_endpoints.clone(),
+        instance.agent_url.clone(),
+        instance.ui_url.clone(),
+        instance.studio_url.clone(),
+    );
+    if changed {
+        instance.updated_at = timestamp();
+    }
+    changed
 }
 
 fn lifecycle_section_service(header: &str) -> Option<String> {
@@ -286,35 +310,6 @@ fn synchronize_lifecycle_project_name_content(content: &str, project_name: &str)
     output
 }
 
-fn replace_project_name_in_directory(
-    dir: &Path,
-    old_name: &str,
-    new_name: &str,
-) -> Result<(), String> {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let entries = fs::read_dir(&current)
-            .map_err(|error| format!("Failed to read directory {}: {error}", current.display()))?;
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                if !path.to_string_lossy().contains("/.git") {
-                    stack.push(path);
-                }
-            } else if path.is_file() {
-                let Ok(content) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                if content.contains(old_name) {
-                    let updated = content.replace(old_name, new_name);
-                    fs::write(&path, updated)
-                        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Rewrites hardcoded port mappings in docker-compose.yml to `${ENV_KEY:-ORIGINAL}:CONTAINER` variable references.
 fn sync_docker_compose_port_mappings(content: &str, entries: &[EnvVariable]) -> String {
@@ -387,6 +382,74 @@ fn sync_docker_compose_port_mappings(content: &str, entries: &[EnvVariable]) -> 
     }
 
     updated
+}
+
+/// Injects `NPM_CONFIG_REGISTRY` into docker-compose services whose command
+/// runs `npm install`, so that dependency resolution uses a faster mirror
+/// instead of the default registry.npmjs.org (which is extremely slow from
+/// mainland China and causes frontend health-check timeouts).
+fn sync_docker_compose_npm_mirror(content: &str) -> String {
+    const ENV_KEY: &str = "NPM_CONFIG_REGISTRY";
+
+    // Only act when the compose file actually contains npm install commands.
+    if !content.contains("npm install") {
+        return content.to_string();
+    }
+
+    let stripped = content.replace("npm install --no-package-lock", "npm install");
+
+    // If the mirror env-var is already present somewhere, return after stripping.
+    if stripped.contains(ENV_KEY) {
+        return stripped;
+    }
+
+    // For every `environment:` block that belongs to a service whose command
+    // runs `npm install`, inject `NPM_CONFIG_REGISTRY`.
+    let mut lines: Vec<String> = stripped.lines().map(str::to_string).collect();
+    let mut env_indices: Vec<usize> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != "environment:" {
+            continue;
+        }
+        let env_indent = line.len() - line.trim_start().len();
+        // The service key sits one indent level above `environment:`.
+        let service_indent = env_indent.saturating_sub(2);
+        // Scan the entire service scope (all lines indented deeper than
+        // the service key) for `npm install`.
+        let mut service_has_npm_install = false;
+        for j in (i + 1)..lines.len() {
+            let next = &lines[j];
+            if next.trim().is_empty() {
+                continue;
+            }
+            let next_indent = next.len() - next.trim_start().len();
+            if next_indent <= service_indent {
+                break;
+            }
+            if next.contains("npm install") {
+                service_has_npm_install = true;
+                break;
+            }
+        }
+        if service_has_npm_install {
+            env_indices.push(i);
+        }
+    }
+
+    // Insert in reverse order so earlier indices remain valid.
+    for &idx in env_indices.iter().rev() {
+        let indent = lines[idx].len() - lines[idx].trim_start().len();
+        let prefix: String = lines[idx].chars().take(indent).collect();
+        let new_line = format!("{}  {}: \"{}\"", prefix, ENV_KEY, NPM_REGISTRY_MIRROR);
+        lines.insert(idx + 1, new_line);
+    }
+
+    let mut result = lines.join("\n");
+    if content.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn synchronize_instance_project_name(
@@ -768,6 +831,7 @@ fn synchronize_instance_port_configs(
         let compose_content = fs::read_to_string(&compose_path)
             .map_err(|error| format!("Failed to read {}: {error}", compose_path.display()))?;
         let compose_updated = sync_docker_compose_port_mappings(&compose_content, entries);
+        let compose_updated = sync_docker_compose_npm_mirror(&compose_updated);
         if compose_updated != compose_content {
             fs::write(&compose_path, &compose_updated)
                 .map_err(|error| format!("Failed to write {}: {error}", compose_path.display()))?;
@@ -804,11 +868,15 @@ fn synchronize_instance_configs_from_env(
     Ok(written)
 }
 
+/// Result of resolving lifecycle ports: rewritten manifest, port change list,
+/// and the resolved `(KEY, port)` pairs that must be synced back into .env.
+type LifecyclePortPlan = (String, Vec<PortChange>, Vec<(String, u16)>);
+
 fn resolve_lifecycle_ports(
     instance: &InstanceRecord,
     reserved_ports: &HashSet<u16>,
     env_entries: &[EnvVariable],
-) -> Result<(String, Vec<PortChange>, Vec<(String, u16)>), String> {
+) -> Result<LifecyclePortPlan, String> {
     let lifecycle_path = Path::new(&instance.work_dir).join(".agentseek/lifecycle.toml");
     let content = fs::read_to_string(&lifecycle_path)
         .map_err(|error| format!("Failed to read {}: {error}", lifecycle_path.display()))?;
@@ -878,4 +946,604 @@ fn resolve_lifecycle_ports(
     }
 
     Ok((updated_content, changes, port_map))
+}
+
+#[cfg(test)]
+mod tests_lifecycle {
+    use super::*;
+
+    #[test]
+    fn lifecycle_project_name_is_synchronized_without_changing_section_names() {
+        let lifecycle = "version = 1\n\
+template = \"deepagents/content-builder\"\n\
+name = \"Content Builder DeepAgent\" # generated default\n\
+[services.frontend]\n\
+name = \"Frontend\"\n\
+url = \"http://127.0.0.1:5174\"\n";
+
+        let updated = synchronize_lifecycle_project_name_content(lifecycle, "demo2 \\\"draft\\\"");
+        let parsed = updated.parse::<toml::Value>().expect("parse lifecycle");
+
+        assert_eq!(
+            parsed.get("name").and_then(toml::Value::as_str),
+            Some("demo2 \\\"draft\\\"")
+        );
+        assert!(updated.contains("# generated default"));
+        assert!(updated.contains("name = \"Frontend\""));
+        assert!(updated.contains("http://127.0.0.1:5174"));
+    }
+    #[test]
+    fn lifecycle_v1_enriches_instance_details() {
+        let root = env::temp_dir().join(format!("agentseek-desktop-details-{}", unique_stamp()));
+        let metadata = root.join(".agentseek");
+        fs::create_dir_all(&metadata).expect("create metadata directory");
+        fs::write(
+            metadata.join("lifecycle.toml"),
+            "version = 1\nname = \"My Bub Agent\"\n[env.BUB_MODEL]\nrequired = true\n[env.BUB_API_KEY]\nrequired = true\n[services.app]\nurl = \"http://127.0.0.1:5173\"\n[services.gateway]\nurl = \"http://127.0.0.1:8088/agent\"\n[services.copilotkit]\nurl = \"http://127.0.0.1:4000/api/copilotkit\"\n",
+        )
+        .expect("write lifecycle manifest");
+        let env_path = root.join(".env");
+        fs::write(
+            &env_path,
+            "BUB_MODEL=openai:gpt-4o-mini\nBUB_API_KEY=secret-value\nBUB_AG_UI_PORT=55550\nFRONTEND_PORT=55551\nCOPILOTKIT_PORT=57278\n",
+        )
+        .expect("write env");
+        let mut instance = InstanceRecord {
+            id: "bub-default".to_string(),
+            name: "bub_default".to_string(),
+            template_id: "bub/default".to_string(),
+            status: "running".to_string(),
+            deployment_mode: "local".to_string(),
+            work_dir: root.to_string_lossy().to_string(),
+            env_example_path: Some(root.join(".env.example").to_string_lossy().to_string()),
+            env_path: Some(env_path.to_string_lossy().to_string()),
+            note: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            needs_doctor: false,
+            pid: None,
+            agent_url: None,
+            ui_url: None,
+            studio_url: None,
+            project_name: None,
+            lifecycle_version: None,
+            service_endpoints: Vec::new(),
+        };
+
+        // First enrich: None -> value counts as drift, so it reports true (write back).
+        assert!(enrich_service_endpoints(&mut instance));
+
+        assert_eq!(instance.project_name.as_deref(), Some("My Bub Agent"));
+        assert_eq!(instance.lifecycle_version, Some(1));
+        assert_eq!(instance.service_endpoints.len(), 3);
+        assert!(instance
+            .service_endpoints
+            .iter()
+            .any(|endpoint| endpoint.primary && endpoint.kind == "web"));
+        assert!(instance
+            .service_endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == "protocol"));
+        assert_eq!(instance.ui_url.as_deref(), Some("http://127.0.0.1:55551"));
+        assert_eq!(
+            instance.agent_url.as_deref(),
+            Some("http://127.0.0.1:55550/agent")
+        );
+        assert!(instance
+            .service_endpoints
+            .iter()
+            .any(|endpoint| endpoint.url == "http://127.0.0.1:57278/api/copilotkit"));
+
+        // Tampered project_name: re-calibrated from the manifest, drift detected.
+        instance.project_name = Some("lag-development".to_string());
+        assert!(enrich_service_endpoints(&mut instance));
+        assert_eq!(instance.project_name.as_deref(), Some("My Bub Agent"));
+        // No drift on a subsequent run: nothing to write back.
+        assert!(!enrich_service_endpoints(&mut instance));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn unfinished_instances_are_not_marked_for_restart() {
+        let mut store = AppStore {
+            instances: vec![InstanceRecord {
+                id: "pending-instance".to_string(),
+                name: "Pending".to_string(),
+                template_id: "deepagents/research".to_string(),
+                status: "needs-restart".to_string(),
+                deployment_mode: "local".to_string(),
+                work_dir: "/tmp/pending-instance".to_string(),
+                env_example_path: Some("/tmp/pending-instance/.env.example".to_string()),
+                env_path: Some("/tmp/pending-instance/.env".to_string()),
+                note: String::new(),
+                created_at: 1,
+                updated_at: 1,
+                needs_doctor: true,
+                pid: None,
+                agent_url: None,
+                ui_url: None,
+                studio_url: None,
+                project_name: None,
+                lifecycle_version: None,
+                service_endpoints: Vec::new(),
+            }],
+            vault: Vec::new(),
+            logs: Vec::new(),
+        };
+
+        assert!(repair_predeployment_restart_statuses(&mut store));
+        assert_eq!(store.instances[0].status, "ready-to-install");
+        assert!(!store.instances[0].needs_doctor);
+    }
+    #[test]
+    fn process_command_port_inserted_from_lifecycle_url_when_no_env_port() {
+        // cli-remote: .env has no LANGGRAPH_PORT; port extracted from lifecycle.toml [services.langgraph] URL
+        let lifecycle = "version = 1\n\
+[services.langgraph]\nurl = \"http://127.0.0.1:54584\"\n\
+[processes.langgraph]\ncommand = [\"uv\", \"run\", \"langgraph\", \"dev\"]\n";
+        let entries = parse_env("LANGGRAPH_URL=http://127.0.0.1:54584\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(updated.contains("--port\""), "should insert --port, got:\n{updated}");
+        assert!(updated.contains("\"54584\""), "should contain port from URL, got:\n{updated}");
+    }
+    #[test]
+    fn process_command_without_port_gets_inserted() {
+        // cli-remote: lifecycle.toml has [processes.langgraph] but command has no --port
+        let lifecycle = "version = 1\n\
+[services.langgraph]\nurl = \"http://127.0.0.1:2024\"\n\
+[processes.langgraph]\ncommand = [\"uv\", \"run\", \"langgraph\", \"dev\"]\n";
+        let entries = parse_env("LANGGRAPH_PORT=54584\nLANGGRAPH_URL=http://127.0.0.1:54584\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(updated.contains("--port\""), "should insert --port, got:\n{updated}");
+        assert!(updated.contains("\"54584\""), "should contain new port, got:\n{updated}");
+    }
+    #[test]
+    fn process_command_without_port_inserted_preserved_by_synchronize_lifecycle() {
+        // Simulate full path of synchronize_instance_port_configs:
+        // synchronize_lifecycle_content + sync_process_command_ports
+        let lifecycle = "version = 1\r\n\
+[services.langgraph]\r\nurl = \"http://127.0.0.1:2024\"\r\n\
+[processes.langgraph]\r\ncommand = [\"uv\", \"run\", \"langgraph\", \"dev\"]\r\n";
+        let entries = parse_env("LANGGRAPH_PORT=54584\n");
+        let updated = synchronize_lifecycle_content(lifecycle, &entries);
+        let updated = sync_process_command_ports(&updated, &entries);
+        assert!(updated != lifecycle, "should differ from original");
+        assert!(updated.contains("--port\""), "should insert --port, got:\n{updated}");
+        assert!(updated.contains("\"54584\""), "should contain new port, got:\n{updated}");
+    }
+    #[test]
+    fn command_tokens_parses_array_and_string_forms() {
+        let arr = command_tokens("command = [\"npm\", \"run\", \"dev\"]");
+        assert_eq!(
+            arr,
+            vec![
+                "npm".to_string(),
+                "run".to_string(),
+                "dev".to_string()
+            ]
+        );
+        let s = command_tokens("command = \"npm run dev\"");
+        assert_eq!(
+            s,
+            vec![
+                "npm".to_string(),
+                "run".to_string(),
+                "dev".to_string()
+            ]
+        );
+        let empty = command_tokens("command = []");
+        assert!(empty.is_empty());
+    }
+    #[test]
+    fn remove_command_port_strips_port_from_array_and_string_forms() {
+        let arr = "command = [\"npm\", \"install\", \"--port\", \"61986\"]";
+        assert_eq!(
+            remove_command_port(arr).as_deref(),
+            Some("command = [\"npm\", \"install\"]")
+        );
+        let s = "command = \"npm install --port 61986\"";
+        assert_eq!(
+            remove_command_port(s).as_deref(),
+            Some("command = \"npm install\"")
+        );
+        // Returns None when no --port
+        assert!(remove_command_port("command = [\"npm\", \"install\"]").is_none());
+    }
+    #[test]
+    fn sync_process_command_ports_skips_install_commands() {
+        // npm install should not inject --port even if corresponding *_PORT exists
+        let lifecycle = "version = 1\n\
+[services.app]\nurl = \"http://127.0.0.1:61986\"\n\
+[processes.app]\ncommand = [\"npm\", \"install\"]\n";
+        let entries = parse_env("FRONTEND_PORT=61986\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            !updated.contains("--port"),
+            "install command must not get --port, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("\"npm\", \"install\"]"),
+            "install command should stay clean, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_cleans_injected_port_from_install_commands() {
+        // Install commands erroneously injected with --port by old logic should be cleaned up
+        let lifecycle = "version = 1\n\
+[processes.app]\ncommand = [\"npm\", \"install\", \"--port\", \"61986\"]\n";
+        let entries = parse_env("FRONTEND_PORT=61986\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            !updated.contains("--port"),
+            "stale --port must be removed, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("\"npm\", \"install\"]"),
+            "install command should be restored, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_injects_port_into_npm_run_dev() {
+        // npm run dev — inject "--", "--port", "<port>" so npm passes
+        // --port through to the underlying vite/uvicorn process.
+        let lifecycle = "version = 1\n\
+[services.app]\nurl = \"http://127.0.0.1:61986\"\n\
+[processes.app]\ncommand = [\"npm\", \"run\", \"dev\"]\n";
+        let entries = parse_env("FRONTEND_PORT=61986\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            updated.contains("\"--\", \"--port\", \"61986\""),
+            "npm run dev should get -- --port 61986, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_migrates_bare_port_to_npm_separator() {
+        // npm run dev with old-style --port (no -- separator) should be
+        // migrated to the correct "--", "--port", "<port>" format.
+        let lifecycle = "version = 1\n\
+[processes.frontend]\ncommand = [\"npm\", \"run\", \"dev\", \"--port\", \"61986\"]\n";
+        let entries = parse_env("FRONTEND_PORT=61986\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            updated.contains("\"--\", \"--port\", \"61986\""),
+            "should have -- separator, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("\"dev\", \"--port\""),
+            "old-style bare --port should be gone, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_skips_docker_compose() {
+        // docker compose up does not accept --port (reports unknown flag: --port)
+        let lifecycle = "version = 1\n\
+[services.seekdb]\nurl = \"http://127.0.0.1:2881\"\n\
+[processes.seekdb]\ncommand = [\"docker\", \"compose\", \"up\", \"seekdb\"]\n";
+        let entries = parse_env("SEEKDB_PORT=2881\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            !updated.contains("--port"),
+            "docker compose must not get --port, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_docker_compose_ports_replaces_host_port() {
+        // Original port 2881 should be replaced with ${SEEKDB_PORT:-2881}:2881 variable reference
+        let compose = "name: my_rag_agent\nservices:\n  seekdb:\n    image: quay.io/oceanbase/seekdb:latest\n    ports:\n      - \"127.0.0.1:2881:2881\"\n    volumes:\n      - ./.seekdb-data:/var/lib/oceanbase\n";
+        let entries = parse_env("SEEKDB_PORT=2891\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert!(
+            updated.contains("${SEEKDB_PORT:-2881}:2881"),
+            "should use variable reference, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("127.0.0.1:2881:2881"),
+            "old hardcoded mapping should be gone, got:\n{updated}"
+        );
+        // Volume mappings unchanged
+        assert!(updated.contains("./.seekdb-data:/var/lib/oceanbase"));
+    }
+    #[test]
+    fn sync_docker_compose_ports_no_change_when_no_env_port() {
+        // docker-compose.yml should not be modified when .env has no *_PORT
+        let compose = "services:\n  seekdb:\n    ports:\n      - \"127.0.0.1:2881:2881\"\n";
+        let entries = parse_env("BACKEND_PORT=2024\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert_eq!(updated, compose);
+    }
+    #[test]
+    fn sync_docker_compose_ports_handles_plain_mapping() {
+        // Port mapping "2881:2881" without IP prefix should also be replaced with variable reference
+        let compose = "services:\n  seekdb:\n    ports:\n      - \"2881:2881\"\n";
+        let entries = parse_env("SEEKDB_PORT=2900\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert!(
+            updated.contains("${SEEKDB_PORT:-2881}:2881"),
+            "should use variable reference, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_docker_compose_ports_skips_unrelated_services() {
+        // Services without corresponding *_PORT env variable should not be modified
+        let compose = "services:\n  seekdb:\n    ports:\n      - \"127.0.0.1:2881:2881\"\n  redis:\n    ports:\n      - \"127.0.0.1:6379:6379\"\n";
+        let entries = parse_env("SEEKDB_PORT=2891\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert!(updated.contains("${SEEKDB_PORT:-2881}:2881"));
+        assert!(updated.contains("127.0.0.1:6379:6379"));
+    }
+    #[test]
+    fn sync_docker_compose_ports_skips_volume_mappings() {
+        // Volume mappings should not be misidentified as port mappings
+        let compose = "services:\n  seekdb:\n    ports:\n      - \"127.0.0.1:2881:2881\"\n    volumes:\n      - ./.seekdb-data:/var/lib/oceanbase\n";
+        let entries = parse_env("SEEKDB_PORT=2891\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert!(updated.contains("${SEEKDB_PORT:-2881}:2881"));
+        assert!(updated.contains("./.seekdb-data:/var/lib/oceanbase"));
+    }
+    #[test]
+    fn sync_docker_compose_ports_idempotent() {
+        // Lines already using ${...} syntax should not be modified again (idempotent)
+        let compose = "services:\n  seekdb:\n    ports:\n      - \"127.0.0.1:${SEEKDB_PORT:-2881}:2881\"\n";
+        let entries = parse_env("SEEKDB_PORT=2900\n");
+        let updated = sync_docker_compose_port_mappings(compose, &entries);
+        assert_eq!(updated, compose);
+    }
+    #[test]
+    fn sync_process_command_ports_injects_into_shell_wrapped_commands() {
+        // sh -lc wrapped commands: --port must be injected INTO the inner
+        // command string, not as a separate array element passed to sh.
+        let lifecycle = "version = 1\n\
+[services.backend]\nurl = \"http://127.0.0.1:63928\"\n\
+[processes.backend]\ncommand = [\"sh\", \"-lc\", \"uv run langgraph dev --no-browser\"]\n";
+        let entries = parse_env("BACKEND_PORT=63928\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        // --port should appear INSIDE the shell command string
+        assert!(
+            updated.contains("langgraph dev --no-browser --port 63928"),
+            "--port must be injected into the inner shell command string, got:\n{updated}"
+        );
+        // --port should NOT be a separate array element
+        assert!(
+            !updated.contains("\", \"--port\", \"63928\""),
+            "--port must not be a separate TOML array element for sh -lc commands, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_no_leak_into_tasks() {
+        // [tasks.*] command should not be injected with process --port (Bug 1)
+        let lifecycle = "version = 1\n\
+[services.langgraph]\nurl = \"http://127.0.0.1:61889\"\n\
+[services.frontend]\nurl = \"http://127.0.0.1:61884\"\n\
+[processes.langgraph]\ncommand = [\"uv\", \"run\", \"langgraph\", \"dev\", \"--port\", \"2024\", \"--no-browser\"]\n\
+[processes.frontend]\ncommand = [\"npm\", \"run\", \"dev\"]\n\
+[tasks.backend]\ncommand = [\"uv\", \"sync\"]\n\
+[tasks.frontend]\ncommand = [\"npm\", \"install\", \"--prefix\", \"frontend\"]\n";
+        let entries = parse_env("LANGGRAPH_PORT=61889\nFRONTEND_PORT=61884\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        // langgraph command should have port replaced to 61889
+        assert!(
+            updated.contains("\"61889\""),
+            "langgraph should carry resolved port, got:\n{updated}"
+        );
+        // tasks should NOT have --port leaked from processes
+        assert!(
+            !updated.contains("sync\", \"--port\""),
+            "uv sync in tasks must not get --port, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("frontend\", \"--port\""),
+            "npm install in tasks must not get --port, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn accepts_port_flag_whitelist() {
+        // langgraph / vite / uvicorn accept --port
+        assert!(accepts_port_flag(&[
+            "uv".to_string(),
+            "run".to_string(),
+            "langgraph".to_string(),
+            "dev".to_string()
+        ]));
+        assert!(accepts_port_flag(&["langgraph".to_string(), "dev".to_string()]));
+        assert!(accepts_port_flag(&["vite".to_string()]));
+        assert!(accepts_port_flag(&[
+            "uvicorn".to_string(),
+            "main:app".to_string()
+        ]));
+        // npm run <script> accepts --port via -- separator
+        assert!(accepts_port_flag(&[
+            "npm".to_string(),
+            "run".to_string(),
+            "dev".to_string()
+        ]));
+        // Others do not accept
+        assert!(!accepts_port_flag(&[
+            "docker".to_string(),
+            "compose".to_string(),
+            "up".to_string()
+        ]));
+        assert!(!accepts_port_flag(&["uv".to_string(), "sync".to_string()]));
+        assert!(!accepts_port_flag(&["npm".to_string(), "install".to_string()]));
+        // sh -lc wrapped commands containing langgraph/uvicorn SHOULD accept --port
+        assert!(accepts_port_flag(&[
+            "sh".to_string(),
+            "-lc".to_string(),
+            "uv run langgraph dev".to_string()
+        ]));
+    }
+    #[test]
+    fn sync_process_command_ports_still_injects_port_for_non_npm_commands() {
+        // Ensure non-npm commands (langgraph dev) still get --port injected normally
+        let lifecycle = "version = 1\n\
+[services.langgraph]\nurl = \"http://127.0.0.1:2024\"\n\
+[processes.langgraph]\ncommand = [\"uv\", \"run\", \"langgraph\", \"dev\"]\n";
+        let entries = parse_env("LANGGRAPH_PORT=54584\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            updated.contains("--port"),
+            "langgraph command should get --port, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("\"54584\""),
+            "langgraph command should carry the port, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn resolve_lifecycle_ports_respects_user_configured_port() {
+        let root =
+            env::temp_dir().join(format!("agentseek-desktop-port-user-{}", unique_stamp()));
+        let metadata = root.join(".agentseek");
+        fs::create_dir_all(&metadata).expect("create metadata directory");
+        fs::write(
+            metadata.join("lifecycle.toml"),
+            "version = 1\n[services.langgraph]\nurl = \"http://127.0.0.1:2024\"\n",
+        )
+        .expect("write lifecycle");
+        let instance = InstanceRecord {
+            id: "port-test".to_string(),
+            name: "port_test".to_string(),
+            template_id: "langchain/test".to_string(),
+            status: "installing".to_string(),
+            deployment_mode: "local".to_string(),
+            work_dir: root.to_string_lossy().to_string(),
+            env_example_path: None,
+            env_path: None,
+            note: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            needs_doctor: false,
+            pid: None,
+            agent_url: None,
+            ui_url: None,
+            studio_url: None,
+            project_name: None,
+            lifecycle_version: None,
+            service_endpoints: Vec::new(),
+        };
+        let user_port = available_ephemeral_port().expect("allocate user port");
+        let entries = parse_env(&format!("LANGGRAPH_PORT={user_port}\n"));
+        let reserved = std::collections::HashSet::new();
+        let (_updated, changes, port_map) =
+            resolve_lifecycle_ports(&instance, &reserved, &entries).expect("resolve lifecycle ports");
+        let resolved = port_map
+            .iter()
+            .find(|(k, _)| k == "LANGGRAPH_PORT")
+            .map(|(_, p)| *p);
+        assert_eq!(
+            resolved,
+            Some(user_port),
+            "user-configured available port must be respected"
+        );
+        assert!(
+            changes.iter().all(|c| c.key != "LANGGRAPH_PORT"),
+            "no change expected when user port is available"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn resolve_lifecycle_ports_falls_back_to_default_when_env_absent() {
+        let root =
+            env::temp_dir().join(format!("agentseek-desktop-port-default-{}", unique_stamp()));
+        let metadata = root.join(".agentseek");
+        fs::create_dir_all(&metadata).expect("create metadata directory");
+        let default_port = available_ephemeral_port().expect("allocate default port");
+        fs::write(
+            metadata.join("lifecycle.toml"),
+            format!(
+                "version = 1\n[services.langgraph]\nurl = \"http://127.0.0.1:{default_port}\"\n"
+            ),
+        )
+        .expect("write lifecycle");
+        let instance = InstanceRecord {
+            id: "port-test".to_string(),
+            name: "port_test".to_string(),
+            template_id: "langchain/test".to_string(),
+            status: "installing".to_string(),
+            deployment_mode: "local".to_string(),
+            work_dir: root.to_string_lossy().to_string(),
+            env_example_path: None,
+            env_path: None,
+            note: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            needs_doctor: false,
+            pid: None,
+            agent_url: None,
+            ui_url: None,
+            studio_url: None,
+            project_name: None,
+            lifecycle_version: None,
+            service_endpoints: Vec::new(),
+        };
+        let entries = parse_env("");
+        let reserved = std::collections::HashSet::new();
+        let (_updated, _changes, port_map) =
+            resolve_lifecycle_ports(&instance, &reserved, &entries).expect("resolve lifecycle ports");
+        let resolved = port_map
+            .iter()
+            .find(|(k, _)| k == "LANGGRAPH_PORT")
+            .map(|(_, p)| *p);
+        assert_eq!(
+            resolved,
+            Some(default_port),
+            "should fall back to lifecycle default when env has no port"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn synchronize_lifecycle_content_empty_input() {
+        let entries = parse_env("");
+        let result = synchronize_lifecycle_content("", &entries);
+        assert_eq!(result, "");
+    }
+    #[test]
+    fn synchronize_lifecycle_content_missing_services_section() {
+        let content = "version = 1\nname = \"test\"\n";
+        let entries = parse_env("");
+        let result = synchronize_lifecycle_content(content, &entries);
+        // Content without services should be returned unchanged (or with minimal changes)
+        assert!(result.contains("version = 1"));
+        assert!(result.contains("name = \"test\""));
+    }
+    #[test]
+    fn lifecycle_manifest_empty_toml() {
+        let manifest: LifecycleManifest = toml::from_str("").expect("parse empty toml");
+        assert_eq!(manifest.version, 0);
+        assert!(manifest.services.is_empty());
+    }
+    #[test]
+    fn lifecycle_manifest_missing_services_section() {
+        let manifest: LifecycleManifest =
+            toml::from_str("version = 1\nname = \"test\"\n").expect("parse toml");
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.services.is_empty());
+    }
+    #[test]
+    fn sync_docker_compose_npm_mirror_injects_registry_and_strips_flag() {
+        let compose = "services:\n  frontend:\n    image: node:22-slim\n    environment:\n      FOO: bar\n    command:\n      - sh\n      - -lc\n      - |\n        npm install --no-package-lock\n        npx vite\n";
+        let updated = sync_docker_compose_npm_mirror(compose);
+        assert!(
+            updated.contains("NPM_CONFIG_REGISTRY: \"https://registry.npmmirror.com\""),
+            "should inject npm mirror, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("--no-package-lock"),
+            "should strip --no-package-lock, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_docker_compose_npm_mirror_idempotent() {
+        let compose = "services:\n  frontend:\n    image: node:22-slim\n    environment:\n      NPM_CONFIG_REGISTRY: \"https://registry.npmmirror.com\"\n    command:\n      - npm install\n";
+        let updated = sync_docker_compose_npm_mirror(compose);
+        assert_eq!(
+            updated.matches("NPM_CONFIG_REGISTRY").count(),
+            1,
+            "should not duplicate mirror entry, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_docker_compose_npm_mirror_skips_without_npm_install() {
+        let compose = "services:\n  backend:\n    image: python:3.12\n    environment:\n      FOO: bar\n";
+        let updated = sync_docker_compose_npm_mirror(compose);
+        assert_eq!(updated, compose, "should not modify compose without npm install");
+    }
 }

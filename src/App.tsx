@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { filterTemplates, templateFrameworks as collectTemplateFrameworks } from "./template-utils";
 import {
   Boxes,
   Check,
@@ -24,6 +25,7 @@ import {
   Maximize2,
   Moon,
   Orbit,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCw,
@@ -52,6 +54,10 @@ import type {
   SystemInfo,
   StorageStatus,
   TemplateInfo,
+  TemplateUpdateCheck,
+  TraceSummary,
+  TraceDetail,
+  SpanNode,
 } from "./types";
 
 type Theme = "light" | "dark";
@@ -226,6 +232,8 @@ function statusTone(status: string) {
 
 /// Number of log groups displayed per page in the log center.
 const LOGS_PER_PAGE = 10;
+/// Number of trace summaries displayed per page.
+const TRACES_PER_PAGE = 20;
 
 export default function App() {
   const [page, setPage] = useState<Page>("instances");
@@ -238,15 +246,23 @@ export default function App() {
   const [logGroupCount, setLogGroupCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshingTemplates, setRefreshingTemplates] = useState(false);
+  const [templateUpdateInfo, setTemplateUpdateInfo] = useState<TemplateUpdateCheck | null>(null);
+  const [templateUpdating, setTemplateUpdating] = useState(false);
+  const [templateVersionDisplay, setTemplateVersionDisplay] = useState<TemplateUpdateCheck | null>(null);
+  const [templateUrlEditOpen, setTemplateUrlEditOpen] = useState(false);
+  const [templateRepoUrlInput, setTemplateRepoUrlInput] = useState("");
+  const [templateCatalogInput, setTemplateCatalogInput] = useState("");
+  const [templateUrlSaving, setTemplateUrlSaving] = useState(false);
   const [search, setSearch] = useState("");
+  const [templateTab, setTemplateTab] = useState("all");
   const [toast, setToast] = useState("");
   const [installState, setInstallState] = useState<InstallState | null>(null);
   const [installModalVisible, setInstallModalVisible] = useState(true);
-  const [installMinimized, setInstallMinimized] = useState(false);
   const [installDrag, setInstallDrag] = useState({ x: 0, y: 0 });
   const [installDragging, setInstallDragging] = useState(false);
   const installDragRef = useRef({ startX: 0, startY: 0, offsetX: 0, offsetY: 0 });
   const [detailInstance, setDetailInstance] = useState<InstanceRecord | null>(null);
+  const [traceLoading, setTraceLoading] = useState(false);
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [cliStatus, setCliStatus] = useState<CliStatus | null>(null);
   const [cliInstalling, setCliInstalling] = useState(false);
@@ -276,6 +292,19 @@ export default function App() {
   const [configTab, setConfigTab] = useState<"vault" | "instance">("vault");
   const [logCategory, setLogCategory] = useState<"all" | "install" | "runtime">("all");
   const [logInstance, setLogInstance] = useState("all");
+  const [traceInstanceId, setTraceInstanceId] = useState("");
+  const [traceSummaries, setTraceSummaries] = useState<TraceSummary[]>([]);
+  const [tracePage, setTracePage] = useState(1);
+  const [traceTotal, setTraceTotal] = useState(0);
+  const [traceDetailView, setTraceDetailView] = useState<TraceDetail | null>(null);
+  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null);
+  const [tracePanelOpen, setTracePanelOpen] = useState(false);
+  const [detailTab, setDetailTab] = useState<"entry" | "trace">("entry");
+  const [tracePanelSummaries, setTracePanelSummaries] = useState<TraceSummary[]>([]);
+  const [tracePanelLoading, setTracePanelLoading] = useState(false);
+  const [tracePanelRefreshKey, setTracePanelRefreshKey] = useState(0);
+  const [tracePanelDetail, setTracePanelDetail] = useState<TraceDetail | null>(null);
+  const [tracePanelSelectedSpanId, setTracePanelSelectedSpanId] = useState<string | null>(null);
   const [runtimeRetentionDays, setRuntimeRetentionDays] = useState(7);
   const [logSettingsBusy, setLogSettingsBusy] = useState(false);
   const [expandedLogGroups, setExpandedLogGroups] = useState<Set<string>>(new Set());
@@ -379,6 +408,66 @@ export default function App() {
     }
   }, [notify]);
 
+  const checkAndPromptTemplateUpdate = useCallback(async () => {
+    setRefreshingTemplates(true);
+    try {
+      const [updateInfo, nextTemplates] = await Promise.all([
+        desktopApi.checkTemplateUpdate(),
+        desktopApi.listTemplates(true),
+      ]);
+      setTemplates(nextTemplates);
+      setTemplateVersionDisplay(updateInfo);
+      if (updateInfo.hasUpdate) {
+        setTemplateUpdateInfo(updateInfo);
+      }
+    } catch (error) {
+      notify(errorMessage(error));
+    } finally {
+      setRefreshingTemplates(false);
+    }
+  }, [notify]);
+
+  const confirmTemplateUpdate = useCallback(async () => {
+    setTemplateUpdating(true);
+    setTemplateUpdateInfo(null);
+    try {
+      const nextTemplates = await desktopApi.updateTemplates();
+      setTemplates(nextTemplates);
+      const updateInfo = await desktopApi.checkTemplateUpdate();
+      setTemplateVersionDisplay(updateInfo);
+      notify(tr("templateUpdateSuccess"));
+    } catch (error) {
+      notify(tr("templateUpdateFailed") + ": " + errorMessage(error));
+    } finally {
+      setTemplateUpdating(false);
+    }
+  }, [notify, tr]);
+
+  const openTemplateUrlEdit = useCallback(async () => {
+    const cfg = await desktopApi.getTemplateSettings();
+    setTemplateRepoUrlInput(cfg.repoUrl);
+    setTemplateCatalogInput(cfg.catalogUrl);
+    setTemplateUrlEditOpen(true);
+  }, []);
+
+  const saveTemplateUrl = useCallback(async () => {
+    setTemplateUrlSaving(true);
+    try {
+      await desktopApi.saveTemplateSettings({
+        repoUrl: templateRepoUrlInput,
+        checkout: "",
+        catalogUrl: templateCatalogInput,
+      });
+      setTemplateUrlEditOpen(false);
+      notify(tr("templateUrlSaved"));
+      await refreshTemplates();
+    } catch (error) {
+      notify(tr("templateUrlInvalid") + ": " + errorMessage(error));
+    } finally {
+      setTemplateUrlSaving(false);
+    }
+  }, [templateRepoUrlInput, templateCatalogInput, notify, tr, refreshTemplates]);
+
   useEffect(() => {
     if (initializedRef.current) return;
     initializedRef.current = true;
@@ -474,6 +563,80 @@ export default function App() {
       window.clearInterval(timer);
     };
   }, [page]);
+
+  // ── Helper: extract Phoenix URL from an instance ──
+  const phoenixUrlFor = useCallback((inst: InstanceRecord | null | undefined) => {
+    if (!inst?.serviceEndpoints) return null;
+    const ep = inst.serviceEndpoints.find(
+      (s) => s.name.toLowerCase() === "phoenix" || (s.kind === "web" && !s.primary && s.url?.includes("6006")),
+    );
+    return ep?.url?.replace(/\/+$/, "") ?? null;
+  }, []);
+
+  // ── Helper: load one trace page (ATOF first; Phoenix GraphQL fallback when empty) ──
+  const fetchTracePage = async (instance: InstanceRecord, page: number, limit: number) => {
+    let result = await desktopApi.listAtofTraces(instance.workDir, page, limit);
+    if (result.entries.length === 0 && result.total === 0) {
+      const pUrl = phoenixUrlFor(instance);
+      if (pUrl) {
+        try { result = await desktopApi.queryPhoenixTraces(pUrl, instance.name, page, limit); } catch { /* keep ATOF empty result */ }
+      }
+    }
+    return result;
+  };
+
+  // ── Trace center data ──
+  useEffect(() => {
+    if (page !== "traces" || traceDetailView) return;
+    // Auto-select first running instance when entering trace center.
+    if (!traceInstanceId) {
+      const firstRunning = instances.find((i) => i.status === "running");
+      if (firstRunning) { setTraceInstanceId(firstRunning.id); return; }
+      return;
+    }
+    const instance = instances.find((i) => i.id === traceInstanceId);
+    if (!instance?.workDir) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const result = await fetchTracePage(instance, tracePage, TRACES_PER_PAGE);
+        if (active) { setTraceSummaries(result.entries); setTraceTotal(result.total); }
+      } catch { /* keep stale data */ }
+    };
+    setTraceLoading(true);
+    void poll().finally(() => { if (active) setTraceLoading(false); });
+    const timer = window.setInterval(() => void poll(), 5_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [page, traceInstanceId, instances, traceDetailView, tracePage]);
+
+  // ── Trace panel data (ATOF first; Phoenix fallback when no local data) ──
+  const phoenixBaseUrl = useMemo(() => phoenixUrlFor(detailInstance), [detailInstance, phoenixUrlFor]);
+
+  useEffect(() => {
+    if (!detailInstance) return;
+    const isRunning = detailInstance.status === "running";
+    if (!detailInstance.workDir || !isRunning) {
+      setTracePanelSummaries([]);
+      return;
+    }
+    let active = true;
+    setTracePanelLoading(true);
+    (async () => {
+      try {
+        const result = await fetchTracePage(detailInstance, 1, 50);
+        if (active) { setTracePanelSummaries(result.entries); setTracePanelLoading(false); }
+      } catch (err) { console.error(err); notify(errorMessage(err)); if (active) { setTracePanelSummaries([]); setTracePanelLoading(false); } }
+    })();
+    return () => { active = false; };
+  }, [detailInstance?.id, detailInstance?.workDir, detailInstance?.status, tracePanelRefreshKey]);
+
+  useEffect(() => {
+    if (!detailInstance) setDetailTab("entry");
+  }, [detailInstance]);
+
+  useEffect(() => {
+    setTracePage(1);
+  }, [traceInstanceId]);
 
   const saveRuntimeLogRetention = async () => {
     if (!Number.isInteger(runtimeRetentionDays) || runtimeRetentionDays < 1 || runtimeRetentionDays > 3650) {
@@ -638,6 +801,7 @@ export default function App() {
     templates: [tr("templates"), tr("templatesDesc")],
     config: [tr("config"), tr("configDesc")],
     logs: [tr("logs"), tr("logsDesc")],
+    traces: [tr("traces"), tr("tracesDesc")],
   }[page];
 
   const filteredInstances = useMemo(() => {
@@ -647,12 +811,11 @@ export default function App() {
     );
   }, [instances, search]);
 
-  const filteredTemplates = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return templates.filter((template) =>
-      !query || [template.id, template.name, template.description, template.framework].some((value) => value.toLowerCase().includes(query)),
-    );
-  }, [search, templates]);
+  // Distinct template types (framework = first segment of the template id),
+  // rendered as tabs above the template list.
+  const templateFrameworks = useMemo(() => collectTemplateFrameworks(templates), [templates]);
+
+  const filteredTemplates = useMemo(() => filterTemplates(templates, templateTab, search), [templates, templateTab, search]);
 
   const filteredLogs = useMemo(
     () =>
@@ -681,7 +844,7 @@ export default function App() {
       const deleted = !instanceStatus && latestEntry?.level === "success" && latestMessage.includes("deleted");
       return {
         id,
-        instanceName: latestEntry?.instanceName || "AgentSeek",
+        instanceName: latestEntry?.instanceName || "AgentSeek Desktop",
         instanceStatus,
         entries: orderedEntries,
         latestAt: Math.max(...entries.map((entry) => entry.createdAt)),
@@ -792,7 +955,6 @@ export default function App() {
     }
     setInstallModalVisible(true);
     setInstallState({ ...installState, step: "deploying", deploymentStage: "create", error: "" });
-    setInstallMinimized(false);
     try {
       const prepared = await desktopApi.prepareInstance(installState.form);
       setInstallState({ ...installState, step: "env", instance: prepared.instance, entries: prepared.env, generated: null, warning: prepared.dockerWarning || "", deploymentStage: "tasks", error: "" });
@@ -1185,7 +1347,7 @@ export default function App() {
     return (
       <div className="cli-setup-shell">
         <header className="cli-setup-header">
-          <div className="brand"><div className="app-mark"><Orbit /></div><div><strong>AgentSeek</strong><span>Template Runtime</span></div></div>
+          <div className="brand"><div className="app-mark"><Orbit /></div><div><strong>AgentSeek Desktop</strong><span>Template Runtime</span></div></div>
           <div className="top-actions">
             <button className="language-button" type="button" onClick={() => setLanguage(language === "zh" ? "en" : "zh")}><Languages /><span>{language === "zh" ? tr("languageChinese") : tr("languageEnglish")}</span></button>
             <button className="icon-button" type="button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} aria-label={tr("theme")}>{theme === "light" ? <Moon /> : <Sun />}</button>
@@ -1264,7 +1426,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="app-mark"><Orbit /></div>
-          <div><strong>AgentSeek</strong><span>Template Runtime</span></div>
+          <div><strong>AgentSeek Desktop</strong><span>Template Runtime</span></div>
         </div>
 
         <nav className="nav-list" aria-label="Primary">
@@ -1300,7 +1462,7 @@ export default function App() {
               <label className="search-box"><Search /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={page === "templates" ? tr("searchTemplates") : tr("search")} /></label>
               <div className="command-actions">
                 {cliStatus?.cliUpdateAvailable && <div className="cli-update-notice"><span><strong>{tr("cliUpdateAvailable")}</strong><small>{cliStatus.cliVersion} → v{cliStatus.cliLatestVersion}</small></span><button className="button" type="button" onClick={() => void openRuntimeInstallConfirm(true)} disabled={cliInstalling || installPlanLoading}>{cliUpgradeRequested && (cliInstalling || installPlanLoading) ? <LoaderCircle className="spin" /> : <SquareTerminal />}{cliInstalling && cliUpgradeRequested ? tr("upgradingCli") : tr("upgradeCli")}</button></div>}
-                {page === "templates" && <button className="button secondary" type="button" onClick={() => void refreshTemplates(true)} disabled={refreshingTemplates}><RefreshCw className={refreshingTemplates ? "spin" : ""} />{tr("refresh")}</button>}
+                {page === "templates" && <><button className="button secondary" type="button" onClick={() => void checkAndPromptTemplateUpdate()} disabled={refreshingTemplates || templateUpdating}><RefreshCw className={(refreshingTemplates || templateUpdating) ? "spin" : ""} />{templateUpdating ? tr("templateUpdating") : tr("refresh")}</button><button className="icon-button" type="button" onClick={() => void openTemplateUrlEdit()} title={tr("editTemplateSettings")} aria-label={tr("editTemplateSettings")}><Pencil /></button></>}
               </div>
             </div>
           )}
@@ -1332,15 +1494,21 @@ export default function App() {
           {page === "templates" && (
             <div className="template-layout">
               <div className="template-list surface">
-                <div className="section-heading"><div><h2>{tr("templates")}</h2><p><SquareTerminal />agentseek create --list-templates</p></div><span className="count-label">{filteredTemplates.length}</span></div>
-                {filteredTemplates.map((template) => (
+                <div className="section-heading"><div><h2>{tr("templates")}</h2><p><SquareTerminal />agentseek create --list-templates{templateVersionDisplay?.currentVersion && <span className="template-version-tag">{tr("templateVersion")}: {templateVersionDisplay.currentVersion}{templateVersionDisplay.hasUpdate && <span className="template-update-badge">{tr("templateUpdateAvailable")}</span>}</span>}</p></div><span className="count-label">{filteredTemplates.length}</span></div>
+                <div className="template-tabs" role="tablist" aria-label={tr("template")}>
+                  <button type="button" role="tab" aria-selected={templateTab === "all"} className={templateTab === "all" ? "active" : ""} onClick={() => setTemplateTab("all")}>{tr("templateAll")}<small>{templates.length}</small></button>
+                  {templateFrameworks.map((framework) => (
+                    <button key={framework} type="button" role="tab" aria-selected={templateTab === framework} className={templateTab === framework ? "active" : ""} onClick={() => setTemplateTab(framework)}>{framework}<small>{templates.filter((template) => template.framework === framework).length}</small></button>
+                  ))}
+                </div>
+                {filteredTemplates.length ? filteredTemplates.map((template) => (
                   <div className="template-row" key={template.id}>
                     <div className={`framework-mark ${template.framework}`}>{template.framework.slice(0, 2).toUpperCase()}</div>
                     <div className="template-copy"><strong>{template.name}</strong><code>{template.id}</code><p>{template.description}</p></div>
                     <span className="framework-label">{template.framework}</span>
                     <button className="button secondary" type="button" onClick={() => openInstall(template)}>{tr("install")}</button>
                   </div>
-                ))}
+                )) : <div className="empty-state"><LayoutTemplate /><strong>{tr("noTemplates")}</strong></div>}
               </div>
               <aside className="process-panel">
                 <div className="section-heading"><div><h2>{tr("installSteps")}</h2></div></div>
@@ -1360,11 +1528,15 @@ export default function App() {
                   <div className="env-scroll">{renderEnvTable(vault, setVault, "vault", true)}</div>
                   <div className="sticky-actions"><span>{vault.filter((entry) => entry.modified).length} {tr("modified")}</span><button className="button primary" onClick={saveVault} type="button"><Check />{tr("saveVault")}</button></div>
                 </div>
+              ) : instances.length === 0 ? (
+                <div className="config-workspace surface">
+                  <div className="empty-state"><Boxes /><strong>{tr("noInstances")}</strong><span>{tr("noInstancesHint")}</span></div>
+                </div>
               ) : (
                 <div className="config-workspace surface with-footer">
-                  <div className="config-toolbar"><div><h2>{tr("instanceEnv")}</h2><p>{instances.find((instance) => instance.id === selectedConfigId)?.envPath || instances.find((instance) => instance.id === selectedConfigId)?.envExamplePath || "—"}</p></div><label className="select-field"><span>{tr("selectInstance")}</span><select value={selectedConfigId} onChange={(event) => setSelectedConfigId(event.target.value)}>{instances.map((instance) => <option key={instance.id} value={instance.id}>{instance.name} · {formatTime(instance.createdAt, language)}</option>)}</select><ChevronDown /></label></div>
+                  <div className="config-toolbar"><div><h2>{tr("instanceEnv")}</h2><p>{instances.find((instance) => instance.id === selectedConfigId)?.envPath || instances.find((instance) => instance.id === selectedConfigId)?.envExamplePath || "—"}</p></div><div><button className="button secondary" onClick={() => setConfigEntries((current) => [...current, { key: "", value: "", comment: "", source: "instance", modified: true }])} type="button"><Plus />{tr("addVariable")}</button><label className="select-field"><span>{tr("selectInstance")}</span><select value={selectedConfigId} onChange={(event) => setSelectedConfigId(event.target.value)}>{instances.map((instance) => <option key={instance.id} value={instance.id}>{instance.name} · {formatTime(instance.createdAt, language)}</option>)}</select><ChevronDown /></label></div></div>
                   <div className="stats-row"><div><span>{tr("all")}</span><strong>{configEntries.length}</strong></div><div><span>{tr("fromVault")}</span><strong>{configEntries.filter((entry) => entry.source === "vault").length}</strong></div><div><span>{tr("templateDefault")}</span><strong>{configEntries.filter((entry) => entry.source === "template").length}</strong></div><div><span>{tr("missing")}</span><strong>{configEntries.filter((entry) => !entry.value).length}</strong></div></div>
-                  <div className="env-scroll">{configBusy ? <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div> : renderEnvTable(configEntries, setConfigEntries, "config")}</div>
+                  <div className="env-scroll">{configBusy ? <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div> : renderEnvTable(configEntries, setConfigEntries, "config", true)}</div>
                   <div className="sticky-actions"><span>{configGenerated ? `${tr("generated")} ${configGenerated.path} (${configGenerated.keyCount} ${tr("keys")})${configGenerated.portChanges.length ? ` · ${portChangeSummary(configGenerated)}` : ""}` : tr("envHint")}</span><button className="button primary" onClick={() => saveConfigEnv()} disabled={!selectedConfigId || configBusy} type="button"><FileKey />{tr("generateEnv")}</button></div>
                 </div>
               )}
@@ -1378,7 +1550,7 @@ export default function App() {
                   {(["all", "install", "runtime"] as const).map((category) => <button className={logCategory === category ? "active" : ""} onClick={() => setLogCategory(category)} type="button" key={category}>{category === "all" ? tr("all") : tr(category === "install" ? "installLog" : "runtimeLog")}</button>)}
                 </div>
                 <div className="log-toolbar-actions">
-                  {logCategory === "runtime" && <label className="retention-control"><span>{tr("runtimeRetention")}</span><input type="number" min="1" max="3650" value={runtimeRetentionDays} onChange={(event) => setRuntimeRetentionDays(Number(event.target.value))} /><span>{tr("days")}</span><button className="button secondary" disabled={logSettingsBusy || runtimeRetentionDays < 1 || runtimeRetentionDays > 3650} onClick={() => void saveRuntimeLogRetention()} type="button">{logSettingsBusy ? <LoaderCircle className="spin" /> : <Check />}{tr("saveRetention")}</button></label>}
+                  {logCategory === "runtime" && <label className="retention-control"><span>{tr("runtimeRetention")}</span><input type="number" min="1" max="3650" value={runtimeRetentionDays} onChange={(event) => setRuntimeRetentionDays(Number(event.target.value))} /><span>{tr("days")}</span><button className="button secondary" disabled={logSettingsBusy || runtimeRetentionDays < 1 || runtimeRetentionDays > 3650} onClick={() => void saveRuntimeLogRetention()} type="button">{logSettingsBusy ? <LoaderCircle className="spin" /> : <Check />}{tr("save")}</button></label>}
                   <label className="select-field compact-select"><select value={logInstance} onChange={(event) => setLogInstance(event.target.value)}><option value="all">{tr("all")}</option>{instances.map((instance) => <option value={instance.id} key={instance.id}>{instance.name}</option>)}</select><ChevronDown /></label>
                 </div>
               </div>
@@ -1415,6 +1587,21 @@ export default function App() {
               )}
             </div>
           )}
+
+          {page === "traces" && (
+            <div className="traces-page surface">
+              {!traceDetailView ? (
+                <>
+              <div className="log-toolbar">
+                <h2>{tr("traces")}</h2>
+              </div>
+              {!traceInstanceId ? <div className="empty-state"><Orbit /><strong>{tr("openTraces")}</strong><span>{tr("selectTraceHint")}</span></div> : traceLoading ? <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div> : traceSummaries.length === 0 ? <div className="empty-state small"><CircleAlert /><span>{tr("noTraces")}</span><span>{tr("noTracesHint")}</span></div> : <><div className="trace-list-page"><div className="trace-table-head"><span>{tr("traceId")}</span><span>{tr("traceStatus")}</span><span>{tr("kind")}</span><span>{tr("traceTabInput")}</span><span>{tr("traceTabOutput")}</span><span>{tr("startTime")}</span><span>{tr("traceLatency")}</span></div>{traceSummaries.map((t) => { const tone = t.status === "ERROR" ? "error" : "success"; const latency = t.latencyMs != null ? t.latencyMs >= 1000 ? `${(t.latencyMs / 1000).toFixed(1)}s` : `${t.latencyMs}ms` : "—"; return (<button className="trace-table-row" key={t.traceId} type="button" onClick={() => { setTraceLoading(true); const inst = instances.find((i) => i.id === traceInstanceId); if (inst) { desktopApi.getAtofTraceDetail(inst.workDir, t.traceId).then((d) => { if (d) { setTraceDetailView(d); setSelectedSpanId(null); return; } const pUrl = phoenixUrlFor(inst); if (pUrl) { return desktopApi.queryPhoenixTraceDetail(pUrl, t.traceId).then((pd) => { setTraceDetailView(pd); setSelectedSpanId(null); }); } }).catch(() => notify(tr("traceDetailLoadFailed"))).finally(() => setTraceLoading(false)); } }}><span className="trace-id-cell" title={t.traceId}>{t.traceId.slice(0, 12)}</span><span className={`status ${tone}`}><i />{t.status}</span><span className="trace-kind-badge">{t.kind}</span><span className="trace-io-cell" title={t.inputSummary ?? ""}>{t.inputSummary ?? "—"}</span><span className="trace-io-cell" title={t.outputSummary ?? ""}>{t.outputSummary ?? "—"}</span><span>{t.startTime ? String(t.startTime).slice(0, 19) : "—"}</span><span>{latency}</span></button>); })}</div>{(() => { const totalTracePages = Math.max(1, Math.ceil(traceTotal / TRACES_PER_PAGE)); return traceTotal > TRACES_PER_PAGE ? <div className="log-pagination"><span className="log-pagination-count">{traceTotal} traces</span><button className="button secondary compact" disabled={tracePage <= 1} onClick={() => setTracePage((p) => p - 1)} type="button"><ChevronLeft /></button><span className="log-pagination-info">{tracePage} / {totalTracePages}</span><button className="button secondary compact" disabled={tracePage >= totalTracePages} onClick={() => setTracePage((p) => p + 1)} type="button"><ChevronRight /></button></div> : null; })()}</>}
+                </>
+              ) : (
+                <TraceDetailPanel detail={traceDetailView!} onBack={() => { setTraceDetailView(null); setSelectedSpanId(null); }} selectedSpanId={selectedSpanId} onSelectSpan={setSelectedSpanId} tr={tr} language={language} />
+              )}
+            </div>
+          )}
         </section>
       </main>
 
@@ -1423,7 +1610,7 @@ export default function App() {
       {installState && installModalVisible && (
         <div className="modal-backdrop">
           <div className={`modal install-modal ${installState.step === "env" ? "wide" : ""}`} role="dialog" aria-modal="true">
-            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallMinimized(true); setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
+            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
             {installState.step === "form" && <div className="modal-body form-grid">
               <label><span>{tr("instanceName")}</span><input autoFocus value={installState.form.name} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, name: event.target.value }, error: "" })} placeholder="rag-development" /></label>
               <label className="full"><span>{tr("targetDir")}</span><div className="path-picker"><input value={installState.form.targetDir} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, targetDir: event.target.value }, error: "" })} placeholder="/Users/name/AgentSeek/instances" /><button type="button" onClick={async () => { const path = await desktopApi.chooseDirectory(); if (path) setInstallState({ ...installState, form: { ...installState.form, targetDir: path }, error: "" }); }}><FolderOpen />{tr("choose")}</button></div>{installState.form.targetDir.trim() && installState.form.name.trim() && <code className="target-path-preview">{`${installState.form.targetDir.replace(/[\\/]+$/, "")}/${installState.form.name.trim()}`}</code>}</label>
@@ -1431,7 +1618,7 @@ export default function App() {
               <label className="full"><span>{tr("note")}</span><textarea value={installState.form.note} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, note: event.target.value } })} rows={3} /></label>
               {!isNativeDesktop && <div className="native-required full"><CircleAlert /><span><strong>{tr("nativeRequired")}</strong><code>{tr("nativeCommand")}</code></span></div>}
             </div>}
-            {installState.step === "env" && <div className="modal-body env-modal-body"><div className="env-context"><ShieldCheck /><div><strong>{tr("envTitle")}</strong><p>{tr("envHint")}</p><code>{installState.instance?.envExamplePath}</code></div></div>{installState.warning && <div className="modal-warning"><CircleAlert />{installState.warning}</div>}<div className="env-scroll modal-env-scroll">{renderEnvTable(installState.entries, (entries) => setInstallState({ ...installState, entries, generated: null }), "install")}</div>{installState.generated && <div className="generated-banner"><Check /><span>{tr("generated")} {installState.generated.path} ({installState.generated.keyCount} {tr("keys")}, {installState.generated.syncedCount} → {tr("vault")}){installState.generated.portChanges.length ? ` · ${portChangeSummary(installState.generated)}` : ""}</span></div>}</div>}
+            {installState.step === "env" && <div className="modal-body env-modal-body"><div className="env-context"><ShieldCheck /><div><strong>{tr("envTitle")}</strong><p>{tr("envHint")}</p><code>{installState.instance?.envExamplePath}</code></div></div>{installState.warning && <div className="modal-warning"><CircleAlert />{installState.warning}</div>}<div className="env-toolbar"><button className="button secondary" onClick={() => setInstallState({ ...installState, entries: [...installState.entries, { key: "", value: "", comment: "", source: "instance", modified: true }], generated: null })} type="button"><Plus />{tr("addVariable")}</button></div><div className="env-scroll modal-env-scroll">{renderEnvTable(installState.entries, (entries) => setInstallState({ ...installState, entries, generated: null }), "install", true)}</div>{installState.generated && <div className="generated-banner"><Check /><span>{tr("generated")} {installState.generated.path} ({installState.generated.keyCount} {tr("keys")}, {installState.generated.syncedCount} → {tr("vault")}){installState.generated.portChanges.length ? ` · ${portChangeSummary(installState.generated)}` : ""}</span></div>}</div>}
             {installState.step === "deploying" && <div className="modal-body progress-body"><div className="progress-ring"><LoaderCircle className="spin" /></div><strong>{installState.instance ? tr("deploying") : tr("preparing")}</strong><div className="progress-steps">{deploymentSteps.map(({ label, icon: Icon }, index) => { const currentIndex = deploymentStageIndex[installState.deploymentStage] ?? 0; const done = installState.deploymentStage === "complete" || index < currentIndex; const active = installState.deploymentStage !== "complete" && index === currentIndex; return <span className={done ? "done" : active ? "active" : "pending"} key={label}>{done ? <Check /> : active ? <LoaderCircle className="spin" /> : <Icon />}{label}</span>; })}</div></div>}
             {installState.error && <div className="modal-error"><CircleAlert />{installState.error}</div>}
             {installState.step !== "deploying" && <div className="modal-foot">{installState.step !== "env" || installState.generated ? <button className="button secondary" onClick={() => setInstallState(null)} type="button">{tr("cancel")}</button> : <button className="button secondary" disabled type="button">{tr("configureEnvFirst")}</button>}{installState.step === "form" ? <button className="button primary" onClick={prepareInstall} disabled={!isNativeDesktop} type="button"><SquareTerminal />{tr("next")}</button> : <><button className="button secondary" onClick={() => generateInstallEnv()} type="button"><FileKey />{tr("generateEnv")}</button><button className="button primary" onClick={continueInstall} disabled={!installState.generated} type="button"><Check />{tr("saveContinue")}</button></>}</div>}
@@ -1465,10 +1652,73 @@ export default function App() {
               <div className="detail-status"><span className={`status ${statusTone(detailInstance.status)}`}><i />{statusLabel(detailInstance.status)}</span><span>{detailInstance.deploymentMode === "docker" ? tr("docker") : tr("local")}</span></div>
               {detailIsReady && <div className="deploy-ready-notice"><CircleAlert /><div><strong>{tr("deployReadyTitle")}</strong><p>{tr("deployReadyHint")}</p></div></div>}
               <section className="detail-overview"><h3>{tr("detail")}</h3><dl><dt>{tr("projectName")}</dt><dd>{detailInstance.projectName || detailInstance.name}</dd><dt>{tr("template")}</dt><dd><code>{detailInstance.templateId}</code></dd><dt>{tr("workDir")}</dt><dd><code title={detailInstance.workDir}>{detailInstance.workDir}</code></dd><dt>{tr("lifecycleVersion")}</dt><dd>V{detailInstance.lifecycleVersion || 1}</dd><dt>{tr("note")}</dt><dd>{detailInstance.note || "—"}</dd></dl></section>
-              <section className="application-section"><h3>{tr("applicationEntry")}</h3>{primaryEndpoint ? <div className={`application-entry ${!detailIsRunning ? "inactive" : ""}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{primaryEndpoint.label}</span><strong>{primaryEndpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(primaryEndpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(primaryEndpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("openApplication")}</button></div></div> : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
-              {integrationEndpoints.length > 0 && <section><h3>{tr("integrationEndpoints")}</h3>{integrationEndpoints.map((endpoint) => <div className={`endpoint ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div>{endpoint.kind === "web" && <button className="icon-button" disabled={!detailIsRunning} title={tr("openAddress")} aria-label={tr("openAddress")} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink /></button>}</div>)}</section>}
+              {/* ── Tab Switcher ── */}
+              <div className="detail-tabs">
+                <button className={`detail-tab ${detailTab === "entry" ? "active" : ""}`} onClick={() => setDetailTab("entry")} type="button">{tr("applicationEntry")}</button>
+                <button className={`detail-tab ${detailTab === "trace" ? "active" : ""}`} onClick={() => { setDetailTab("trace"); setTracePanelRefreshKey((key) => key + 1); }} type="button">{tr("traces")}{tracePanelSummaries.length > 0 && <span className="detail-tab-badge">{tracePanelSummaries.length}</span>}</button>
+              </div>
+
+              {/* ── Tab: Application entry ── */}
+              {detailTab === "entry" && (
+                <>
+                  <section className="application-section"><h3>{tr("applicationEntry")}</h3>{primaryEndpoint ? <div className={`application-entry ${!detailIsRunning ? "inactive" : ""}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{primaryEndpoint.label}</span><strong>{primaryEndpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(primaryEndpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(primaryEndpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("openApplication")}</button></div></div> : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
+                  {integrationEndpoints.length > 0 && <section><h3>{tr("integrationEndpoints")}</h3>{integrationEndpoints.map((endpoint) => <div className={`endpoint ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div>{endpoint.kind === "web" && <button className="icon-button" disabled={!detailIsRunning} title={tr("openAddress")} aria-label={tr("openAddress")} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink /></button>}</div>)}</section>}
+                </>
+              )}
+
+              {/* ── Tab: Trace list ── */}
+              {detailTab === "trace" && (
+                <>
+                  {tracePanelLoading ? (
+                    <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div>
+                  ) : tracePanelSummaries.length === 0 ? (
+                    <div className="empty-state small"><CircleAlert /><span>{tr("noTraces")}</span><span>{tr("noTracesHint")}</span></div>
+                  ) : (
+                    <div className="trace-list-page">
+                      <div className="trace-table-head"><span>{tr("traceId")}</span><span>{tr("traceStatus")}</span><span>{tr("kind")}</span><span>{tr("traceTabInput")}</span><span>{tr("traceTabOutput")}</span><span>{tr("startTime")}</span><span>{tr("traceLatency")}</span></div>
+                      {tracePanelSummaries.map((t) => {
+                        const tone = t.status === "ERROR" ? "error" : "success";
+                        const latency = t.latencyMs != null ? t.latencyMs >= 1000 ? `${(t.latencyMs / 1000).toFixed(1)}s` : `${t.latencyMs}ms` : "—";
+                        return (
+                          <button className="trace-table-row" key={t.traceId} type="button" onClick={() => {
+                            setTracePanelLoading(true);
+                            desktopApi.getAtofTraceDetail(detailInstance.workDir, t.traceId)
+                              .then((d) => {
+                                if (d) { setTracePanelDetail(d); setTracePanelSelectedSpanId(null); setTracePanelOpen(true); return; }
+                                const pUrl = phoenixUrlFor(detailInstance);
+                                if (pUrl) {
+                                  return desktopApi.queryPhoenixTraceDetail(pUrl, t.traceId)
+                                    .then((pd) => { setTracePanelDetail(pd); setTracePanelSelectedSpanId(null); setTracePanelOpen(true); });
+                                }
+                              })
+                              .catch(() => notify(tr("traceDetailLoadFailed")))
+                              .finally(() => setTracePanelLoading(false));
+                          }}>
+                            <span className="trace-id-cell" title={t.traceId}>{t.traceId.slice(0, 12)}</span>
+                            <span className={`status ${tone}`}><i />{t.status}</span>
+                            <span className="trace-kind-badge">{t.kind}</span>
+                            <span className="trace-io-cell" title={t.inputSummary ?? ""}>{t.inputSummary ?? "—"}</span>
+                            <span className="trace-io-cell" title={t.outputSummary ?? ""}>{t.outputSummary ?? "—"}</span>
+                            <span>{t.startTime ? String(t.startTime).slice(0, 19) : "—"}</span>
+                            <span>{latency}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
-            <div className="drawer-foot"><button className="button secondary" onClick={() => { setSelectedConfigId(detailInstance.id); setConfigTab("instance"); setPage("config"); setDetailInstance(null); }} type="button"><FileKey />{tr("editConfig")}</button>{detailIsReady ? <button className="button primary" onClick={() => void continueReadyInstance(detailInstance)} type="button"><SquareTerminal />{tr("continueDeploy")}</button> : <button className="button primary" onClick={() => { setLogInstance(detailInstance.id); setPage("logs"); setDetailInstance(null); }} type="button"><FileText />{tr("openLogs")}</button>}</div>
+            <div className="drawer-foot">{detailTab === "trace" && phoenixBaseUrl ? <div className="drawer-foot-phoenix"><div className="phoenix-foot-left"><span className="phoenix-foot-subtitle">{tr("phoenixSubtitle")}</span></div><button className="phoenix-foot-btn" onClick={() => { void desktopApi.openExternalUrl(phoenixBaseUrl).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("phoenixDashboard")}</button></div> : <><button className="button secondary" onClick={() => { setSelectedConfigId(detailInstance.id); setConfigTab("instance"); setPage("config"); setDetailInstance(null); }} type="button"><FileKey />{tr("editConfig")}</button>{detailIsReady ? <button className="button primary" onClick={() => void continueReadyInstance(detailInstance)} type="button"><SquareTerminal />{tr("continueDeploy")}</button> : <button className="button primary" onClick={() => { setLogInstance(detailInstance.id); setPage("logs"); setDetailInstance(null); }} type="button"><FileText />{tr("openLogs")}</button>}</>}</div>
+          </aside>
+        </div>
+      )}
+
+      {/* ── Trace detail floating panel ── */}
+      {tracePanelOpen && detailInstance && tracePanelDetail && (
+        <div className="modal-backdrop align-right" onMouseDown={(e) => e.currentTarget === e.target && setTracePanelOpen(false)}>
+          <aside className="detail-drawer wide">
+            <TraceDetailPanel detail={tracePanelDetail} onBack={() => { setTracePanelDetail(null); setTracePanelSelectedSpanId(null); setTracePanelOpen(false); }} selectedSpanId={tracePanelSelectedSpanId} onSelectSpan={setTracePanelSelectedSpanId} tr={tr} language={language} />
           </aside>
         </div>
       )}
@@ -1575,6 +1825,21 @@ export default function App() {
         </div>
       )}
 
+      {templateUpdateInfo && (
+        <div className="modal-backdrop">
+          <div className="modal" role="alertdialog" aria-modal="true">
+            <div className="modal-head"><div><span className="eyebrow">{tr("templateUpdateTitle")}</span><h2>{tr("templateUpdateTitle")}</h2><p>{tr("templateUpdateMessage")}</p></div><button className="icon-button" onClick={() => setTemplateUpdateInfo(null)} type="button"><X /></button></div>
+            <div className="modal-body" style={{ padding: "16px" }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div><strong>{tr("currentVersion")}:</strong> {templateUpdateInfo.currentVersion}</div>
+                <div><strong>{tr("latestVersion")}:</strong> {templateUpdateInfo.latestVersion}</div>
+              </div>
+            </div>
+            <div className="modal-foot"><button className="button secondary" onClick={() => setTemplateUpdateInfo(null)} type="button">{tr("cancel")}</button><button className="button primary" onClick={() => void confirmTemplateUpdate()} type="button"><RefreshCw />{tr("confirmUpdate")}</button></div>
+          </div>
+        </div>
+      )}
+
       {commentTooltip && <div
         className={`comment-popover ${commentTooltip.placement}`}
         role="dialog"
@@ -1600,7 +1865,195 @@ export default function App() {
         aria-label={tr("comment")}
       /></div>}
 
+      {templateUrlEditOpen && (
+        <div className="modal-backdrop">
+          <div className="modal" role="dialog" aria-modal="true">
+            <div className="modal-head"><div><h2>{tr("editTemplateSettings")}</h2></div><button className="icon-button" onClick={() => setTemplateUrlEditOpen(false)} type="button"><X /></button></div>
+            <div className="modal-body" style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "12px" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>{tr("templateRepoUrl")}</span>
+                <small style={{ opacity: 0.6 }}>{tr("templateRepoUrlHint")}</small>
+                <input
+                  type="text"
+                  value={templateRepoUrlInput}
+                  onChange={(event) => setTemplateRepoUrlInput(event.target.value)}
+                  placeholder="https://github.com/agentseek-ai/agentseek-templates.git"
+                  autoFocus
+                />
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>{tr("templateCatalogUrl")}</span>
+                <small style={{ opacity: 0.6 }}>{tr("templateCatalogUrlHint")}</small>
+                <input
+                  type="text"
+                  value={templateCatalogInput}
+                  onChange={(event) => setTemplateCatalogInput(event.target.value)}
+                  placeholder="https://corp.com/catalog.json"
+                />
+              </label>
+            </div>
+            <div className="modal-foot"><button className="button secondary" onClick={() => setTemplateUrlEditOpen(false)} type="button">{tr("cancel")}</button><button className="button primary" onClick={() => void saveTemplateUrl()} disabled={templateUrlSaving || !templateRepoUrlInput.trim()} type="button">{templateUrlSaving ? <LoaderCircle className="spin" /> : <Check />}{tr("save")}</button></div>
+          </div>
+        </div>
+      )}
+
       {toast && <div className={`toast ${installState && !installModalVisible ? "task-visible" : ""}`}><Check />{toast}</div>}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Trace Detail Panel (Three-Pane Layout)
+// ---------------------------------------------------------------------------
+
+function TraceDetailPanel({
+  detail,
+  onBack,
+  selectedSpanId,
+  onSelectSpan,
+  tr,
+  language,
+}: {
+  detail: TraceDetail;
+  onBack: () => void;
+  selectedSpanId: string | null;
+  onSelectSpan: (id: string | null) => void;
+  tr: (key: TranslationKey) => string;
+  language: Language;
+}) {
+  const selectedSpan = selectedSpanId
+    ? findSpanById(detail.spans, selectedSpanId)
+    : detail.spans[0] ?? null;
+
+  const latency = detail.latencyMs != null
+    ? detail.latencyMs >= 1000
+      ? `${(detail.latencyMs / 1000).toFixed(1)}s`
+      : `${detail.latencyMs}ms`
+    : "—";
+
+  return (
+    <div className="trace-detail">
+      {/* Top status bar */}
+      <div className="trace-detail-topbar">
+        <button className="button secondary compact" onClick={onBack} type="button"><ChevronLeft />{tr("back")}</button>
+        <div className="trace-detail-meta">
+          <code className="trace-detail-id">{detail.traceId.slice(0, 16)}…</code>
+          <span className={`status ${detail.status === "ERROR" ? "error" : "success"}`}><i />{detail.status}</span>
+          <span className="trace-detail-stat">{tr("traceLatency")} <strong>{latency}</strong></span>
+          <span className="trace-detail-stat">{tr("traceSpans")} <strong>{detail.spans.length}</strong></span>
+        </div>
+      </div>
+
+      {/* Three-pane body */}
+      <div className="trace-detail-body">
+        {/* Left: Span tree */}
+        <aside className="trace-tree-panel">
+          <h3 className="trace-pane-title">{tr("traceSpans")}</h3>
+          <div className="trace-tree">
+            {detail.spans.map((span) => (
+              <SpanTreeNode key={span.spanId} span={span} depth={0} selectedSpanId={selectedSpanId} onSelect={onSelectSpan} />
+            ))}
+          </div>
+        </aside>
+
+        {/* Center: Inspector */}
+        <section className="trace-inspector">
+          {selectedSpan ? (
+            <>
+              <div className="trace-inspector-head">
+                <h3>{selectedSpan.name}</h3>
+                <div className="trace-inspector-meta">
+                  <code>{selectedSpan.spanId.slice(0, 12)}</code>
+                  <span className={`status ${selectedSpan.status === "ERROR" ? "error" : "success"}`}>{selectedSpan.status}</span>
+                  <span>{selectedSpan.kind}</span>
+                  {selectedSpan.durationMs != null && <span>{selectedSpan.durationMs >= 1000 ? `${(selectedSpan.durationMs / 1000).toFixed(1)}s` : `${selectedSpan.durationMs}ms`}</span>}
+                </div>
+              </div>
+              <div className="trace-inspector-tabs">
+                {(["input", "output", "attributes"] as const).map((tab) => {
+                  const data = tab === "input" ? selectedSpan.input : tab === "output" ? selectedSpan.output : selectedSpan.attributes;
+                  if (data == null) return null;
+                  const tabKey = tab === "input" ? "traceTabInput" : tab === "output" ? "traceTabOutput" : "traceTabAttributes";
+                  return (
+                    <details className="trace-inspector-section" key={tab} open={tab === "input"}>
+                      <summary>{tr(tabKey)}</summary>
+                      <pre className="trace-json">{formatJson(data)}</pre>
+                    </details>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <div className="empty-state small"><CircleAlert /><span>{tr("selectSpanHint")}</span></div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function SpanTreeNode({
+  span,
+  depth,
+  selectedSpanId,
+  onSelect,
+}: {
+  span: SpanNode;
+  depth: number;
+  selectedSpanId: string | null;
+  onSelect: (id: string | null) => void;
+}) {
+  const isSelected = selectedSpanId === span.spanId;
+  const hasChildren = span.children.length > 0;
+  const [expanded, setExpanded] = useState(true);
+  const kindIcon = span.kind === "LLM" ? "🤖" : span.kind === "TOOL" ? "🔧" : span.kind === "AGENT" ? "🧠" : span.kind === "CHAIN" ? "🔗" : "📌";
+
+  return (
+    <div className="trace-tree-node">
+      <button
+        className={`trace-tree-row ${isSelected ? "selected" : ""}`}
+        style={{ paddingLeft: 8 + depth * 20 }}
+        type="button"
+        onClick={() => onSelect(isSelected ? null : span.spanId)}
+      >
+        {hasChildren && (
+          <span className="trace-tree-toggle" onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}>
+            <ChevronDown style={{ transform: expanded ? "" : "rotate(-90deg)", width: 14, height: 14 }} />
+          </span>
+        )}
+        {!hasChildren && <span className="trace-tree-toggle" />}
+        <span className="trace-tree-icon">{kindIcon}</span>
+        <span className="trace-tree-name">{span.name}</span>
+        <span className="trace-tree-status">
+          <span className={`status ${span.status === "ERROR" ? "error" : "success"}`}>{span.status}</span>
+        </span>
+        {span.durationMs != null && (
+          <span className="trace-tree-duration">{span.durationMs >= 1000 ? `${(span.durationMs / 1000).toFixed(1)}s` : `${span.durationMs}ms`}</span>
+        )}
+      </button>
+      {expanded && hasChildren && (
+        <div className="trace-tree-children">
+          {span.children.map((child) => (
+            <SpanTreeNode key={child.spanId} span={child} depth={depth + 1} selectedSpanId={selectedSpanId} onSelect={onSelect} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function findSpanById(spans: SpanNode[], id: string): SpanNode | null {
+  for (const span of spans) {
+    if (span.spanId === id) return span;
+    const found = findSpanById(span.children, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function formatJson(value: unknown): string {
+  if (typeof value === "string") {
+    try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
+  }
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
 }

@@ -19,6 +19,10 @@ import type {
   SystemInfo,
   StorageStatus,
   TemplateInfo,
+  TemplateConfig,
+  TemplateUpdateCheck,
+  TraceDetail,
+  TracePage,
 } from "./types";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -33,18 +37,60 @@ interface MockStore {
   logs: LogEntry[];
 }
 
-const templates: TemplateInfo[] = [
-  { id: "langchain/default", name: "LangChain Default", framework: "langchain", description: "LangChain create_agent plus CopilotKit middleware." },
-  { id: "langchain/agentic-rag", name: "Agentic RAG", framework: "langchain", description: "LangChain agentic RAG with OceanBase vector search." },
-  { id: "langchain/agentic-rag-openvino", name: "Agentic RAG OpenVINO", framework: "langchain", description: "Local RAG with OpenVINO models." },
-  { id: "langchain/cli-remote", name: "LangChain CLI Remote", framework: "langchain", description: "Remote LangGraph CLI agent bridged through LangGraphClientRunnable." },
-  { id: "langchain/markdown-messages", name: "Markdown Messages", framework: "langchain", description: "LangChain create_agent and react-markdown frontend." },
-  { id: "deepagents/content-builder", name: "Content Builder", framework: "deepagents", description: "DeepAgents content builder with skills, subagents, image generation, and streamed UI." },
-  { id: "deepagents/default", name: "DeepAgents Default", framework: "deepagents", description: "Local create_deep_agent runnable." },
-  { id: "deepagents/research", name: "DeepAgents Research", framework: "deepagents", description: "Research agent with Tavily search and streamed sub-agent UI." },
-  { id: "deepagents/sandbox", name: "DeepAgents Sandbox", framework: "deepagents", description: "Sandbox coding agent with streamed UI." },
-  { id: "bub/default", name: "Bub Default", framework: "bub", description: "Lightweight Bub agent with AgentSeek lifecycle spec." },
-];
+// Template catalog is fetched from the configured template repository in
+// preview mode instead of a hard-coded list, keeping it in sync with the
+// real catalog (mirrors the Rust `read_template_index` / `display_name`).
+let templateIndexCache: TemplateInfo[] | null = null;
+
+/// Convert a template repository URL to the raw templates/index.json URL.
+/// Mirrors `parse_template_repo_url` semantics: `tree/<branch>` and
+/// `releases/tag/<tag>` forms are supported; plain repo URLs use main.
+function templateIndexUrl(repoUrl: string): string | null {
+  const normalized = repoUrl.trim().replace(/\.git$/, "");
+  const match = normalized.match(
+    /^https:\/\/github\.com\/([^/]+)\/([^/]+)(?:\/(?:tree|releases\/tag)\/([^/]+))?$/,
+  );
+  if (!match) return null;
+  const ref = match[3] || "main";
+  return `https://raw.githubusercontent.com/${match[1]}/${match[2]}/${ref}/templates/index.json`;
+}
+
+/// Display name mirroring the Rust `display_name` helper: last path segment,
+/// split on "-" / "_", each part capitalized, joined with spaces.
+function templateDisplayName(templateId: string): string {
+  const last = templateId.split("/").pop() || templateId;
+  return last
+    .split(/[-_]/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+/// Fetch and parse the template catalog from the template repository.
+/// Returns an empty list on any failure (offline, unreachable, invalid JSON).
+async function fetchTemplateIndex(force: boolean): Promise<TemplateInfo[]> {
+  if (!force && templateIndexCache) return templateIndexCache;
+  try {
+    const repoUrl =
+      localStorage.getItem("agentseek-template-repo") ||
+      "https://github.com/agentseek-ai/agentseek-templates.git";
+    const indexUrl = templateIndexUrl(repoUrl);
+    if (!indexUrl) return [];
+    const response = await fetch(indexUrl);
+    if (!response.ok) return [];
+    const map = (await response.json()) as Record<string, string>;
+    const result = Object.entries(map).map(([id, description]) => ({
+      id,
+      name: templateDisplayName(id),
+      description,
+      framework: id.split("/")[0] || "",
+    }));
+    templateIndexCache = result;
+    return result;
+  } catch {
+    return [];
+  }
+}
 
 const defaultVault: EnvVariable[] = [
   { key: "OPENAI_API_KEY", value: "", comment: "OpenAI compatible API key", source: "instance", modified: false },
@@ -99,7 +145,7 @@ function mockLog(store: MockStore, instance: InstanceRecord | null, category: Lo
   store.logs.unshift({
     id: `log-${Date.now()}-${store.logs.length}`,
     instanceId: instance?.id,
-    instanceName: instance?.name ?? "AgentSeek",
+    instanceName: instance?.name ?? "AgentSeek Desktop",
     category,
     level,
     message,
@@ -153,10 +199,36 @@ export const desktopApi = {
     return { status: "success", stage: "complete", log: "runtime ready" };
   },
 
-  async listTemplates(): Promise<TemplateInfo[]> {
-    if (isTauri()) return invoke("list_templates");
-    await wait(260);
-    return templates;
+  async listTemplates(force = false): Promise<TemplateInfo[]> {
+    if (isTauri()) return invoke("list_templates", { force });
+    return fetchTemplateIndex(force);
+  },
+
+  async checkTemplateUpdate(): Promise<TemplateUpdateCheck> {
+    if (isTauri()) return invoke("check_template_update");
+    await wait(200);
+    return { currentVersion: "vX.Y.Z", latestVersion: "vX.Y.Z", hasUpdate: false };
+  },
+
+  async updateTemplates(): Promise<TemplateInfo[]> {
+    if (isTauri()) return invoke("update_templates");
+    return fetchTemplateIndex(true);
+  },
+
+  async getTemplateSettings(): Promise<TemplateConfig> {
+    if (isTauri()) return invoke("get_template_settings");
+    return {
+      repoUrl: localStorage.getItem("agentseek-template-repo") || "https://github.com/agentseek-ai/agentseek-templates.git",
+      checkout: localStorage.getItem("agentseek-template-checkout") || "",
+      catalogUrl: localStorage.getItem("agentseek-template-catalog") || "",
+    };
+  },
+
+  async saveTemplateSettings(cfg: TemplateConfig): Promise<void> {
+    if (isTauri()) return invoke("save_template_settings", { cfg });
+    localStorage.setItem("agentseek-template-repo", cfg.repoUrl);
+    localStorage.setItem("agentseek-template-checkout", cfg.checkout);
+    localStorage.setItem("agentseek-template-catalog", cfg.catalogUrl);
   },
 
   async listInstances(): Promise<InstanceRecord[]> {
@@ -369,7 +441,7 @@ export const desktopApi = {
 
   async systemInfo(): Promise<SystemInfo> {
     if (isTauri()) return invoke("system_info");
-    return { appName: "AgentSeek", version: __APP_VERSION__, dataPath: "Browser localStorage preview", cliStrategy: "uv run agentseek", storage: "Embedded SQLite (desktop state only; isolated from template instances)", dockerAvailable: false, dockerComposeAvailable: false, dockerRunning: false };
+    return { appName: "AgentSeek Desktop", version: __APP_VERSION__, dataPath: "Browser localStorage preview", cliStrategy: "uv run agentseek", storage: "Embedded SQLite (desktop state only; isolated from template instances)", dockerAvailable: false, dockerComposeAvailable: false, dockerRunning: false };
   },
 
   async storageStatus(): Promise<StorageStatus> {
@@ -382,5 +454,34 @@ export const desktopApi = {
     if (isTauri()) return invoke("configure_storage", { config });
     localStorage.setItem("agentseek-storage-configured", "1");
     return { ...config, effectiveMode: config.mode, setupRequired: false, writable: true, error: null };
+  },
+
+  async listAtofTraces(workDir: string, page = 1, pageSize = 20): Promise<TracePage> {
+    if (isTauri()) return invoke("list_atof_traces", { workDir, page, pageSize });
+    await wait(120);
+    return { entries: [], total: 0, page, pageSize };
+  },
+
+  async getAtofTraceDetail(workDir: string, traceId: string): Promise<TraceDetail | null> {
+    if (isTauri()) return invoke("get_atof_trace_detail", { workDir, traceId });
+    await wait(120);
+    return null;
+  },
+
+  async queryPhoenixTraces(
+    phoenixUrl: string,
+    serviceName?: string,
+    page = 1,
+    pageSize = 20,
+  ): Promise<TracePage> {
+    if (isTauri()) return invoke("query_phoenix_traces", { phoenixUrl, serviceName, page, pageSize });
+    await wait(120);
+    return { entries: [], total: 0, page, pageSize };
+  },
+
+  async queryPhoenixTraceDetail(phoenixUrl: string, traceId: string): Promise<TraceDetail | null> {
+    if (isTauri()) return invoke("query_phoenix_trace_detail_cmd", { phoenixUrl, traceId });
+    await wait(120);
+    return null;
   },
 };

@@ -3,7 +3,7 @@
 
 Produces a polished 660×400 background with:
   - Dark purple-to-blue gradient (AgentSeek brand colors)
-  - "AgentSeek" heading + tagline
+  - "AgentSeek Desktop" heading + tagline
   - Semi-transparent drag zone with "Drag to >>"
 
 Icon positions (set in create-dmg):
@@ -78,9 +78,10 @@ def main():
     img = img.filter(ImageFilter.GaussianBlur(radius=0.3))
     draw = ImageDraw.Draw(img)
 
-    # 3. Heading: "AgentSeek" — gradient text (purple→blue) with shadow
-    font_title = load_font(42, bold=True)
-    title = "AgentSeek"
+    # 3. Heading: "AgentSeek Desktop" — gradient text (purple→blue) with shadow.
+    #    38px keeps the longer title balanced on the 660px canvas.
+    font_title = load_font(38, bold=True)
+    title = "AgentSeek Desktop"
     bbox = draw.textbbox((0, 0), title, font=font_title)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     title_x = (W - tw) // 2

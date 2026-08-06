@@ -64,6 +64,119 @@ fn find_file_recursive(root: &Path, filename: &str, max_depth: usize) -> Option<
     None
 }
 
+/// Replace `old_port` with `new_port` only when the digit sequence appears
+/// in a port-like context: preceded by `:` (URL/JSON), a `*_PORT=` key
+/// assignment, or a standalone `port` keyword. This avoids replacing the
+/// same digits inside unrelated strings, IDs, or comments.
+fn replace_port_in_context(content: &str, old_port: u16, new_port: u16) -> String {
+    let old = old_port.to_string();
+    let new = new_port.to_string();
+    let mut result = String::with_capacity(content.len());
+    let mut remaining = content;
+    while let Some(pos) = remaining.find(&old) {
+        let before = &remaining[..pos];
+        let after = &remaining[pos + old.len()..];
+        // Ensure the match is a whole number (not part of a larger digit sequence).
+        let prev_char = before.chars().last();
+        let next_char = after.chars().next();
+        let is_boundary = !prev_char.is_some_and(|c| c.is_ascii_digit())
+            && !next_char.is_some_and(|c| c.is_ascii_digit());
+        if !is_boundary {
+            result.push_str(&remaining[..pos + old.len()]);
+            remaining = after;
+            continue;
+        }
+        let trimmed_before = before.trim_end();
+        // Port key assignment: `=` preceded by a key ending in `_PORT`
+        // (e.g. `PHOENIX_PORT=6006`), so plain `foo=6006` is untouched.
+        let port_key_assignment = trimmed_before.ends_with('=') && {
+            let key = trimmed_before[..trimmed_before.len() - 1]
+                .rsplit(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'');
+            key.to_ascii_uppercase().ends_with("_PORT")
+        };
+        // Standalone `port` keyword bounded by quote/whitespace/line start
+        // (e.g. `port 6006`), so words like `import`/`support` are not
+        // matched.
+        let keyword = trimmed_before
+            .strip_suffix('"')
+            .or_else(|| trimmed_before.strip_suffix('\''))
+            .unwrap_or(trimmed_before);
+        let port_keyword = {
+            let lower = keyword.to_ascii_lowercase();
+            lower
+                .rfind("port")
+                .is_some_and(|p| p + 4 == lower.len())
+                && keyword[..keyword.len().saturating_sub(4)]
+                    .chars()
+                    .last()
+                    .map_or(true, |c| c == '"' || c == '\'' || c.is_whitespace())
+        };
+        let in_port_context = trimmed_before.ends_with(':') || port_key_assignment || port_keyword;
+        if in_port_context {
+            result.push_str(before);
+            result.push_str(&new);
+        } else {
+            result.push_str(&remaining[..pos + old.len()]);
+        }
+        remaining = after;
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Patch source files when port conflicts required different ports than the
+/// cookiecutter defaults. After lifecycle.toml URLs are updated, the rendered
+/// source files (e.g. `langgraph_dev.py` with a hardcoded port) may still
+/// reference the original default port. This function walks the instance
+/// directory and replaces old port values with the resolved ones in `.py`,
+/// `.ts`, `.js`, and `.json` files.
+///
+/// Only port numbers appearing in port-like contexts are replaced (e.g. after
+/// `:`, `port=`, `PORT=`) to avoid accidentally modifying unrelated numeric
+/// literals that happen to share the same digits.
+fn patch_source_ports_for_conflicts(instance_dir: &Path, port_changes: &[PortChange]) {
+    if port_changes.is_empty() {
+        return;
+    }
+
+    fn walk(dir: &Path, port_changes: &[PortChange]) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == ".venv" {
+                    continue;
+                }
+                walk(&path, port_changes);
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !["py", "ts", "js", "json"].contains(&ext) {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut updated = content.clone();
+            for change in port_changes {
+                updated = replace_port_in_context(&updated, change.old_port, change.new_port);
+            }
+            if updated != content {
+                let _ = fs::write(&path, updated);
+            }
+        }
+    }
+
+    walk(instance_dir, port_changes);
+}
+
 /// Patch convert_models.py in agentic-rag-openvino instances to use
 /// `optimum-cli export openvino` instead of `python -m optimum.exporters.openvino`.
 fn patch_convert_models_if_needed(instance_dir: &Path) {
@@ -128,24 +241,20 @@ fn patch_dockerfile_apt_mirror_if_needed(instance_dir: &Path) {
     let Ok(content) = fs::read_to_string(&path) else {
         return;
     };
-    if content.contains("mirrors.aliyun.com") || !content.contains("apt-get update") {
+    if content.contains(APT_MIRROR) || !content.contains("apt-get update") {
         return;
     }
     let old = "apt-get update";
-    let new = "(timeout 60 apt-get update -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=1 && [ -n \"$(find /var/lib/apt/lists -name '*Packages*' 2>/dev/null)\" ] || (sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; apt-get update))";
-    let patched = content.replacen(old, new, 1);
+    let new = format!("(timeout 60 apt-get update -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=1 && [ -n \"$(find /var/lib/apt/lists -name '*Packages*' 2>/dev/null)\" ] || (sed -i 's|deb.debian.org|{mirror}|g; s|security.debian.org|{mirror}|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; sed -i 's|deb.debian.org|{mirror}|g; s|security.debian.org|{mirror}|g' /etc/apt/sources.list 2>/dev/null; apt-get update))", mirror = APT_MIRROR);
+    let patched = content.replacen(old, &new, 1);
     let _ = fs::write(&path, patched);
 }
 
-/// Patch Dockerfile to add GitHub and PyPI mirror fallbacks for slow
+/// Patch Dockerfile to add PyPI mirror fallback for slow
 /// connections in China.
 ///
-/// Two independent checks:
-/// 1. **GitHub mirror** – read `pyproject.toml`, find the first GitHub repo,
-///    download 500 KB of its tarball, must finish in 3 s (≈167 KB/s).  If too
-///    slow, route all GitHub URLs through `ghfast.top` proxy.
-/// 2. **PyPI mirror** – download 200 KB from pypi.org, must finish in 3 s
-///    (≈67 KB/s).  If too slow, fall back to `mirrors.aliyun.com/pypi/simple/`.
+/// **PyPI mirror** – download 200 KB from pypi.org, must finish in 3 s
+/// (≈67 KB/s).  If too slow, fall back to `mirrors.aliyun.com/pypi/simple/`.
 fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
     let Some(path) = find_file_recursive(instance_dir, "Dockerfile", 5) else {
         return;
@@ -153,12 +262,11 @@ fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
     let Ok(content) = fs::read_to_string(&path) else {
         return;
     };
-    // Skip if already patched (ghfast.top is the definitive marker) or no uv
-    // sync command.
-    if content.contains("ghfast.top") || !content.contains("uv sync") {
+    // Skip if already patched or no uv sync command.
+    if content.contains("mirrors.aliyun.com/pypi/simple/") || !content.contains("uv sync") {
         return;
     }
-    // Replace the UV index variable handling block with: GitHub mirror test +
+    // Replace the UV index variable handling block with:
     // PyPI speed test + Aliyun mirror fallback.
     //
     // Templates use this pattern:
@@ -183,14 +291,15 @@ fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
         }
     }
 
-    let new_block = r#"timeout 15 python -c "import urllib.request,time,sys; c=open('pyproject.toml').read(); i=c.find('github.com/'); sys.exit(0) if i<0 else None; r=c[i+11:].split('\"')[0]; r=r[:-4] if r.endswith('.git') else r; s=time.time(); urllib.request.urlopen(f'https://github.com/{r}/archive/HEAD.tar.gz',timeout=10).read(500000); sys.exit(1 if time.time()-s>3 else 0)" >/dev/null 2>&1 || \
-        git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/"; \
-    if [ -n "${UV_DEFAULT_INDEX:-}" ]; then export UV_DEFAULT_INDEX; \
-    elif [ -n "${UV_INDEX_URL:-}" ]; then export UV_INDEX_URL; \
+    let new_block = format!(
+        r#"if [ -n "${{UV_DEFAULT_INDEX:-}}" ]; then export UV_DEFAULT_INDEX; \
+    elif [ -n "${{UV_INDEX_URL:-}}" ]; then export UV_INDEX_URL; \
     elif ! timeout 15 python -c "import urllib.request,time; start=time.time(); resp=urllib.request.urlopen('https://pypi.org/simple/pip/',timeout=5); resp.read(200000); assert time.time()-start<=3" >/dev/null 2>&1; then \
-        export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/; \
+        export UV_INDEX_URL={pypi_mirror}; \
     fi; \
-    "#;
+    "#,
+        pypi_mirror = PYPI_MIRROR
+    );
     let patched = format!("{}{}{}", &content[..pos], new_block, &rest[end_pos..]);
     let _ = fs::write(&path, patched);
 }
@@ -252,8 +361,14 @@ fn recheck_instance_ports(
         .map(PathBuf::from)
         .ok_or_else(|| "Instance .env has not been generated yet".to_string())?;
     let mut entries = parse_env(&fs::read_to_string(&env_path).map_err(|error| error.to_string())?);
-    let _reserved = collect_assigned_ports(state, Some(&instance.id));
-    let changes = resolve_port_conflicts(&mut entries)?;
+    let reserved = collect_assigned_ports(state, Some(&instance.id));
+    // Treat ports reserved by other instances as conflicts even when their
+    // processes are stopped; the instance itself owns nothing yet pre-deploy.
+    let changes = resolve_port_conflicts_inner(&mut entries, &reserved, &HashSet::new())?;
+    // Restore corrupted container-internal endpoints to their loopback
+    // template defaults first, then the lifecycle sync below aligns their
+    // ports with the resolved values (e.g. 127.0.0.1:6006 -> 127.0.0.1:56438).
+    restore_non_loopback_url_defaults(&instance.work_dir, &mut entries);
     sync_env_urls_from_lifecycle(&instance.work_dir, &mut entries);
     if !changes.is_empty() || entries.iter().any(|e| e.modified) {
         fs::write(&env_path, render_env(&entries)).map_err(|error| error.to_string())?;
@@ -411,7 +526,7 @@ fn huggingface_reachable() -> bool {
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.next())
-            .map_or(false, |addr| {
+            .is_some_and(|addr| {
                 TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
             })
     })
@@ -442,14 +557,14 @@ fn apply_instance_environment(
     // Auto-inject VITE_LANGGRAPH_API_URL so Vite frontends can connect to the LangGraph backend.
     if !entries
         .iter()
-        .any(|e| e.key.to_ascii_uppercase() == "VITE_LANGGRAPH_API_URL")
+        .any(|e| e.key.eq_ignore_ascii_case("VITE_LANGGRAPH_API_URL"))
     {
         // Prefer BACKEND_PORT (the actual langgraph dev --port) over LANGGRAPH_PORT
         // (which may be a stale cookiecutter variable unrelated to the running process).
         let langgraph_port = entries
             .iter()
-            .find(|e| e.key.to_ascii_uppercase() == "BACKEND_PORT")
-            .or_else(|| entries.iter().find(|e| e.key.to_ascii_uppercase() == "LANGGRAPH_PORT"))
+            .find(|e| e.key.eq_ignore_ascii_case("BACKEND_PORT"))
+            .or_else(|| entries.iter().find(|e| e.key.eq_ignore_ascii_case("LANGGRAPH_PORT")))
             .and_then(|e| e.value.trim().parse::<u16>().ok());
         if let Some(port) = langgraph_port {
             command.env("VITE_LANGGRAPH_API_URL", format!("http://127.0.0.1:{port}"));
@@ -458,12 +573,10 @@ fn apply_instance_environment(
     // Auto-inject HF_ENDPOINT mirror when huggingface.co is unreachable.
     if !entries
         .iter()
-        .any(|e| e.key.to_ascii_uppercase() == "HF_ENDPOINT")
-    {
-        if !huggingface_reachable() {
-            command.env("HF_ENDPOINT", "https://hf-mirror.com");
+        .any(|e| e.key.eq_ignore_ascii_case("HF_ENDPOINT"))
+        && !huggingface_reachable() {
+            command.env("HF_ENDPOINT", HF_MIRROR);
         }
-    }
     Ok(entries)
 }
 
@@ -878,8 +991,18 @@ fn endpoint_port(url: &str) -> Option<u16> {
     authority.rsplit_once(':')?.1.parse().ok()
 }
 
-fn listener_process_ids(instance: &InstanceRecord) -> Vec<u32> {
+/// Find processes listening on the instance's service ports that belong to the
+/// instance process tree (pid + descendants). Unrelated processes that merely
+/// happen to use the same port are returned separately and never terminated,
+/// preventing accidental kills of other applications.
+fn listener_process_ids(instance: &InstanceRecord) -> (Vec<u32>, Vec<(u32, u16)>) {
+    let mut related = HashSet::new();
+    if let Some(pid) = instance.pid {
+        related.insert(pid);
+        related.extend(child_process_ids(pid));
+    }
     let mut pids = Vec::new();
+    let mut skipped = Vec::new();
     for port in instance
         .service_endpoints
         .iter()
@@ -891,14 +1014,19 @@ fn listener_process_ids(instance: &InstanceRecord) -> Vec<u32> {
             .args(["-nP", "-t", &selector, "-sTCP:LISTEN"])
             .output()
         {
-            pids.extend(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter_map(|line| line.trim().parse::<u32>().ok()),
-            );
+            for pid in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+            {
+                if related.contains(&pid) {
+                    pids.push(pid);
+                } else {
+                    skipped.push((pid, port));
+                }
+            }
         }
     }
-    pids
+    (pids, skipped)
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -995,7 +1123,8 @@ fn stop_instance_process(
         }
         Ok(Vec::new())
     } else {
-        let mut roots = listener_process_ids(instance);
+        let (listener_pids, skipped_listeners) = listener_process_ids(instance);
+        let mut roots = listener_pids;
         if let Some(pid) = instance.pid {
             roots.push(pid);
         }
@@ -1009,16 +1138,29 @@ fn stop_instance_process(
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let skipped_details = if skipped_listeners.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nSkipped unrelated processes listening on instance ports (not part of instance process tree):\n{}",
+                skipped_listeners
+                    .iter()
+                    .map(|(pid, port)| format!("  PID {pid} on port {port}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         state.log(
             Some(&instance.id),
             &instance.name,
             log_category,
             "info",
             format!(
-                "Instance associated processes stopped\nWorking directory: {}\nProcess count: {}\nDetails:\n{}",
+                "Instance associated processes stopped\nWorking directory: {}\nProcess count: {}\nDetails:\n{}{}",
                 instance.work_dir,
                 stopped.len(),
-                process_details
+                process_details,
+                skipped_details
             ),
             None,
         );
@@ -1071,6 +1213,46 @@ fn docker_compose_file(project_dir: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
+/// Stop and remove Docker containers associated with an instance.
+/// Runs `docker compose down` in the instance's working directory.
+/// Best-effort: returns `Ok(true)` if containers were cleaned up,
+/// `Ok(false)` if no compose file exists, or `Err` on failure (non-fatal).
+fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
+    if docker_compose_file(Path::new(work_dir)).is_none() {
+        return Ok(false);
+    }
+    let output = Command::new("docker")
+        .args(["compose", "down", "--remove-orphans"])
+        .current_dir(work_dir)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stopped = stdout
+                .lines()
+                .filter(|line| line.contains("Removed") || line.contains("Stopped"))
+                .count();
+            Ok(stopped > 0 || stdout.contains("Going to remove"))
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Not an error if Docker reports no containers to remove
+            if stderr.contains("no configuration file provided")
+                || stderr.contains("no containers to start")
+            {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "docker compose down failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ))
+            }
+        }
+        Err(error) => Err(format!("Failed to execute docker compose down: {error}")),
+    }
+}
+
 fn docker_compose_check(project_dir: &Path) -> Option<String> {
     let compose_file = docker_compose_file(project_dir)?;
     let docker_status = check_docker();
@@ -1121,4 +1303,907 @@ fn check_docker() -> DockerStatus {
         compose_v2_available,
         daemon_running,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Instance listing & lifecycle commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_instances(state: State<'_, DesktopState>) -> Result<Vec<InstanceRecord>, String> {
+    let mut instances = state
+        .data
+        .lock()
+        .map_err(|_| "State lock is poisoned".to_string())?
+        .instances
+        .clone();
+    // Re-calibrate from the on-disk lifecycle.toml / .env and persist any
+    // drift so direct DB readers (e.g. the CLI) always see fresh values.
+    let mut drift: Vec<InstanceRecord> = Vec::new();
+    for instance in &mut instances {
+        if enrich_service_endpoints(instance) {
+            drift.push(instance.clone());
+        }
+    }
+    if !drift.is_empty() && state.ensure_storage_ready().is_ok() {
+        let mut failures: Vec<String> = Vec::new();
+        let mut persisted: Vec<InstanceRecord> = Vec::new();
+        // Persist first, then sync the in-memory store (storage → data lock
+        // order, matching persist_instance / replace_vault_entries).
+        if let Ok(mut storage) = state.storage.lock() {
+            for instance in &drift {
+                match storage.upsert_instance(instance) {
+                    Ok(()) => persisted.push(instance.clone()),
+                    Err(error) => failures.push(format!("{}: {error}", instance.id)),
+                }
+            }
+        } else {
+            failures.push("storage lock poisoned".to_string());
+        }
+        if !failures.is_empty() {
+            state.log(
+                None,
+                "AgentSeek Desktop",
+                "storage",
+                "warn",
+                format!(
+                    "Failed to persist enriched instance(s): {}",
+                    failures.join("; ")
+                ),
+                None,
+            );
+        }
+        if !persisted.is_empty() {
+            if let Ok(mut data) = state.data.lock() {
+                for instance in persisted {
+                    if let Some(slot) = data
+                        .instances
+                        .iter_mut()
+                        .find(|item| item.id == instance.id)
+                    {
+                        *slot = instance;
+                    }
+                }
+            }
+        }
+    }
+    instances.sort_by_key(|instance| std::cmp::Reverse(instance.created_at));
+    Ok(instances)
+}
+
+#[tauri::command]
+async fn continue_install(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<InstanceRecord, String> {
+    let state = state.inner().clone();
+    state.set_deployment_stage(&instance_id, "tasks");
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| -> Result<InstanceRecord, String> {
+            let mut instance = instance_by_id(&state, &instance_id)?;
+            if instance.env_path.is_none() {
+                return Err("Please generate instance .env first".to_string());
+            }
+            ensure_docker_compose_ready(&state, &instance, "install")?;
+            recheck_instance_ports(&state, &instance)?;
+            instance.status = "installing".to_string();
+            instance.updated_at = timestamp();
+            enrich_service_endpoints(&mut instance);
+            update_instance(&state, instance.clone())?;
+
+            state.set_deployment_stage(&instance_id, "tasks");
+            let tasks = run_and_log(&state, &instance, &["task", "--list"], "execution")?;
+            // Parse every task name from `agentseek task --list` output
+            // (format: "  task_name    description...") and execute each one.
+            // Skip tasks that cannot run during the pre-start task phase:
+            // - names starting with "ingest" import data and require the
+            //   backend services to be fully running
+            // - "relay-export" validates runtime ATOF events that only exist
+            //   after live traffic has flowed through the Relay middleware
+            // - names ending with "-stop" or "_stop" are teardown tasks
+            //   (e.g. "phoenix-stop" runs docker compose down) that would
+            //   undo earlier start tasks if executed in the same phase
+            for line in tasks.output.lines() {
+                let task_name = line.split_whitespace().next().unwrap_or("");
+                if !task_name.is_empty()
+                    && !task_name.starts_with("ingest")
+                    && task_name != "relay-export"
+                    && !task_name.ends_with("-stop")
+                    && !task_name.ends_with("_stop")
+                {
+                    run_and_log(&state, &instance, &["task", task_name], "execution")?;
+                }
+            }
+            let info = run_and_log(&state, &instance, &["info"], "execution")?;
+            apply_info_urls(&mut instance, &info.output);
+            enrich_service_endpoints(&mut instance);
+            state.set_deployment_stage(&instance_id, "doctor");
+            run_and_log(&state, &instance, &["doctor"], "execution")?;
+            ensure_docker_compose_ready(&state, &instance, "install")?;
+            state.set_deployment_stage(&instance_id, "dry-run");
+            run_and_log(&state, &instance, &["dev", "--dry-run"], "execution")?;
+            state.set_deployment_stage(&instance_id, "starting");
+            spawn_instance(&state, &mut instance)?;
+            instance.status = "starting".to_string();
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            if let Err(error) = wait_for_instance_ready(&state, &instance) {
+                let process_already_exited = instance
+                    .pid
+                    .is_some_and(|pid| !process_exists(pid));
+                if !process_already_exited {
+                    let _ = stop_instance_process(&state, &instance, "install");
+                }
+                return Err(error);
+            }
+            instance.status = "running".to_string();
+            instance.needs_doctor = false;
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            state.log(
+                Some(&instance.id),
+                &instance.name,
+                "install",
+                "success",
+                "Instance deployment completed",
+                None,
+            );
+            state.set_deployment_stage(&instance_id, "complete");
+            Ok(instance)
+        })();
+        if let Err(error) = &result {
+            state.set_deployment_stage(&instance_id, "failed");
+            finalize_failed_deployment(&state, &instance_id, error, false);
+        }
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn deployment_progress(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<String, String> {
+    Ok(state
+        .deployment_stages
+        .lock()
+        .map_err(|_| "Deployment state lock is poisoned".to_string())?
+        .get(&instance_id)
+        .cloned()
+        .unwrap_or_else(|| "pending".to_string()))
+}
+
+#[tauri::command]
+async fn stop_instance(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<InstanceRecord, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut instance = instance_by_id(&state, &instance_id)?;
+        enrich_service_endpoints(&mut instance);
+        let previous_status = instance.status.clone();
+        instance.status = "stopping".to_string();
+        instance.updated_at = timestamp();
+        update_instance(&state, instance.clone())?;
+        let _stopped = match stop_instance_process(&state, &instance, "install") {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                instance.status = previous_status;
+                instance.updated_at = timestamp();
+                let _ = update_instance(&state, instance.clone());
+                state.log(
+                    Some(&instance.id),
+                    &instance.name,
+                    "install",
+                    "error",
+                    format!("Failed to stop instance: {error}"),
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        instance.pid = None;
+        instance.status = "stopped".to_string();
+        instance.updated_at = timestamp();
+        update_instance(&state, instance.clone())?;
+        state.log(
+            Some(&instance.id),
+            &instance.name,
+            "install",
+            "success",
+            "Instance stopped",
+            None,
+        );
+        Ok(instance)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn restart_instance(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<InstanceRecord, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| -> Result<InstanceRecord, String> {
+            let mut instance = instance_by_id(&state, &instance_id)?;
+            ensure_docker_compose_ready(&state, &instance, "install")?;
+            let synchronized = synchronize_instance_configs_from_env(&instance)?;
+            if !synchronized.is_empty() {
+                state.log(
+                    Some(&instance.id),
+                    &instance.name,
+                    "config",
+                    "info",
+                    format!(
+                        "Runtime configs updated based on instance .env before restart\n{}",
+                        synchronized
+                            .iter()
+                            .map(|path| format!("  {}", path.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                    None,
+                );
+            }
+            enrich_service_endpoints(&mut instance);
+            instance.status = "restarting".to_string();
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            run_and_log(&state, &instance, &["doctor"], "execution")?;
+            ensure_docker_compose_ready(&state, &instance, "install")?;
+            let _stopped = stop_instance_process(&state, &instance, "install")?;
+            instance.pid = None;
+            spawn_instance(&state, &mut instance)?;
+            instance.status = "starting".to_string();
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            if let Err(error) = wait_for_instance_ready(&state, &instance) {
+                let process_already_exited = instance
+                    .pid
+                    .is_some_and(|pid| !process_exists(pid));
+                if !process_already_exited {
+                    let _ = stop_instance_process(&state, &instance, "install");
+                }
+                return Err(error);
+            }
+            instance.status = "running".to_string();
+            instance.needs_doctor = false;
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            state.log(
+                Some(&instance.id),
+                &instance.name,
+                "install",
+                "success",
+                "Doctor passed; instance restarted",
+                None,
+            );
+            Ok(instance)
+        })();
+        if let Err(error) = &result {
+            finalize_failed_deployment(&state, &instance_id, error, true);
+        }
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Shared failure cleanup for a deployment attempt: drop spooled runtime logs
+/// and mark the instance failed (or needs-restart when a doctor check flagged it).
+fn finalize_failed_deployment(
+    state: &DesktopState,
+    instance_id: &str,
+    error: &str,
+    needs_restart_on_doctor: bool,
+) {
+    remove_runtime_log_spool(state, instance_id);
+    // Instance failed to run; clean up runtime log (error info already shown in lifecycle log)
+    if let Ok(mut storage) = state.storage.lock() {
+        let _ = storage.delete_runtime_logs(instance_id);
+    }
+    if let Ok(mut data) = state.data.lock() {
+        data.logs.retain(|log| {
+            !(log.instance_id.as_deref() == Some(instance_id) && log.category == "runtime")
+        });
+    }
+    if let Ok(mut instance) = instance_by_id(state, instance_id) {
+        instance.status = if needs_restart_on_doctor && instance.needs_doctor {
+            "needs-restart".to_string()
+        } else {
+            "failed".to_string()
+        };
+        instance.updated_at = timestamp();
+        let _ = update_instance(state, instance.clone());
+        state.log(
+            Some(&instance.id),
+            &instance.name,
+            "install",
+            "error",
+            error.to_string(),
+            None,
+        );
+    }
+}
+
+#[tauri::command]
+fn mark_env_edited(state: State<'_, DesktopState>, instance_id: String) -> Result<(), String> {
+    let mut instance = instance_by_id(&state, &instance_id)?;
+    let deployment_completed = instance_has_completed_deployment(state.inner(), &instance)?;
+    if !deployment_completed {
+        instance.needs_doctor = false;
+        instance.status = if instance.env_path.is_some() {
+            "ready-to-install".to_string()
+        } else {
+            "configuring".to_string()
+        };
+        instance.updated_at = timestamp();
+        return update_instance(&state, instance);
+    }
+    instance.needs_doctor = true;
+    instance.status = "needs-restart".to_string();
+    instance.updated_at = timestamp();
+    update_instance(&state, instance)
+}
+
+#[tauri::command]
+async fn delete_instance(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut instance = instance_by_id(&state, &instance_id)?;
+        enrich_service_endpoints(&mut instance);
+        instance.status = "deleting".to_string();
+        instance.updated_at = timestamp();
+        update_instance(&state, instance.clone())?;
+        let result = (|| -> Result<(), String> {
+            let stopped = stop_instance_process(&state, &instance, "install")
+                .map_err(|error| format!("Failed to stop instance associated processes: {error}"))?;
+            instance.pid = None;
+            instance.updated_at = timestamp();
+            update_instance(&state, instance.clone())?;
+            // Clean up Docker containers (e.g. Phoenix, SeekDB) started by
+            // tasks or docker compose in local deployment mode. Best-effort:
+            // log failure but don't block instance deletion.
+            let docker_cleaned = match cleanup_docker_containers(&instance.work_dir) {
+                Ok(cleaned) => {
+                    if cleaned {
+                        state.log(
+                            Some(&instance.id),
+                            &instance.name,
+                            "install",
+                            "info",
+                            "Docker containers stopped and removed via docker compose down".to_string(),
+                            None,
+                        );
+                    }
+                    cleaned
+                }
+                Err(error) => {
+                    state.log(
+                        Some(&instance.id),
+                        &instance.name,
+                        "install",
+                        "warning",
+                        format!("Docker container cleanup failed (non-fatal): {error}"),
+                        None,
+                    );
+                    false
+                }
+            };
+            remove_instance_work_dir(&instance.work_dir)?;
+            remove_runtime_log_spool(&state, &instance.id);
+            state.remove_persisted_instance(&instance_id)?;
+            {
+                let mut data = state
+                    .data
+                    .lock()
+                    .map_err(|_| "State lock is poisoned".to_string())?;
+                data.instances.retain(|item| item.id != instance_id);
+            }
+            state.log(
+                Some(&instance.id),
+                &instance.name,
+                "install",
+                "success",
+                format!(
+                    "Instance deletion completed\nInstance name: {}\nInstance ID: {}\nWorking directory: {}\nProcesses stopped: {}\nDocker containers cleaned: {}\nInstance record: deleted",
+                    instance.name,
+                    instance.id,
+                    instance.work_dir,
+                    stopped.len(),
+                    docker_cleaned
+                ),
+                None,
+            );
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            if let Ok(mut failed_instance) = instance_by_id(&state, &instance_id) {
+                failed_instance.status = "delete-failed".to_string();
+                failed_instance.updated_at = timestamp();
+                let _ = update_instance(&state, failed_instance);
+            }
+            state.log(
+                Some(&instance.id),
+                &instance.name,
+                "install",
+                "error",
+                format!("Failed to delete instance: {error}"),
+                None,
+            );
+        }
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn check_instance_docker_requirements(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<Option<String>, String> {
+    let instance = instance_by_id(&state, &instance_id)?;
+    if let Some(message) = docker_compose_check(Path::new(&instance.work_dir)) {
+        state.log(
+            Some(&instance.id),
+            &instance.name,
+            "install",
+            "error",
+            &message,
+            Some("docker --version && docker compose version --short && docker info".to_string()),
+        );
+        Ok(Some(format!("{} instance startup process exited, please check lifecycle logs", instance.name)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests_instance {
+    use super::*;
+
+    #[test]
+    fn replace_port_in_context_only_touches_port_like_contexts() {
+        // URL contexts (`:port`) are replaced.
+        assert_eq!(
+            replace_port_in_context("http://127.0.0.1:6006/api", 6006, 64977),
+            "http://127.0.0.1:64977/api"
+        );
+        // `*_PORT=` assignments are replaced; plain `foo=6006` is untouched.
+        assert_eq!(
+            replace_port_in_context("PHOENIX_PORT=6006\nSOME_KEY=6006", 6006, 64977),
+            "PHOENIX_PORT=64977\nSOME_KEY=6006"
+        );
+        // Standalone `port` keyword (JSON, quotes, whitespace) is replaced.
+        assert_eq!(
+            replace_port_in_context("\"port\": 6006", 6006, 64977),
+            "\"port\": 64977"
+        );
+        assert_eq!(
+            replace_port_in_context("port 6006", 6006, 64977),
+            "port 64977"
+        );
+        // Words ending in "port" (import/export/support) are NOT matched.
+        assert_eq!(
+            replace_port_in_context("import 6006", 6006, 64977),
+            "import 6006"
+        );
+        assert_eq!(
+            replace_port_in_context("# support 6006 items", 6006, 64977),
+            "# support 6006 items"
+        );
+        // Numbers inside larger digit sequences and IP segments stay untouched.
+        assert_eq!(
+            replace_port_in_context("port 60067 and 192.168.6006.1", 6006, 64977),
+            "port 60067 and 192.168.6006.1"
+        );
+        // JSON string values that merely look like the port are untouched.
+        assert_eq!(
+            replace_port_in_context("{\"other\": \"6006\"}", 6006, 64977),
+            "{\"other\": \"6006\"}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_services_expose_all_declared_urls() {
+        let manifest: LifecycleManifest = toml::from_str(
+            "[services.app]\nurl = \"http://127.0.0.1:5173\"\n[services.gateway]\nurl = \"http://127.0.0.1:8088/agent\"\n[services.copilotkit]\nurl = \"http://127.0.0.1:4000/api/copilotkit\"\n",
+        )
+        .expect("parse lifecycle services");
+
+        assert_eq!(manifest.services.len(), 3);
+        assert_eq!(service_display_name("app"), "Frontend");
+        assert_eq!(service_display_name("gateway"), "Agent / Gateway");
+        assert_eq!(service_display_name("copilotkit"), "CopilotKit Runtime");
+    }
+    #[test]
+    fn deleting_an_instance_removes_its_working_directory() {
+        let root = env::temp_dir().join(format!("agentseek-desktop-delete-{}", unique_stamp()));
+        fs::create_dir_all(root.join("nested")).expect("create instance directory");
+        fs::write(root.join("nested/data.txt"), "instance data").expect("write instance file");
+
+        remove_instance_work_dir(&root.to_string_lossy()).expect("remove instance directory");
+
+        assert!(!root.exists());
+    }
+    #[test]
+    fn instance_working_directory_is_parent_plus_instance_name() {
+        let parent = Path::new("/tmp/agentseek-instances");
+
+        assert_eq!(
+            instance_target_path(parent, "rag-development").expect("build target path"),
+            parent.join("rag-development")
+        );
+        assert!(instance_target_path(parent, "nested/name").is_err());
+        assert!(instance_target_path(parent, "..").is_err());
+    }
+    #[test]
+    fn env_file_scan_prefers_example_and_ignores_nested_files() {
+        let root = env::temp_dir().join(format!("agentseek-desktop-env-scan-{}", unique_stamp()));
+        fs::create_dir_all(root.join("frontend")).expect("create test directory");
+        for name in [
+            ".env",
+            ".env.example",
+            ".env.development",
+            ".env1",
+            "README.md",
+        ] {
+            fs::write(root.join(name), "KEY=value\n").expect("write test file");
+        }
+        fs::write(root.join("frontend/.env"), "FRONTEND=true\n").expect("write nested env");
+
+        let files = list_env_files(root.to_string_lossy().to_string()).expect("scan env files");
+
+        assert_eq!(files.len(), 4);
+        assert!(files[0].ends_with("/.env.example"));
+        assert!(files.iter().any(|file| file.ends_with("/.env")));
+        assert!(files.iter().any(|file| file.ends_with("/.env.development")));
+        assert!(files.iter().any(|file| file.ends_with("/.env1")));
+        assert!(files.iter().all(|file| !file.contains("frontend")));
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn historical_desktop_operations_move_to_lifecycle_category() {
+        let mut store = AppStore {
+            instances: Vec::new(),
+            vault: Vec::new(),
+            logs: [
+                "Instance stopped",
+                "Instance associated processes stopped\nWorking directory: /tmp/demo",
+                "Doctor passed; instance restarted",
+                "Instance processes, working directory, and record deleted",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| LogEntry {
+                id: format!("lifecycle-log-{index}"),
+                instance_id: Some("instance".to_string()),
+                instance_name: "Instance".to_string(),
+                category: "runtime".to_string(),
+                level: "success".to_string(),
+                message: message.to_string(),
+                command: None,
+                created_at: index as u64,
+                sequence: index as u64,
+            })
+            .collect(),
+        };
+
+        assert!(repair_lifecycle_log_categories(&mut store));
+        assert!(store.logs.iter().all(|log| log.category == "install"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn terminate_processes_stops_parent_and_children() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process tree");
+        let pid = child.id();
+        let waiter = std::thread::spawn(move || child.wait().expect("wait for process tree"));
+
+        let stopped = super::terminate_processes([pid]).expect("terminate process tree");
+
+        assert!(stopped.iter().any(|process| process.pid == pid));
+        assert!(stopped.iter().all(|process| !process.executable.is_empty()));
+        waiter.join().expect("join process waiter");
+        assert!(!super::process_exists(pid));
+    }
+    #[test]
+    fn apt_mirror_patch_adds_timeout_and_fallback() {
+        let dir = patch_test_dir("apt-normal");
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, "RUN apt-get update && apt-get install -y git\n").expect("write");
+        patch_dockerfile_apt_mirror_if_needed(&dir);
+        let patched = fs::read_to_string(&dockerfile).expect("read");
+        assert!(patched.contains("timeout 60"));
+        assert!(patched.contains("mirrors.aliyun.com"));
+        assert!(!patched.contains("RUN apt-get update &&")); // original replaced
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn apt_mirror_patch_is_idempotent() {
+        let dir = patch_test_dir("apt-idem");
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, "RUN apt-get update && apt-get install -y git\n").expect("write");
+        patch_dockerfile_apt_mirror_if_needed(&dir);
+        let after_first = fs::read_to_string(&dockerfile).expect("read");
+        patch_dockerfile_apt_mirror_if_needed(&dir);
+        let after_second = fs::read_to_string(&dockerfile).expect("read");
+        assert_eq!(after_first, after_second);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn apt_mirror_patch_skips_when_no_apt_get_update() {
+        let dir = patch_test_dir("apt-none");
+        let dockerfile = dir.join("Dockerfile");
+        let original = "FROM python:3.12\nCMD [\"bash\"]\n";
+        fs::write(&dockerfile, original).expect("write");
+        patch_dockerfile_apt_mirror_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&dockerfile).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn apt_mirror_patch_skips_when_no_dockerfile() {
+        let dir = patch_test_dir("apt-nofile");
+        // Should not panic.
+        patch_dockerfile_apt_mirror_if_needed(&dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+    fn sample_dockerfile_with_uv() -> String {
+        [
+            "FROM python:3.12-slim AS base",
+            "WORKDIR /app",
+            "RUN apt-get update && apt-get install -y git",
+            "COPY pyproject.toml .",
+            "RUN set -e; \\",
+            "    if [ -n \"${UV_DEFAULT_INDEX:-}\" ]; then export UV_DEFAULT_INDEX; fi; \\",
+            "    if [ -n \"${UV_INDEX_URL:-}\" ]; then export UV_INDEX_URL; fi; \\",
+            "    if [ -n \"${UV_INSECURE_HOST:-}\" ]; then export UV_INSECURE_HOST; fi; \\",
+            "    UV_LINK_MODE=copy uv sync --no-dev --no-cache",
+            "",
+        ]
+        .join("\n")
+    }
+    #[test]
+    fn mirrors_patch_adds_pypi_fallback() {
+        let dir = patch_test_dir("mirrors-normal");
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, sample_dockerfile_with_uv()).expect("write");
+        patch_dockerfile_mirrors_if_needed(&dir);
+        let patched = fs::read_to_string(&dockerfile).expect("read");
+        assert!(patched.contains("mirrors.aliyun.com/pypi/simple/"));
+        // Original fi; lines should be replaced with elif chain.
+        assert!(patched.contains("elif [ -n \"${UV_INDEX_URL"));
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn mirrors_patch_is_idempotent() {
+        let dir = patch_test_dir("mirrors-idem");
+        let dockerfile = dir.join("Dockerfile");
+        fs::write(&dockerfile, sample_dockerfile_with_uv()).expect("write");
+        patch_dockerfile_mirrors_if_needed(&dir);
+        let after_first = fs::read_to_string(&dockerfile).expect("read");
+        patch_dockerfile_mirrors_if_needed(&dir);
+        let after_second = fs::read_to_string(&dockerfile).expect("read");
+        assert_eq!(after_first, after_second);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn mirrors_patch_skips_when_no_uv_sync() {
+        let dir = patch_test_dir("mirrors-nouv");
+        let dockerfile = dir.join("Dockerfile");
+        let original = "FROM python:3.12\nRUN pip install -r requirements.txt\n";
+        fs::write(&dockerfile, original).expect("write");
+        patch_dockerfile_mirrors_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&dockerfile).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn mirrors_patch_skips_when_no_default_index_marker() {
+        let dir = patch_test_dir("mirrors-nomarker");
+        let dockerfile = dir.join("Dockerfile");
+        // Has uv sync but no UV_DEFAULT_INDEX block.
+        let original = "FROM python:3.12\nRUN uv sync --no-dev\n";
+        fs::write(&dockerfile, original).expect("write");
+        patch_dockerfile_mirrors_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&dockerfile).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn cors_patch_replaces_port_specific_origins() {
+        let dir = patch_test_dir("cors-normal");
+        let path = dir.join("langgraph.json");
+        let original = serde_json::json!({
+            "graphs": { "agent": "./src/agent.py:graph" },
+            "http": {
+                "port": 8089,
+                "cors": {
+                    "allow_origins": ["http://127.0.0.1:5175"],
+                    "allow_origin_regex": "^https?://.*:5175$"
+                }
+            }
+        });
+        fs::write(&path, original.to_string()).expect("write");
+        patch_langgraph_cors_if_needed(&dir);
+        let patched: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        let cors = patched["http"]["cors"].as_object().expect("cors object");
+        assert_eq!(cors["allow_origin_regex"].as_str(), Some("^https?://.*$"));
+        assert!(cors.get("allow_origins").is_none());
+        assert_eq!(cors["allow_methods"], serde_json::json!(["*"]));
+        assert_eq!(cors["allow_headers"], serde_json::json!(["*"]));
+        // Non-CORS fields should be preserved.
+        assert_eq!(patched["http"]["port"], 8089);
+        assert_eq!(patched["graphs"]["agent"], "./src/agent.py:graph");
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn cors_patch_adds_trailing_newline() {
+        let dir = patch_test_dir("cors-newline");
+        let path = dir.join("langgraph.json");
+        fs::write(&path, r#"{"http":{"cors":{"allow_origins":["http://localhost:5175"]}}}"#)
+            .expect("write");
+        patch_langgraph_cors_if_needed(&dir);
+        let content = fs::read_to_string(&path).expect("read");
+        assert!(content.ends_with('\n'), "patched file must end with a newline");
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn cors_patch_skips_when_no_cors_section() {
+        let dir = patch_test_dir("cors-nocors");
+        let path = dir.join("langgraph.json");
+        let original = r#"{"graphs":{"agent":"./src/agent.py:graph"},"http":{"port":8089}}"#;
+        fs::write(&path, original).expect("write");
+        patch_langgraph_cors_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn cors_patch_skips_when_no_langgraph_json() {
+        let dir = patch_test_dir("cors-nofile");
+        // Should not panic.
+        patch_langgraph_cors_if_needed(&dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn cors_patch_skips_invalid_json() {
+        let dir = patch_test_dir("cors-invalid");
+        let path = dir.join("langgraph.json");
+        let original = "{not valid json}";
+        fs::write(&path, original).expect("write");
+        patch_langgraph_cors_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn convert_models_patch_replaces_optimum_command() {
+        let dir = patch_test_dir("convert-normal");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("convert_models.py");
+        fs::write(&path, "cmd = [sys.executable, \"-m\", \"optimum.exporters.openvino\", \"--model\", model_name]\n")
+            .expect("write");
+        patch_convert_models_if_needed(&dir);
+        let patched = fs::read_to_string(&path).expect("read");
+        assert!(patched.contains("\"optimum-cli\", \"export\", \"openvino\""));
+        assert!(!patched.contains("\"-m\", \"optimum.exporters.openvino\""));
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn convert_models_patch_skips_when_already_patched() {
+        let dir = patch_test_dir("convert-idem");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("convert_models.py");
+        let original = "cmd = [\"optimum-cli\", \"export\", \"openvino\", \"--model\", model_name]\n";
+        fs::write(&path, original).expect("write");
+        patch_convert_models_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn convert_models_patch_skips_when_no_marker() {
+        let dir = patch_test_dir("convert-nomarker");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("convert_models.py");
+        let original = "print('hello')\n";
+        fs::write(&path, original).expect("write");
+        patch_convert_models_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn agent_async_patch_adds_shim() {
+        let dir = patch_test_dir("agent-normal");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("agent.py");
+        fs::write(&path, "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n")
+            .expect("write");
+        // pyproject.toml must list langchain-huggingface for the shim to be added.
+        fs::write(dir.join("pyproject.toml"), "\"langchain-huggingface>=1.0\",\n").expect("write");
+        patch_agent_async_if_needed(&dir);
+        let patched = fs::read_to_string(&path).expect("read");
+        assert!(patched.contains("_patched_agenerate"));
+        assert!(patched.contains("_patched_astream"));
+        assert!(patched.contains("asyncio.to_thread"));
+        // Original marker should still be present.
+        assert!(patched.contains("from langchain_oceanbase.vectorstores import OceanbaseVectorStore"));
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn agent_async_patch_is_idempotent() {
+        let dir = patch_test_dir("agent-idem");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("agent.py");
+        fs::write(&path, "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n")
+            .expect("write");
+        fs::write(dir.join("pyproject.toml"), "\"langchain-huggingface>=1.0\",\n").expect("write");
+        patch_agent_async_if_needed(&dir);
+        let after_first = fs::read_to_string(&path).expect("read");
+        patch_agent_async_if_needed(&dir);
+        let after_second = fs::read_to_string(&path).expect("read");
+        assert_eq!(after_first, after_second);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn agent_async_patch_skips_when_no_hf_dep() {
+        let dir = patch_test_dir("agent-nohf");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("agent.py");
+        let original = "from langchain_core.prompts import ChatPromptTemplate\nprint('hi')\n";
+        fs::write(&path, original).expect("write");
+        // No langchain-huggingface in pyproject.toml — patch should skip.
+        fs::write(dir.join("pyproject.toml"), "[project]\n").expect("write");
+        patch_agent_async_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn agent_async_patch_skips_with_marker_but_no_hf_dep() {
+        let dir = patch_test_dir("agent-markerno");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let path = src.join("agent.py");
+        let original = "from langchain_oceanbase.vectorstores import OceanbaseVectorStore\nprint('hi')\n";
+        fs::write(&path, original).expect("write");
+        // Has OceanbaseVectorStore marker but no langchain-huggingface dep — should skip.
+        fs::write(dir.join("pyproject.toml"), "[project]\n").expect("write");
+        patch_agent_async_if_needed(&dir);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn agent_async_patch_skips_when_no_agent_py() {
+        let dir = patch_test_dir("agent-nofile");
+        // Should not panic.
+        patch_agent_async_if_needed(&dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+/// Create a temp directory with a unique name.
+fn patch_test_dir(label: &str) -> std::path::PathBuf {
+    let dir = env::temp_dir().join(format!("agentseek-patch-{label}-{}", unique_stamp()));
+    fs::create_dir_all(&dir).expect("create test dir");
+    dir
 }

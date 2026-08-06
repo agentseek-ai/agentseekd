@@ -73,9 +73,7 @@ fn runtime_stream_level(line: &str) -> &'static str {
     let lower = line.to_lowercase();
     if lower.contains("cannot connect to the docker daemon")
         || lower.contains("is the docker daemon running")
-    {
-        "error"
-    } else if lower.contains("traceback")
+        || lower.contains("traceback")
         || lower.contains("exception")
         || lower.contains("error")
         || lower.contains("failed")
@@ -349,4 +347,254 @@ fn remove_runtime_log_spool(state: &DesktopState, instance_id: &str) {
     let (log_path, cursor_path) = runtime_log_spool_paths(&state.data_dir, instance_id);
     let _ = fs::remove_file(log_path);
     let _ = fs::remove_file(cursor_path);
+}
+
+// ---------------------------------------------------------------------------
+// Log commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_logs(state: State<'_, DesktopState>, query: LogQuery) -> Result<LogPage, String> {
+    sync_runtime_log_spools(state.inner());
+    state
+        .storage
+        .lock()
+        .map_err(|_| "Storage lock is poisoned".to_string())?
+        .query_logs(&query)
+}
+
+#[tauri::command]
+fn log_settings(state: State<'_, DesktopState>) -> Result<LogSettings, String> {
+    let retention_days = state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())?
+        .runtime_log_retention_days;
+    Ok(LogSettings {
+        runtime_retention_days: retention_days,
+    })
+}
+
+#[tauri::command]
+fn save_log_settings(
+    state: State<'_, DesktopState>,
+    settings: LogSettings,
+) -> Result<LogSettings, String> {
+    state.ensure_storage_ready()?;
+    if !(1..=3_650).contains(&settings.runtime_retention_days) {
+        return Err("Runtime log retention days must be between 1 and 3650".to_string());
+    }
+    let mut config = state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())?
+        .clone();
+    config.runtime_log_retention_days = settings.runtime_retention_days;
+    write_storage_config(&state.config_path, &config)?;
+    *state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())? = config;
+    let removed = state
+        .storage
+        .lock()
+        .map_err(|_| "Storage lock is poisoned".to_string())?
+        .cleanup_logs(settings.runtime_retention_days, timestamp())?;
+    state.log(
+        None,
+        "Log Center",
+        "config",
+        "success",
+        format!(
+            "Runtime log retention set to {} days; cleaned up {} log entries",
+            settings.runtime_retention_days, removed
+        ),
+        None,
+    );
+    Ok(settings)
+}
+
+#[cfg(test)]
+mod tests_logging {
+    use super::*;
+
+    #[test]
+    fn runtime_tool_tracebacks_are_compacted_to_error_and_reason() {
+        let mut suppress_traceback = false;
+        assert_eq!(
+            compact_runtime_log_record(
+                "2026-07-22 17:52:26.376 | ERROR | bub.tools:wrapped:34 - tool.call.error name=web.fetch elapsed_time=153.81ms",
+                &mut suppress_traceback,
+            )
+            .as_deref(),
+            Some("Tool call failed: web.fetch (153.81ms)")
+        );
+        assert!(suppress_traceback);
+        assert_eq!(
+            compact_runtime_log_record(
+                "Traceback (most recent call last):",
+                &mut suppress_traceback
+            ),
+            None
+        );
+        assert_eq!(
+            compact_runtime_log_record(
+                "  File \"/tmp/site-packages/aiohttp/client.py\", line 701, in _request",
+                &mut suppress_traceback,
+            ),
+            None
+        );
+        assert_eq!(
+            compact_runtime_log_record(
+                "aiohttp.client_exceptions.ClientResponseError: 403, message='Forbidden'",
+                &mut suppress_traceback,
+            )
+            .as_deref(),
+            Some("Failure reason: ClientResponseError: 403, message='Forbidden'")
+        );
+        assert!(!suppress_traceback);
+
+        let mut timeout_traceback = true;
+        assert_eq!(
+            compact_runtime_log_record("TimeoutError", &mut timeout_traceback).as_deref(),
+            Some("Failure reason: TimeoutError (request timeout)")
+        );
+        assert!(!timeout_traceback);
+    }
+    #[test]
+    fn runtime_log_spool_resumes_only_after_a_complete_line() {
+        let root = env::temp_dir().join(format!("agentseek-runtime-spool-{}", unique_stamp()));
+        fs::create_dir_all(&root).expect("create runtime spool test directory");
+        let (log_path, cursor_path) = runtime_log_spool_paths(&root, "../instance/demo");
+        assert_eq!(log_path.parent(), Some(root.join("runtime-logs").as_path()));
+        assert_eq!(cursor_path.parent(), log_path.parent());
+
+        fs::create_dir_all(log_path.parent().expect("runtime log parent"))
+            .expect("create runtime log directory");
+        fs::write(&log_path, "first\npartial").expect("write initial runtime output");
+        let (start, records) =
+            read_runtime_log_records(&log_path, 0, false).expect("read complete runtime line");
+        assert_eq!(start, 0);
+        assert_eq!(records, vec![("first".to_string(), 6)]);
+
+        let mut output = fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("reopen runtime output");
+        output
+            .write_all(b" tail\n")
+            .expect("complete partial runtime line");
+        let (_, resumed) =
+            read_runtime_log_records(&log_path, 6, false).expect("resume runtime output");
+        assert_eq!(
+            resumed,
+            vec![(
+                "partial tail".to_string(),
+                "first\npartial tail\n".len() as u64
+            )]
+        );
+
+        fs::remove_dir_all(root).expect("remove runtime spool test directory");
+    }
+    #[test]
+    fn oversized_log_text_is_truncated_on_a_utf8_boundary() {
+        let value = "\u{2192}".repeat(MAX_LOG_TEXT_BYTES);
+        let truncated = truncate_log_text(value);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.contains("log content truncated"));
+        assert!(truncated.len() < MAX_LOG_TEXT_BYTES + 100);
+    }
+    #[test]
+    fn log_retention_preserves_active_lifecycle_and_expires_runtime_or_deleted_instances() {
+        let now = 20 * SECONDS_PER_DAY;
+        let active = InstanceRecord {
+            id: "active".to_string(),
+            name: "Active".to_string(),
+            template_id: "bub/default".to_string(),
+            status: "running".to_string(),
+            deployment_mode: "local".to_string(),
+            work_dir: "/tmp/active".to_string(),
+            env_example_path: None,
+            env_path: None,
+            note: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            needs_doctor: false,
+            pid: None,
+            agent_url: None,
+            ui_url: None,
+            studio_url: None,
+            project_name: None,
+            lifecycle_version: None,
+            service_endpoints: Vec::new(),
+        };
+        let old = now - 10 * SECONDS_PER_DAY;
+        let recent = now - SECONDS_PER_DAY;
+        let mut store = AppStore {
+            instances: vec![active],
+            vault: Vec::new(),
+            logs: vec![
+                test_log("active-lifecycle", Some("active"), "install", old),
+                test_log("active-runtime", Some("active"), "runtime", old),
+                test_log("deleted-lifecycle-old", Some("deleted"), "install", old),
+                test_log(
+                    "deleted-lifecycle-recent",
+                    Some("deleted"),
+                    "install",
+                    recent,
+                ),
+                test_log("deleted-runtime-recent", Some("deleted"), "runtime", recent),
+                test_log("platform-lifecycle", None, "config", old),
+            ],
+        };
+
+        let removed = prune_logs(&mut store, 7, now);
+        let remaining = store
+            .logs
+            .iter()
+            .map(|log| log.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(removed.contains(&"active-runtime".to_string()));
+        assert!(removed.contains(&"deleted-lifecycle-old".to_string()));
+        assert!(remaining.contains("active-lifecycle"));
+        assert!(remaining.contains("deleted-lifecycle-recent"));
+        assert!(remaining.contains("deleted-runtime-recent"));
+        assert!(remaining.contains("platform-lifecycle"));
+    }
+    #[test]
+    fn runtime_stream_level_does_not_treat_normal_stderr_as_an_error() {
+        assert_eq!(
+            runtime_stream_level("INFO: Application startup complete."),
+            "info"
+        );
+        assert_eq!(runtime_stream_level("WARNING: retrying request"), "warning");
+        assert_eq!(
+            runtime_stream_level("RuntimeError: connection failed"),
+            "error"
+        );
+        assert_eq!(
+            runtime_stream_level("unable to get image 'quay.io/oceanbase/seekdb:latest': Cannot connect to the Docker daemon at unix:///Users/sunchong/.orbstack/run/docker.sock. Is the docker daemon running?"),
+            "error"
+        );
+        assert_eq!(
+            runtime_stream_level("Cannot connect to the Docker daemon at unix:///Users/sunchong/.orbstack/run/docker.sock. Is the docker daemon running?"),
+            "error"
+        );
+    }
+}
+
+#[cfg(test)]
+fn test_log(id: &str, instance_id: Option<&str>, category: &str, created_at: u64) -> LogEntry {
+    LogEntry {
+        id: id.to_string(),
+        instance_id: instance_id.map(str::to_string),
+        instance_name: instance_id.unwrap_or("AgentSeek").to_string(),
+        category: category.to_string(),
+        level: "info".to_string(),
+        message: id.to_string(),
+        command: None,
+        created_at,
+        sequence: created_at,
+    }
 }

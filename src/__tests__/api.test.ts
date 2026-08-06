@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { desktopApi } from "../api";
 import type { InstanceRecord, EnvVariable } from "../types";
 
@@ -343,7 +343,7 @@ describe("desktopApi mock layer", () => {
   describe("systemInfo", () => {
     it("returns system info", async () => {
       const info = await desktopApi.systemInfo();
-      expect(info.appName).toBe("AgentSeek");
+      expect(info.appName).toBe("AgentSeek Desktop");
       expect(typeof info.dockerAvailable).toBe("boolean");
     });
   });
@@ -353,10 +353,37 @@ describe("desktopApi mock layer", () => {
   // -----------------------------------------------------------------
 
   describe("listTemplates", () => {
-    it("returns templates list", async () => {
+    it("fetches and transforms the template catalog", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          "langchain/default": "LangChain create_agent plus CopilotKit middleware.",
+          "langchain/relay-observability": "LangChain Relay observability with Phoenix.",
+          "bub/default": "Lightweight Bub agent with AgentSeek lifecycle spec.",
+        }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
       const templates = await desktopApi.listTemplates();
-      expect(templates.length).toBeGreaterThan(0);
-      expect(templates[0].id).toBeDefined();
+      expect(templates).toEqual([
+        { id: "langchain/default", name: "Default", framework: "langchain", description: "LangChain create_agent plus CopilotKit middleware." },
+        { id: "langchain/relay-observability", name: "Relay Observability", framework: "langchain", description: "LangChain Relay observability with Phoenix." },
+        { id: "bub/default", name: "Default", framework: "bub", description: "Lightweight Bub agent with AgentSeek lifecycle spec." },
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const fetchUrl = fetchMock.mock.calls[0][0] as string;
+      expect(fetchUrl).toBe("https://raw.githubusercontent.com/agentseek-ai/agentseek-templates/main/templates/index.json");
+    });
+
+    it("returns an empty list when the catalog fetch fails", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+      const templates = await desktopApi.listTemplates(true);
+      expect(templates).toEqual([]);
+    });
+
+    it("returns an empty list on a non-OK catalog response", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+      const templates = await desktopApi.listTemplates(true);
+      expect(templates).toEqual([]);
     });
   });
 });

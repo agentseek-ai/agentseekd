@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# E2E conversation tests for all 11 AgentSeek templates.
+# E2E conversation tests for every template auto-discovered from the
+# AgentSeek template catalog via `agentseek create --list-templates`
+# (explicit-catalog mode, same commit used for creation).
+# New templates in the catalog run automatically — no script changes needed.
 #
 # For each template this script:
 #   1. Creates an instance via `agentseek create --no-input`
@@ -35,17 +38,23 @@
 # Optional (templates are skipped if the corresponding secret is missing):
 #   TAVILY_API_KEY        — deepagents/research (Tavily search, free tier available)
 #
-# Auto-skipped in CI (no public alternative exists):
-#   langchain/agentic-rag-openvino  — needs local OpenVINO model files
-#   langchain/cli-remote            — needs an external LangGraph server URL
+# Notes:
+#   langchain/agentic-rag-openvino — runs in CI (model download is supported,
+#                                     needs ~4GB free disk)
+#   langchain/cli-remote           — requires an external LangGraph server URL
+#                                     (no public alternative, may fail)
 #
 # Optional flags:
-#   E2E_TIMEOUT           — Per-template timeout in seconds (default: 300)
-#   E2E_WORK_DIR          — Working directory (default: /tmp/agentseek-e2e)
-#   SKIP_DOCKER_TEMPLATES — Set to 1 to skip templates requiring Docker
-#   SKIP_CI_ONLY          — Set to 1 to skip templates that need local
-#                           hardware/external services (openvino, cli-remote)
-#   MOCK_API_PORT         — Port for mock API server (default: 8899)
+#   E2E_TIMEOUT            — Per-template timeout in seconds (default: 300)
+#   E2E_WORK_DIR           — Working directory (default: /tmp/agentseek-e2e)
+#   SKIP_DOCKER_TEMPLATES  — Set to 1 to skip templates requiring Docker
+#   SKIP_CI_ONLY           — Set to 1 to skip templates that need local
+#                            hardware/external services (openvino, cli-remote)
+#   MOCK_API_PORT          — Port for mock API server (default: 8899)
+#   E2E_TEMPLATE_REPO      — Template catalog repository (default: official)
+#   E2E_TEMPLATE_CHECKOUT  — Pin the catalog commit (default: remote main HEAD)
+#   E2E_TEMPLATE_PROXY     — Proxy used ONLY for catalog fetch (create/list);
+#                            service traffic during dev never goes through it
 
 set -euo pipefail
 
@@ -207,22 +216,59 @@ declare -a FAILED=()
 declare -a SKIPPED=()
 
 # ---------------------------------------------------------------------------
-# Template definitions
+# Template discovery
 #
-# Format: "template_id|type|graph_id|needs_docker|extra_env|ci_only_skip"
+# The template list is auto-discovered from the AgentSeek template catalog
+# through `agentseek create --list-templates` (explicit-catalog mode), so the
+# test matrix always matches what creation supports, and new templates run
+# without touching this script.
 #
-# type:           "bub" (AG-UI gateway) or "langgraph" (LangGraph API)
-# graph_id:       LangGraph graph key (empty for bub type)
-# needs_docker:   1 if Docker is required, 0 otherwise
-# extra_env:      Extra required env vars (comma-separated, empty if none)
-# ci_only_skip:   Non-empty reason string if template should be skipped in CI
-#                 (needs local hardware, external service, etc.)
-# ---------------------------------------------------------------------------
+# Discovered per template id:
+#   tpl_type      — test protocol; inferred as "langgraph" by default, only
+#                   "bub" entries are listed below (the catalog cannot tell
+#                   which protocol a template is tested with)
+#   graph_id      — first graph key from langgraph.json (LangGraph protocol)
+#   needs_docker  — "1" when the template has a docker-compose.yml
+#
+# TEMPLATE_OVERRIDES overrides the inferred values per template id. Non-empty
+# fields replace the auto-discovered ones; add a line only for templates with
+# special requirements (bub protocol, extra secrets, Docker, CI skips,
+# task exports).
+#
 #   Field format: tpl_id|tpl_type|graph_id|needs_docker|extra_env|ci_only_skip|tpl_exports
 #   tpl_exports: comma-separated KEY=VALUE pairs exported when running tasks
-TEMPLATES=(
+TEMPLATE_OVERRIDES=(
+  "bub/default|bub|||||"
+  "deepagents/default|bub|||||"
+  "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
+  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
+  "deepagents/content-builder|langgraph|content_builder|0|||"
+  "langchain/default|bub||1|||"
+  "langchain/agentic-rag|||1|||"
+  "langchain/agentic-rag-hybrid|||1|||"
+  "langchain/agentic-rag-openvino|||1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
+  # graph_id is a cookiecutter variable ({{ cookiecutter.assistant_id }});
+  # pin it to the rendered value.
+  "langchain/cli-remote|langgraph|agent|0|||"
+  # AG-UI gateway served via docker compose (no LangGraph protocol);
+  # TAVILY_API_KEY is declared required in its lifecycle.toml doctor.
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
+)
+
+# Templates are resolved through the agentseek CLI's explicit-catalog mode
+# (--template-repo/--checkout), so the test matrix and `agentseek create`
+# always use the same catalog commit — no local clone is needed.
+TEMPLATE_REPO="${E2E_TEMPLATE_REPO:-https://github.com/agentseek-ai/agentseek-templates.git}"
+TEMPLATE_CHECKOUT="${E2E_TEMPLATE_CHECKOUT:-}"
+# Optional proxy applied ONLY to catalog fetching; dev/service traffic must
+# stay direct, so it is not exported globally.
+TEMPLATE_PROXY="${E2E_TEMPLATE_PROXY:-}"
+
+# Fallback list used when the catalog cannot be fetched (e.g. offline).
+FALLBACK_TEMPLATES=(
   "bub/default|bub||0|||"
   "deepagents/default|bub||0|||"
+  "deepagents/mcp|langgraph|mcp|0|||"
   "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
   "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
   "deepagents/content-builder|langgraph|content_builder|0|||"
@@ -232,7 +278,86 @@ TEMPLATES=(
   "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1|||"
   "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
   "langchain/markdown-messages|langgraph|agent|0|||"
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
 )
+
+# Filled by discover_templates() before the test loop runs.
+TEMPLATES=()
+
+# Resolve the catalog commit the CLI should fetch (remote main HEAD unless
+# pinned via E2E_TEMPLATE_CHECKOUT).
+resolve_template_checkout() {
+  if [[ -n "$TEMPLATE_CHECKOUT" ]]; then
+    log_info "Using pinned template checkout ${TEMPLATE_CHECKOUT:0:12}"
+    return 0
+  fi
+  if ! has_command git; then
+    log_warn "git not found — cannot resolve the template repo HEAD"
+    return 1
+  fi
+  # HEAD resolution fetches the same catalog the create step will fetch,
+  # so route it through the optional proxy too.
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  TEMPLATE_CHECKOUT=$(env "${proxy_env[@]}" git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  if [[ -z "$TEMPLATE_CHECKOUT" ]]; then
+    log_warn "Could not resolve template repo HEAD for $TEMPLATE_REPO"
+    return 1
+  fi
+  log_info "Template catalog checkout: ${TEMPLATE_CHECKOUT:0:12}"
+}
+
+# Auto-discover templates through the agentseek CLI's explicit-catalog mode,
+# so the test matrix always matches what `agentseek create` can build.
+# Metadata (protocol, graph id, Docker) comes from TEMPLATE_OVERRIDES and
+# FALLBACK_TEMPLATES, since the catalog is no longer cloned locally.
+# Falls back to FALLBACK_TEMPLATES when the catalog cannot be fetched.
+discover_templates() {
+  resolve_template_checkout || {
+    TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
+    log_warn "Using built-in fallback list (${#TEMPLATES[@]} templates)"
+    return 1
+  }
+  local ids
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  ids=$(env "${proxy_env[@]}" agentseek create --list-templates \
+    --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>/dev/null \
+    | grep -oE '^[[:space:]]{2,}[a-z0-9._-]+/[a-z0-9._-]+' | tr -d ' ')
+  if [[ -z "$ids" ]]; then
+    TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
+    log_warn "agentseek --list-templates returned no templates — using built-in fallback list"
+    return 1
+  fi
+  local discovered=()
+  local id
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    # Fill each field from the first non-empty match in TEMPLATE_OVERRIDES,
+    # then FALLBACK_TEMPLATES (override fields take precedence).
+    local t_type="" t_graph="" t_docker="" t_env="" t_skip="" t_exports=""
+    local entry
+    for entry in "${TEMPLATE_OVERRIDES[@]}" "${FALLBACK_TEMPLATES[@]}"; do
+      local m_id m_type m_graph m_docker m_env m_skip m_exports
+      IFS='|' read -r m_id m_type m_graph m_docker m_env m_skip m_exports <<< "$entry"
+      [[ "$m_id" == "$id" ]] || continue
+      [[ -z "$t_type" && -n "$m_type" ]] && t_type="$m_type"
+      [[ -z "$t_graph" && -n "$m_graph" ]] && t_graph="$m_graph"
+      [[ -z "$t_docker" && -n "$m_docker" ]] && t_docker="$m_docker"
+      [[ -z "$t_env" && -n "$m_env" ]] && t_env="$m_env"
+      [[ -z "$t_skip" && -n "$m_skip" ]] && t_skip="$m_skip"
+      [[ -z "$t_exports" && -n "$m_exports" ]] && t_exports="$m_exports"
+    done
+    discovered+=("${id}|${t_type:-langgraph}|${t_graph}|${t_docker:-0}|${t_env}|${t_skip}|${t_exports}")
+  done <<< "$ids"
+  TEMPLATES=("${discovered[@]}")
+  log_info "Auto-discovered ${#TEMPLATES[@]} templates via agentseek --list-templates (checkout ${TEMPLATE_CHECKOUT:0:12})"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -343,6 +468,17 @@ check_prerequisites() {
 # Configure .env for a template instance.
 # Copies .env.example to .env if it does not exist, then appends API keys.
 # Usage: configure_env <instance_dir> <template_type> <extra_env_vars> <needs_docker>
+# Address used by containers to reach services on the host: the Docker
+# bridge gateway on Linux CI runners, host.docker.internal on macOS Docker
+# Desktop (where 172.17.0.1 does not exist).
+docker_host_gateway() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "host.docker.internal"
+  else
+    echo "172.17.0.1"
+  fi
+}
+
 configure_env() {
   local dir="$1"
   local tpl_type="$2"
@@ -381,12 +517,11 @@ configure_env() {
   agentseek_base=$(resolve_api_base AGENTSEEK_API_BASE)
   agentseek_model=$(resolve_model AGENTSEEK_MODEL)
 
-  # For Docker-based templates, replace 127.0.0.1 with the Docker bridge gateway
-  # so containers can reach the Mock API Server on the host.
-  # 172.17.0.1 is the default Docker bridge gateway on Linux.
+  # For Docker-based templates, replace 127.0.0.1 with the host gateway
+  # address so containers can reach the Mock API Server on the host.
   local _host="127.0.0.1"
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _host="172.17.0.1"
+    _host=$(docker_host_gateway)
   fi
 
   [[ -n "$bub_key" ]]       && echo "BUB_API_KEY=$bub_key" >> "$env_file"
@@ -398,6 +533,10 @@ configure_env() {
 
   [[ -n "$agentseek_key" ]]   && echo "AGENTSEEK_API_KEY=$agentseek_key" >> "$env_file"
   [[ -n "$agentseek_base" ]]  && echo "AGENTSEEK_API_BASE=$(echo "$agentseek_base" | sed "s/127\.0\.0\.1/$_host/")" >> "$env_file"
+  # Newer templates (e.g. deepagents/mcp) declare AGENTSEEK_MODEL_API_KEY as
+  # required in lifecycle.toml; agentseek dev runs a strict doctor pass and
+  # aborts startup without it, so write the same key under this alias too.
+  [[ -n "$agentseek_key" ]]   && echo "AGENTSEEK_MODEL_API_KEY=$agentseek_key" >> "$env_file"
   [[ -n "$agentseek_model" ]] && echo "AGENTSEEK_MODEL=$agentseek_model" >> "$env_file"
   # LangChain init_chat_model accepts OPENAI_MODEL as alias.
   [[ -n "$agentseek_model" ]] && echo "OPENAI_MODEL=$agentseek_model" >> "$env_file"
@@ -702,7 +841,14 @@ test_template() {
   # Record directories before creation to detect the new one.
   local before_dirs
   before_dirs=$(ls -d "$E2E_WORK_DIR"/*/ 2>/dev/null || true)
-  if ! agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" 2>&1 | tail -5; then
+  # Only catalog fetching goes through the optional proxy; everything else
+  # (setup, dev, health checks) stays on the direct network.
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  if ! env "${proxy_env[@]}" agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" \
+      --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>&1 | tail -5; then
     log_fail "  Failed to create instance"
     FAILED+=("$tpl_id (create failed)")
     return 1
@@ -749,7 +895,9 @@ test_template() {
   # `agentseek task --list` shows available tasks; each task is run by name.
   # Critical tasks (sync, frontend, models, seekdb) must succeed.
   # Non-critical tasks (ingest-sample, seekdb-skills) only produce a warning.
-  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills"
+  # relay-export only verifies events from a previous dev session; a fresh
+  # instance has no archive yet, and the real check is the conversation test.
+  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills|relay-export"
   log_info "  Installing dependencies..."
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
@@ -807,9 +955,9 @@ test_template() {
   local _openai_key _openai_base
   _openai_key=$(resolve_api_key OPENAI_API_KEY)
   _openai_base=$(resolve_api_base OPENAI_API_BASE)
-  # For Docker templates, use Docker bridge gateway so containers can reach the mock server.
+  # For Docker templates, use the host gateway address so containers can reach the mock server.
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _openai_base=$(echo "$_openai_base" | sed 's/127\.0\.0\.1/172.17.0.1/')
+    _openai_base=$(echo "$_openai_base" | sed "s/127\.0\.0\.1/$(docker_host_gateway)/")
   fi
   (cd "$instance_dir" && \
     OPENAI_API_KEY="$_openai_key" \
@@ -902,6 +1050,28 @@ main() {
   echo ""
 
   mkdir -p "$E2E_WORK_DIR"
+
+  # Auto-discover templates from the template catalog; falls back to the
+  # built-in list when the catalog cannot be fetched.
+  discover_templates || true
+
+  # E2E_DRY_RUN=1 prints the resolved test matrix and exits without running.
+  if [[ "${E2E_DRY_RUN:-0}" == "1" ]]; then
+    echo "Discovered template test matrix:"
+    local entry
+    for entry in "${TEMPLATES[@]}"; do
+      local tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip tpl_exports
+      IFS='|' read -r tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip tpl_exports <<< "$entry"
+      local extras=""
+      [[ -n "$extra_env" ]] && extras="${extras}, extra_env=$extra_env"
+      [[ -n "$tpl_exports" ]] && extras="${extras}, exports=$tpl_exports"
+      echo "  $tpl_id  [type=$tpl_type, graph=$graph_id, docker=$needs_docker${extras}]"
+    done
+    echo ""
+    echo "Total: ${#TEMPLATES[@]} templates"
+    stop_mock_api
+    exit 0
+  fi
 
   # If arguments are provided, only test those templates.
   local templates_to_test=()

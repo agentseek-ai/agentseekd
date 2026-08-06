@@ -1,23 +1,5 @@
 // CLI runtime detection: version comparison, dependency checking,
-// agentseek/uv program resolution, and template parsing.
-
-fn display_name(template_id: &str) -> String {
-    template_id
-        .split('/')
-        .next_back()
-        .unwrap_or(template_id)
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+// agentseek/uv program resolution, and CLI process execution.
 
 fn runtime_path() -> std::ffi::OsString {
     let mut paths = Vec::new();
@@ -225,8 +207,9 @@ fn dependency_commands(
     let managed_nvm = PathBuf::from(&managed_root).join("nvm");
     let managed_node_command = match platform {
         "macos" | "debian" | "rhel" | "linux" => format!(
-            "unset npm_config_prefix && export NVM_DIR=\"{}\" PROFILE=/dev/null && curl -o- {} | bash && . \"{}/nvm.sh\" && nvm install {} && node --version && npm --version",
+            "unset npm_config_prefix && export NVM_DIR=\"{}\" PROFILE=/dev/null NVM_SOURCE={}.git && curl -o- {} | bash && . \"{}/nvm.sh\" && nvm install {} && node --version && npm --version",
             managed_nvm.to_string_lossy(),
+            NVM_INSTALL_MIRROR,
             nvm_installer,
             managed_nvm.to_string_lossy(),
             node_major,
@@ -336,18 +319,6 @@ fn uv_program() -> Option<String> {
         return located;
     }
     resolved_program("uv", "--version")
-}
-
-fn uv_tool_bin_dir() -> String {
-    uv_program()
-        .and_then(|uv| {
-            configured_command(&uv)
-                .args(["tool", "dir", "--bin"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-        .unwrap_or_default()
 }
 
 fn agentseek_program() -> String {
@@ -590,88 +561,250 @@ fn current_cli_status(check_latest: bool) -> Result<CliStatus, String> {
     })
 }
 
-fn run_cli(args: &[&str], cwd: Option<&Path>) -> Result<CommandResult, String> {
+/// Execute the CLI with optional stdin input (for interactive cookiecutter prompts).
+/// Keeps stdin handle alive until the process exits to avoid EOF-induced infinite loops.
+fn run_cli_with_input(
+    args: &[&str],
+    cwd: Option<&Path>,
+    answers: Option<&str>,
+) -> Result<CommandResult, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     let (program, prefix) = cli_parts();
     let mut command = configured_command(&program);
     command.args(&prefix).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
     let printable = std::iter::once(program.as_str())
         .chain(prefix.iter().map(String::as_str))
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    let output = command
-        .output()
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("Unable to execute {printable}: {error}"))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+
+    // Write answers to stdin (if provided) and keep the handle alive until
+    // the child exits. Dropping stdin early would send EOF, causing
+    // cookiecutter's `while True` prompt loop to spin forever.
+    let mut stdin_handle = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open stdin for child process".to_string())?;
+    if let Some(answers) = answers {
+        if let Err(error) = stdin_handle.write_all(answers.as_bytes()) {
+            let _ = stdin_handle.flush();
+            // The child cannot receive answers; fail fast instead of hanging.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to write answers to CLI stdin: {error}"));
+        }
+        if let Err(error) = stdin_handle.flush() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to flush CLI stdin: {error}"));
+        }
+    }
+
+    // Spawn threads to read stdout/stderr (prevents pipe buffer deadlock);
+    // results are delivered via channels so we can bound the join wait.
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open stdout for child process".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to open stderr for child process".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout_pipe.read_to_string(&mut s);
+        let _ = stdout_tx.send(s);
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        let _ = stderr_tx.send(s);
+    });
+
+    // Poll with timeout (10 minutes) to prevent infinite hang on EOF deadlock.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // Reap the child to avoid zombies.
+                    return Err(format!("Command timed out after 600 seconds: {printable}"));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Failed to wait for child process: {e}"));
+            }
+        }
+    };
+
+    // Child exited; safe to drop stdin now.
+    drop(stdin_handle);
+
+    // Bound the pipe-drain wait: a grandchild holding the pipe write end could
+    // otherwise keep the reader threads alive forever.
+    let stdout = stdout_rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default();
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    let combined = format!("{}{}", stdout, stderr);
+
     Ok(CommandResult {
-        code: output.status.code().unwrap_or(1),
+        code: status.code().unwrap_or(1),
         output: combined.trim().to_string(),
         command: printable,
     })
 }
 
-fn parse_templates(output: &str) -> Vec<TemplateInfo> {
-    let mut templates = Vec::new();
-    let mut current: Option<usize> = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let is_template = trimmed.contains('/')
-            && !trimmed.contains(' ')
-            && !trimmed.starts_with("http")
-            && trimmed.split('/').count() == 2;
-        if is_template {
-            let framework = trimmed.split('/').next().unwrap_or_default().to_string();
-            templates.push(TemplateInfo {
-                id: trimmed.to_string(),
-                name: display_name(trimmed),
-                description: String::new(),
-                framework,
-            });
-            current = Some(templates.len() - 1);
-        } else if let Some(index) = current {
-            if !trimmed.is_empty()
-                && !trimmed.chars().all(|character| character == '─')
-                && !trimmed.contains("templates)")
-            {
-                templates[index].description = trimmed.to_string();
-                current = None;
-            }
-        }
-    }
-    templates
+// ---------------------------------------------------------------------------
+// CLI status & system info commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn cli_status(check_latest: Option<bool>) -> Result<CliStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || current_cli_status(check_latest.unwrap_or(true)))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
-/// Refresh the cookiecutter template cache from GitHub.
-/// Fetches the latest remote commit and resets the working tree so that
-/// `agentseek create --list-templates` reports up-to-date templates.
-fn refresh_template_cache() {
-    let Some(home) = env::var_os("HOME") else {
-        return;
+#[tauri::command]
+fn system_info(state: State<'_, DesktopState>) -> SystemInfo {
+    let (program, prefix) = cli_parts();
+    let config = state
+        .storage_config
+        .lock()
+        .ok()
+        .map(|config| config.clone())
+        .unwrap_or_default();
+    let effective_mode = state
+        .effective_storage_mode
+        .lock()
+        .map(|mode| mode.clone())
+        .unwrap_or_else(|_| "sqlite_embedded".to_string());
+    let (data_path, storage) = match effective_mode.as_str() {
+        "seekdb_embedded" => (config.path, "Embedded SeekDB".to_string()),
+        "seekdb_server" | "oceanbase_server" => (
+            format!("{}:{} / {}", config.host, config.port, config.database),
+            "SeekDB / OceanBase Server".to_string(),
+        ),
+        _ => (
+            sqlite_database_path(&state.data_dir, &config)
+                .to_string_lossy()
+                .to_string(),
+            "Embedded SQLite".to_string(),
+        ),
     };
-    let cache_dir = Path::new(&home).join(".cookiecutters").join("agentseek");
-    if !cache_dir.is_dir() {
-        return;
+    let docker_status = check_docker();
+    SystemInfo {
+        app_name: "AgentSeek Desktop".to_string(),
+        version: env!("APP_VERSION").to_string(),
+        data_path,
+        cli_strategy: std::iter::once(program)
+            .chain(prefix)
+            .collect::<Vec<_>>()
+            .join(" "),
+        storage: format!("{storage} (desktop state only; isolated from template instances)"),
+        docker_available: docker_status.cli_available,
+        docker_compose_available: docker_status.compose_v2_available,
+        docker_running: docker_status.daemon_running,
     }
-    // git fetch origin — update remote tracking refs
-    let fetch_ok = configured_command("git")
-        .args(["fetch", "origin", "--quiet"])
-        .current_dir(&cache_dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !fetch_ok {
-        return;
+}
+
+#[cfg(test)]
+mod tests_cli {
+    use super::*;
+
+    #[test]
+    fn dependency_versions_are_compared_across_command_formats() {
+        assert!(version_at_least("uv 0.7.11", &[0, 7, 0]));
+        assert!(version_at_least("v20.19.0", &[20, 19, 0]));
+        assert!(version_at_least("git version 2.30.0", &[2, 30, 0]));
+        assert!(!version_at_least("9.9.0", &[10, 0, 0]));
+        assert!(!version_at_least("not installed", &[1, 0, 0]));
     }
-    // git reset --hard FETCH_HEAD — sync working tree to latest remote commit
-    let _ = configured_command("git")
-        .args(["reset", "--hard", "FETCH_HEAD"])
-        .current_dir(&cache_dir)
-        .output();
+    #[test]
+    fn only_secret_environment_keys_are_redacted() {
+        assert!(is_secret_env_key("OPENAI_API_KEY"));
+        assert!(is_secret_env_key("DATABASE_PASSWORD"));
+        assert!(!is_secret_env_key("FRONTEND_PORT"));
+        assert!(!is_secret_env_key("COPILOTKIT_PORT"));
+    }
+    #[test]
+    fn agentseek_version_is_read_from_uv_tool_list() {
+        let output = "agentseek v0.0.4\n- agentseek\n";
+        assert_eq!(
+            parse_uv_tool_version(output, "agentseek").as_deref(),
+            Some("agentseek 0.0.4")
+        );
+    }
+    #[test]
+    fn agentseek_version_is_read_after_banner() {
+        let output = "    _                    _\n   / \\   __ _  ___ _ __\nAGENTSEEK v0.0.4\n";
+        assert_eq!(
+            parse_agentseek_version(output).as_deref(),
+            Some("AGENTSEEK v0.0.4")
+        );
+    }
+    #[test]
+    fn agentseek_latest_version_is_read_from_package_metadata() {
+        assert_eq!(
+            parse_agentseek_package_version(br#"{"info":{"version":"0.0.5"}}"#)
+                .expect("parse package version"),
+            "0.0.5"
+        );
+    }
+    #[test]
+    fn numeric_version_empty_string_returns_empty_vec() {
+        assert!(numeric_version("").is_empty());
+    }
+    #[test]
+    fn numeric_version_non_numeric_returns_empty_vec() {
+        assert!(numeric_version("abc").is_empty());
+        assert!(numeric_version("no version here").is_empty());
+    }
+    #[test]
+    fn numeric_version_pre_release_suffix_stops_at_suffix() {
+        let v = numeric_version("1.2.3-alpha");
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+    #[test]
+    fn version_at_least_empty_version_returns_false() {
+        assert!(!version_at_least("", &[1, 0]));
+    }
+    #[test]
+    fn meets_requirement_empty_version_returns_false() {
+        assert!(!meets_requirement("", "1.0.0"));
+    }
+    #[test]
+    fn meets_requirement_non_numeric_returns_false() {
+        assert!(!meets_requirement("abc", "1.0.0"));
+    }
+    #[test]
+    fn meets_requirement_pre_release_version() {
+        // "1.2.3-alpha" should parse to [1, 2, 3] and meet "1.2.0"
+        assert!(meets_requirement("1.2.3-alpha", "1.2.0"));
+        // But should NOT meet "1.3.0"
+        assert!(!meets_requirement("1.2.3-alpha", "1.3.0"));
+    }
 }

@@ -102,13 +102,16 @@ struct DesktopState {
 }
 
 impl DesktopState {
-    fn load(data_dir: PathBuf) -> Self {
-        let _ = fs::create_dir_all(&data_dir);
+    /// Load and normalize the storage config from disk.
+    /// Returns `(config, config_file_exists, config_ready, storage_setup_required)`.
+    fn load_storage_config(
+        data_dir: &Path,
+        config_path: &Path,
+        startup_errors: &mut Vec<String>,
+    ) -> (StorageConfig, bool, bool, bool) {
         let mut config_ready = true;
-        let mut startup_errors = Vec::new();
-        let config_path = data_dir.join("storage.json");
         let config_file_exists = config_path.is_file();
-        let mut config: StorageConfig = match fs::read_to_string(&config_path) {
+        let mut config: StorageConfig = match fs::read_to_string(config_path) {
             Ok(value) => match serde_json::from_str(&value) {
                 Ok(config) => config,
                 Err(error) => {
@@ -128,7 +131,7 @@ impl DesktopState {
         normalize_storage_database(&mut config);
         // Legacy files have no completion marker and must still show the first-run storage choice.
         let storage_setup_required = !config_file_exists || !config.setup_completed;
-        let default_sqlite_path = data_dir.clone();
+        let default_sqlite_path = data_dir.to_path_buf();
         let default_seekdb_path = data_dir.join("seekdb");
         let legacy_seekdb_path = default_seekdb_path.join("desktop");
         if config.mode == "sqlite_embedded" {
@@ -145,6 +148,97 @@ impl DesktopState {
         {
             config.path = default_seekdb_path.to_string_lossy().to_string();
         }
+        (config, config_file_exists, config_ready, storage_setup_required)
+    }
+
+    /// Open the storage engine based on the resolved config.
+    /// Returns `(engine, effective_storage_mode)`.
+    fn open_storage_engine(
+        data_dir: &Path,
+        config: &StorageConfig,
+        config_file_exists: bool,
+        startup_errors: &mut Vec<String>,
+    ) -> (StorageEngine, String) {
+        let sqlite_path = if config.mode == "sqlite_embedded" {
+            sqlite_database_path(data_dir, config)
+        } else {
+            data_dir.join("agentseek-desktop.sqlite3")
+        };
+        // A truly fresh launch stays database-free until the user confirms a storage backend.
+        let configured_engine = if !config_file_exists {
+            Ok(StorageEngine::Pending)
+        } else if config.mode == "sqlite_embedded" {
+            Ok(StorageEngine::Sqlite(sqlite_path.clone()))
+        } else {
+            let pending = data_dir.join("storage.startup.json");
+            let bridge = fs::write(
+                &pending,
+                serde_json::to_string_pretty(config).unwrap_or_default(),
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|_| SeekDbBridge::open(&pending, data_dir));
+            let _ = fs::remove_file(&pending);
+            bridge.map(StorageEngine::SeekDb)
+        };
+        match configured_engine {
+            Ok(engine) => (engine, config.mode.clone()),
+            Err(error) => {
+                startup_errors.push(format!(
+                    "Configured {} storage unavailable, degraded to embedded SQLite: {error}",
+                    config.mode
+                ));
+                (
+                    StorageEngine::Sqlite(sqlite_path),
+                    "sqlite_embedded".to_string(),
+                )
+            }
+        }
+    }
+
+    /// Migrate legacy `template_url` app config key to the new
+    /// `template.repo_url` / `template.checkout` keys.
+    fn migrate_legacy_template_url(engine: &mut StorageEngine) {
+        let Ok(Some(old_url)) = engine.get_app_config("template_url") else {
+            return;
+        };
+        let old_url = old_url.trim().to_string();
+        if old_url.is_empty() {
+            return;
+        }
+        // Extract repo_url: everything before /tree/ or /releases.
+        let (repo_url, checkout) = if let Some(pos) = old_url.find("/tree/") {
+            let repo = old_url[..pos].to_string();
+            let remainder = &old_url[pos + 6..];
+            let branch = match remainder.find('/') {
+                Some(slash) => remainder[..slash].to_string(),
+                None => remainder.to_string(),
+            };
+            (repo, branch)
+        } else if old_url.ends_with("/releases") || old_url.ends_with("/releases/latest") {
+            let repo = old_url
+                .strip_suffix("/releases")
+                .or_else(|| old_url.strip_suffix("/releases/latest"))
+                .unwrap_or(&old_url)
+                .to_string();
+            (repo, String::new())
+        } else {
+            (old_url, String::new())
+        };
+        let _ = engine.set_app_config("template.repo_url", &repo_url);
+        let _ = engine.set_app_config("template.checkout", &checkout);
+        let _ = engine.set_app_config("template_url", "");
+    }
+
+    fn load(data_dir: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&data_dir);
+        let mut startup_errors = Vec::new();
+        let config_path = data_dir.join("storage.json");
+
+        // 1. Load and normalize storage config.
+        let (mut config, config_file_exists, mut config_ready, storage_setup_required) =
+            Self::load_storage_config(&data_dir, &config_path, &mut startup_errors);
+
+        // 2. Load credentials and sync password with config.
         let credentials_path = data_dir.join("credentials.json");
         let mut credentials_ready = true;
         let mut credentials = match read_local_credentials(&credentials_path) {
@@ -171,41 +265,15 @@ impl DesktopState {
                 startup_errors.push(format!("Failed to save storage config: {error}"));
             }
         }
-        // SeekDB startup failures use the app-level SQLite file, never the SeekDB data directory.
-        let sqlite_path = if config.mode == "sqlite_embedded" {
-            sqlite_database_path(&data_dir, &config)
-        } else {
-            data_dir.join("agentseek-desktop.sqlite3")
-        };
-        // A truly fresh launch stays database-free until the user confirms a storage backend.
-        let configured_engine = if !config_file_exists {
-            Ok(StorageEngine::Pending)
-        } else if config.mode == "sqlite_embedded" {
-            Ok(StorageEngine::Sqlite(sqlite_path.clone()))
-        } else {
-            let pending = data_dir.join("storage.startup.json");
-            let bridge = fs::write(
-                &pending,
-                serde_json::to_string_pretty(&config).unwrap_or_default(),
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|_| SeekDbBridge::open(&pending, &data_dir));
-            let _ = fs::remove_file(&pending);
-            bridge.map(StorageEngine::SeekDb)
-        };
-        let (mut engine, effective_storage_mode) = match configured_engine {
-            Ok(engine) => (engine, config.mode.clone()),
-            Err(error) => {
-                startup_errors.push(format!(
-                    "Configured {} storage unavailable, degraded to embedded SQLite: {error}",
-                    config.mode
-                ));
-                (
-                    StorageEngine::Sqlite(sqlite_path.clone()),
-                    "sqlite_embedded".to_string(),
-                )
-            }
-        };
+
+        // 3. Open storage engine.
+        let (mut engine, effective_storage_mode) =
+            Self::open_storage_engine(&data_dir, &config, config_file_exists, &mut startup_errors);
+
+        // 4. Migrate legacy template_url from DB to new TemplateConfig keys.
+        Self::migrate_legacy_template_url(&mut engine);
+
+        // 5. Load data from engine or legacy state.json.
         let legacy_path = data_dir.join("state.json");
         let legacy_exists = legacy_path.is_file();
         let legacy_data = fs::read_to_string(&legacy_path)
@@ -227,6 +295,8 @@ impl DesktopState {
             && database_ready
             && config_ready
             && (!credentials_required || credentials_ready);
+
+        // 6. Repair instance statuses and legacy data.
         let repaired_statuses = if migrating_legacy {
             repair_predeployment_restart_statuses(&mut data)
         } else {
@@ -251,6 +321,8 @@ impl DesktopState {
             });
             prune_logs(&mut data, config.runtime_log_retention_days, timestamp());
         }
+
+        // 7. Persist migrated data and clean up logs.
         if storage_ready {
             let persist_result = (|| -> Result<(), String> {
                 if migrating_legacy {

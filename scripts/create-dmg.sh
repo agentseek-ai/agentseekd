@@ -13,7 +13,19 @@ rm -f "$RW" "$OUTPUT" 2>/dev/null || true
 hdiutil detach "/Volumes/$VOLNAME" -force 2>/dev/null || true
 
 hdiutil create -ov -volname "$VOLNAME" -fs HFS+ -size 200m "$RW" >/dev/null 2>&1
-hdiutil attach "$RW" -nobrowse >/dev/null 2>&1
+
+# Attach can transiently fail on shared CI runners; retry a few times.
+for _ in 1 2 3; do
+    if hdiutil attach "$RW" -nobrowse >/dev/null 2>&1; then
+        break
+    fi
+    hdiutil detach "/Volumes/$VOLNAME" -force 2>/dev/null || true
+    sleep 3
+done
+hdiutil info 2>/dev/null | grep -q "/Volumes/$VOLNAME" || {
+    echo "Failed to attach $RW after 3 attempts" >&2
+    exit 1
+}
 
 # Use ditto to preserve extended attributes / resource forks
 ditto "$APP" "/Volumes/$VOLNAME/$(basename "$APP")"
@@ -40,7 +52,7 @@ tell application "Finder"
         set arrangement of viewOptions to not arranged
         set icon size of viewOptions to 128
         set background picture of viewOptions to file ".background:dmg-background.png"
-        set position of item "AgentSeek" of container window to {180, 190}
+        set position of item "$VOLNAME" of container window to {180, 190}
         set position of item "Applications" of container window to {480, 190}
         close
         open

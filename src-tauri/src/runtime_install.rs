@@ -160,21 +160,23 @@ fn posix_runtime_install_script(
             format!("export NVM_DIR={}", shell_quote(&nvm_dir.to_string_lossy())),
             "export PROFILE=/dev/null".to_string(),
             "mkdir -p \"$NVM_DIR\"".to_string(),
+            // Force nvm install script to use Gitee mirror directly, avoiding
+            // unreliable GitHub proxies that may be unreachable.
+            format!("export NVM_SOURCE={}.git", shell_quote(NVM_INSTALL_MIRROR)),
             {
                 let nvm_gitee = format!(
-                    "https://gitee.com/mirrors/nvm/raw/v{}/install.sh",
+                    "{}/raw/v{}/install.sh",
+                    NVM_INSTALL_MIRROR,
                     &requirements.versions.nvm.managed
                 );
-                let nvm_proxy = format!("https://ghproxy.net/{}", nvm_installer);
                 format!(
-                    "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {primary} nvm || run_shell_installer {gitee} nvm || run_shell_installer {proxy} nvm; fi",
+                    "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {primary} nvm || run_shell_installer {gitee} nvm; fi",
                     primary = shell_quote(&nvm_installer),
                     gitee = shell_quote(&nvm_gitee),
-                    proxy = shell_quote(&nvm_proxy),
                 )
             },
             ". \"$NVM_DIR/nvm.sh\"".to_string(),
-            "if curl -fsI --connect-timeout 2 --max-time 3 \"https://cdn.npmmirror.com/binaries/node/v24.18.0/SHASUMS256.txt\" > /dev/null 2>&1; then export NVM_NODEJS_ORG_MIRROR=https://cdn.npmmirror.com/binaries/node; fi".to_string(),
+            format!("if curl -fsI --connect-timeout 2 --max-time 3 \"{mirror}/v24.18.0/SHASUMS256.txt\" > /dev/null 2>&1; then export NVM_NODEJS_ORG_MIRROR={mirror}; fi", mirror = NVM_NODEJS_MIRROR),
             format!("nvm install {node_major}"),
             "node --version".to_string(),
             "npm --version".to_string(),
@@ -464,4 +466,272 @@ fn runtime_install_task_dir(state: &DesktopState, task_id: &str) -> Result<PathB
         return Err("Invalid install task ID".to_string());
     }
     Ok(state.data_dir.join("runtime-install").join(task_id))
+}
+
+// ---------------------------------------------------------------------------
+// Runtime install commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn runtime_install_progress(
+    task_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<RuntimeInstallProgress, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let task_dir = runtime_install_task_dir(&state, &task_id)?;
+        let status = fs::read_to_string(task_dir.join("status.json"))
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content.trim()).ok())
+            .unwrap_or_else(|| serde_json::json!({"status": "pending", "stage": "pending"}));
+        Ok(RuntimeInstallProgress {
+            status: status
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending")
+                .to_string(),
+            stage: status
+                .get("stage")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending")
+                .to_string(),
+            log: install_log_tail(&task_dir.join("install.log")),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn runtime_install_plan(
+    force_agentseek_upgrade: Option<bool>,
+    state: State<'_, DesktopState>,
+) -> Result<RuntimeInstallPlan, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_runtime_install_plan(&state, force_agentseek_upgrade.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn execute_runtime_install(
+    task_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let task_dir = runtime_install_task_dir(&state, &task_id)?;
+        let script_path = task_dir.join(if cfg!(windows) {
+            "install.ps1"
+        } else {
+            "install.command"
+        });
+        if !script_path.is_file() {
+            return Err("Install script does not exist, please regenerate install plan".to_string());
+        }
+        state.log(
+            None,
+            "AgentSeek Desktop",
+            "install",
+            "info",
+            format!(
+                "Opened system terminal to execute runtime environment install script\n{}",
+                script_path.display()
+            ),
+            Some(script_path.to_string_lossy().to_string()),
+        );
+        launch_runtime_install_terminal(&script_path)?;
+        let status_path = task_dir.join("status.json");
+        for _ in 0..3_600 {
+            std::thread::sleep(Duration::from_millis(500));
+            let Ok(content) = fs::read_to_string(&status_path) else {
+                continue;
+            };
+            let Ok(status): Result<serde_json::Value, _> = serde_json::from_str(content.trim())
+            else {
+                continue;
+            };
+            match status.get("status").and_then(serde_json::Value::as_str) {
+                Some("success") => {
+                    let checked = current_cli_status(false)?;
+                    if !checked.prerequisites_ready {
+                        return Err(
+                            "Install script completed, but some dependencies still do not meet version requirements; please re-check".to_string()
+                        );
+                    }
+                    if let Ok(target) =
+                        fs::read_to_string(task_dir.join("agentseek-upgrade-target"))
+                    {
+                        if !meets_requirement(&checked.cli_version, target.trim()) {
+                            return Err(format!(
+                                "AgentSeek CLI upgrade did not reach target version {}; currently detected {}",
+                                target.trim(),
+                                checked.cli_version
+                            ));
+                        }
+                    }
+                    state.log(
+                        None,
+                        "AgentSeek Desktop",
+                        "install",
+                        "success",
+                        "Terminal install script completed; runtime environment check passed",
+                        Some(script_path.to_string_lossy().to_string()),
+                    );
+                    return Ok(format!(
+                        "Runtime environment installation completed\nLog: {}",
+                        task_dir.join("install.log").display()
+                    ));
+                }
+                Some("failed") => {
+                    let tail = install_log_tail(&task_dir.join("install.log"));
+                    state.log(
+                        None,
+                        "AgentSeek Desktop",
+                        "install",
+                        "error",
+                        format!("Terminal install script execution failed\n{tail}"),
+                        Some(script_path.to_string_lossy().to_string()),
+                    );
+                    return Err(if tail.is_empty() {
+                        "Terminal install script execution failed; please check terminal output".to_string()
+                    } else {
+                        tail
+                    });
+                }
+                _ => {}
+            }
+        }
+        Err("Timed out waiting for terminal install result; please check terminal output and re-check".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod tests_runtime_install {
+    use super::*;
+
+    #[test]
+    fn bundled_runtime_requirements_are_valid() {
+        let requirements: RuntimeRequirements =
+            serde_json::from_str(DEFAULT_RUNTIME_REQUIREMENTS).expect("parse requirements");
+        validate_runtime_requirements(&requirements).expect("validate requirements");
+    }
+    #[test]
+    fn agentseek_updates_do_not_change_minimum_version_compatibility() {
+        assert!(version_at_least("AGENTSEEK v0.0.4", &[0, 0, 4]));
+        assert!(agentseek_update_available(
+            "AGENTSEEK v0.0.4",
+            Some("0.0.5"),
+            true
+        ));
+        assert!(!agentseek_update_available(
+            "AGENTSEEK v0.0.5",
+            Some("0.0.5"),
+            true
+        ));
+        assert!(!agentseek_update_available(
+            "AGENTSEEK v0.0.6",
+            Some("0.0.5"),
+            true
+        ));
+        assert!(!agentseek_update_available("AGENTSEEK v0.0.4", None, true));
+        assert!(!agentseek_update_available(
+            "AGENTSEEK v0.0.4",
+            Some("0.0.5"),
+            false
+        ));
+    }
+    #[test]
+    fn available_agentseek_update_is_included_in_the_install_plan() {
+        let status = CliStatus {
+            uv_compatible: true,
+            node_compatible: true,
+            npm_compatible: true,
+            cli_compatible: true,
+            cli_update_available: true,
+            ..CliStatus::default()
+        };
+
+        assert_eq!(required_runtime_dependencies(&status), ["agentseek"]);
+    }
+    #[test]
+    fn runtime_install_scripts_use_platform_installers_without_mutating_system_uv() {
+        let requirements: RuntimeRequirements =
+            serde_json::from_str(DEFAULT_RUNTIME_REQUIREMENTS).expect("parse requirements");
+        let status = CliStatus {
+            uv_available: true,
+            uv_path: "/usr/local/bin/uv".to_string(),
+            node_compatible: true,
+            npm_compatible: true,
+            cli_compatible: true,
+            ..CliStatus::default()
+        };
+        let task_dir = Path::new("/tmp/agentseek-install-task");
+        let runtime_root = Path::new("/tmp/agentseek-runtime");
+
+        let posix = posix_runtime_install_script(&requirements, &status, task_dir, runtime_root);
+        assert!(posix.contains("https://astral.sh/uv/install.sh"));
+        assert!(posix.contains("$HOME/.local/bin/uv"));
+        assert!(posix.contains("--output \"$installer_file.tmp\""));
+        assert!(posix.contains("bash -n \"$installer_file.tmp\""));
+        assert!(!posix.contains("| sh"));
+        assert!(!posix.contains("uv self update"));
+        assert!(!posix.contains("export METHOD=script"));
+        assert!(!posix.contains(
+            "Installation completed. AgentSeek Desktop will recheck automatically. Press Enter"
+        ));
+        assert!(!posix
+            .chars()
+            .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)));
+        #[cfg(unix)]
+        {
+            let script_path =
+                env::temp_dir().join(format!("agentseek-install-{}.command", unique_stamp()));
+            fs::write(&script_path, &posix).expect("write generated POSIX installer");
+            let output = std::process::Command::new("bash")
+                .arg("-n")
+                .arg(&script_path)
+                .output()
+                .expect("validate generated POSIX installer");
+            fs::remove_file(script_path).expect("remove generated POSIX installer");
+            assert!(
+                output.status.success(),
+                "generated installer is invalid: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let windows =
+            windows_runtime_install_script(&requirements, &status, task_dir, runtime_root);
+        assert!(windows.contains("https://astral.sh/uv/install.ps1"));
+        assert!(windows.contains("Invoke-DownloadWithRetry"));
+        assert!(!windows.contains("https://astral.sh/uv/install.sh"));
+        assert!(!windows.contains("Read-Host"));
+        assert!(!windows.contains("-NoExit"));
+        assert!(!windows
+            .chars()
+            .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)));
+    }
+    #[test]
+    fn managed_node_install_uses_private_nvm_and_bundled_npm() {
+        let requirements: RuntimeRequirements =
+            serde_json::from_str(DEFAULT_RUNTIME_REQUIREMENTS).expect("parse requirements");
+        let commands = dependency_commands(
+            &requirements,
+            "macos",
+            Some(Path::new("/tmp/agentseek-runtime")),
+            true,
+            false,
+        );
+        let command = commands.get("node").expect("node install command");
+
+        assert!(command.contains("NVM_DIR=\"/tmp/agentseek-runtime/nvm\""));
+        assert!(command.contains("nvm install 24"));
+        assert!(command.contains("node --version && npm --version"));
+        assert!(!command.contains("install -g npm"));
+    }
 }

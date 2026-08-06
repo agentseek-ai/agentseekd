@@ -57,17 +57,20 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Cache agentseek templates
+      - name: Resolve template repo HEAD
+        # Content-aware cache key: cache hits only when the remote template
+        # repository is unchanged; a new commit automatically refreshes it.
+        id: templates
+        run: echo "sha=$(git ls-remote https://github.com/agentseek-ai/agentseek-templates.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache agentseek explicit template catalog
+        # Cached by the agentseek CLI itself (~/.cookiecutters/.as); the e2e
+        # script resolves templates through --template-repo/--checkout, so no
+        # repository clone is needed.
         uses: actions/cache@v5
         with:
-          path: ~/.cookiecutters/agentseek
-          key: agentseek-templates-${{ hashFiles('src-tauri/Cargo.lock') }}
-
-      - name: Fetch agentseek templates
-        run: |
-          if [ ! -d ~/.cookiecutters/agentseek/templates ]; then
-            git clone --depth 1 https://github.com/ob-labs/agentseek.git ~/.cookiecutters/agentseek
-          fi
+          path: ~/.cookiecutters/.as
+          key: agentseek-catalog-${{ steps.templates.outputs.sha }}
 
       - name: Run frontend tests
         run: npm run test
@@ -114,6 +117,17 @@ jobs:
 
       - name: Install agentseek CLI
         run: pipx install agentseek --python python3.12
+
+      - name: Resolve template repo HEAD
+        # Content-aware cache key for the CLI's explicit catalog cache.
+        id: templates
+        run: echo "sha=$(git ls-remote https://github.com/agentseek-ai/agentseek-templates.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache agentseek explicit template catalog
+        uses: actions/cache@v5
+        with:
+          path: ~/.cookiecutters/.as
+          key: agentseek-catalog-${{ steps.templates.outputs.sha }}
 
       - name: Install uv (Python package manager)
         uses: astral-sh/setup-uv@v8.3.2

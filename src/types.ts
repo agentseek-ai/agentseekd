@@ -1,4 +1,4 @@
-export type Page = "instances" | "templates" | "config" | "logs";
+export type Page = "instances" | "templates" | "config" | "logs" | "traces";
 export type DeploymentMode = "local" | "docker";
 export type LogCategory = "install" | "config" | "execution" | "runtime";
 
@@ -7,6 +7,12 @@ export interface TemplateInfo {
   name: string;
   description: string;
   framework: string;
+}
+
+export interface TemplateConfig {
+  repoUrl: string;
+  checkout: string;
+  catalogUrl: string;
 }
 
 export interface InstanceRecord {
@@ -151,6 +157,12 @@ export interface CliStatus {
   installCommand: string;
 }
 
+export interface TemplateUpdateCheck {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+}
+
 export interface RuntimeInstallPlan {
   taskId: string;
   script: string;
@@ -166,3 +178,48 @@ export interface RuntimeInstallProgress {
 }
 
 export type DeploymentStage = "create" | "tasks" | "doctor" | "dry-run" | "starting" | "complete" | "failed" | string;
+
+// ---------------------------------------------------------------------------
+// ATOF Trace types
+// ---------------------------------------------------------------------------
+
+export interface TraceSummary {
+  traceId: string;
+  status: string;
+  kind: string;
+  name: string;
+  inputSummary?: string | null;
+  outputSummary?: string | null;
+  startTime?: string | null;
+  latencyMs?: number | null;
+  spanCount: number;
+}
+
+export interface TraceDetail {
+  traceId: string;
+  status: string;
+  latencyMs?: number | null;
+  startTime?: string | null;
+  spans: SpanNode[];
+}
+
+export interface SpanNode {
+  spanId: string;
+  name: string;
+  kind: string;
+  status: string;
+  startTime?: string | null;
+  endTime?: string | null;
+  durationMs?: number | null;
+  input?: unknown;
+  output?: unknown;
+  attributes?: unknown;
+  children: SpanNode[];
+}
+
+export interface TracePage {
+  entries: TraceSummary[];
+  total: number;
+  page: number;
+  pageSize: number;
+}

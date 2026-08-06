@@ -1,4 +1,5 @@
 name: Build
+run-name: Build ${{ github.ref_name }}
 
 # Expensive desktop bundle builds only run on release-track events:
 #   - tag push v*       (actual release)
@@ -156,7 +157,7 @@ jobs:
             x86_64-apple-darwin)  ARCH=x64 ;;
             *)                    ARCH=universal ;;
           esac
-          OUTPUT="$DMG_DIR/${APP_NAME}_${VERSION}_${ARCH}.dmg"
+          OUTPUT="$DMG_DIR/${APP_NAME// /_}_${VERSION}_${ARCH}.dmg"
           BG="src-tauri/resources/dmg-background.png"
 
           bash scripts/create-dmg.sh "$APP" "$OUTPUT" "$BG"
@@ -216,6 +217,20 @@ jobs:
               ;;
           esac
 
+          # Normalize bundle names to the AgentSeek_Desktop_* convention on
+          # every platform: productName spaces appear as spaces in some Tauri
+          # bundles and as dots ("AgentSeek.Desktop_...") in Linux/Windows
+          # ones. Replace only the product-name prefix, never version dots.
+          for f in "$ARTIFACT_DIR"/*; do
+            [ -e "$f" ] || continue
+            b="$(basename "$f")"
+            b="${b// /_}"
+            b="${b/AgentSeek.Desktop_/AgentSeek_Desktop_}"
+            if [ "$b" != "$(basename "$f")" ]; then
+              mv "$f" "$(dirname "$f")/$b" 2>/dev/null || true
+            fi
+          done
+
           if [ -z "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -print -quit)" ]; then
             echo "No bundle files were collected for $RUNNER_OS" >&2
             for root in "${BUNDLE_ROOTS[@]}"; do
@@ -234,191 +249,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agentseek-${{ matrix.label }}
           path: ci-artifacts/${{ matrix.label }}
           if-no-files-found: error
           retention-days: 14
 
-  # ─── Publish GitHub Release (tag push only) ─────────────────────────
-  publish-release:
-    name: Publish Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Verify tag matches package version
-        run: |
-          set -euo pipefail
-          TAG="${{ github.ref_name }}"
-          EXPECTED_VERSION="${TAG#v}"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          if [ "$EXPECTED_VERSION" != "$PACKAGE_VERSION" ]; then
-            echo "Release tag $TAG does not match package.json version $PACKAGE_VERSION" >&2
-            exit 1
-          fi
-          echo "✓ Tag $TAG matches package.json version $PACKAGE_VERSION"
-
-      - name: Resolve release notes base tag
-        id: release_notes_base
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          previous_ancestor_tag=""
-          if git rev-parse --verify "${TAG}^{tag}" >/dev/null 2>&1 || git rev-parse --verify "${TAG}^{commit}" >/dev/null 2>&1; then
-            previous_ancestor_tag="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
-          fi
-
-          previous_tag="$previous_ancestor_tag"
-          # Stable releases compare against the previous stable tag (skip
-          # rc/beta/alpha); prereleases compare against the ancestor tag.
-          if printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            previous_stable_tag=""
-            while IFS= read -r candidate; do
-              if [ "$candidate" = "$TAG" ]; then
-                break
-              fi
-              previous_stable_tag="$candidate"
-            done < <(git tag -l 'v*' --sort=v:refname 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
-
-            first_release_tag="$(git tag -l 'v*' --sort=v:refname 2>/dev/null | head -n 1 || true)"
-            previous_tag="${previous_stable_tag:-$first_release_tag}"
-          fi
-
-          if [ "$previous_tag" = "$TAG" ]; then
-            previous_tag=""
-          fi
-
-          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-bundles
-
-      - name: Collect release assets
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          find release-bundles -type f \
-            \( -name '*.AppImage' -o -name '*.deb' \
-               -o -name '*.dmg' -o -name '*.app.tar.gz' \
-               -o -name '*.msi' -o -name '*.exe' \) \
-            -exec cp '{}' release-assets/ \;
-
-          if [ -z "$(find release-assets -maxdepth 1 -type f -print -quit)" ]; then
-            echo "No desktop bundle files were found to publish" >&2
-            find release-bundles -maxdepth 4 -type f | sort
-            exit 1
-          fi
-
-          (cd release-assets && sha256sum * > SHA256SUMS.txt)
-
-      - name: Create release preface
-        env:
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          BASE="https://github.com/${GH_REPO}/releases/download/${TAG}"
-          checksums_url="${BASE}/SHA256SUMS.txt"
-
-          # Group actual asset files by platform to build download links
-          # that always match the real published filenames.
-          linux=""; macos_intel=""; macos_arm=""; windows=""
-          for f in release-assets/*; do
-            b=$(basename "$f")
-            case "$b" in
-              *.AppImage)          linux="${linux} · [AppImage](${BASE}/${b})" ;;
-              *.deb)               linux="${linux} · [deb](${BASE}/${b})" ;;
-              *aarch64*.dmg)       macos_arm="[dmg](${BASE}/${b})" ;;
-              *_x64.dmg|*x64*.dmg) macos_intel="[dmg](${BASE}/${b})" ;;
-              *.dmg)               macos_arm="${macos_arm:-[dmg](${BASE}/${b})}" ;;
-              *.msi)               windows="${windows} · [msi](${BASE}/${b})" ;;
-              *.exe)               windows="${windows} · [exe](${BASE}/${b})" ;;
-              *.sig|SHA256SUMS.txt) ;;
-            esac
-          done
-          linux="${linux# · }"; linux="${linux:-—}"
-          windows="${windows# · }"; windows="${windows:-—}"
-          macos_intel="${macos_intel:-—}"
-          macos_arm="${macos_arm:-—}"
-
-          {
-            printf '## Install\n\n'
-            printf '### Desktop App\n\n'
-            printf 'Direct downloads for this release. Checksums: [`SHA256SUMS.txt`](%s)\n\n' "$checksums_url"
-            printf '| Platform | Downloads |\n'
-            printf '|---|---|\n'
-            printf '| Linux x64 | %s |\n' "$linux"
-            printf '| macOS Intel | %s |\n' "$macos_intel"
-            printf '| macOS Apple Silicon | %s |\n' "$macos_arm"
-            printf '| Windows x64 | %s |\n\n' "$windows"
-          } > RELEASE_PREFACE.md
-
-      - name: Generate release notes
-        run: |
-          set -euo pipefail
-          chmod +x scripts/generate-release-notes.sh
-          {
-            cat RELEASE_PREFACE.md
-            echo ""
-            bash scripts/generate-release-notes.sh "${{ github.ref_name }}" "${{ steps.release_notes_base.outputs.previous_tag }}"
-          } > RELEASE_BODY.md
-          echo "Generated release body ($(wc -l < RELEASE_BODY.md) lines)"
-
-      - name: Resolve release options
-        id: release_options
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          prerelease="false"
-          # 0.0.x and -rc/-beta/-alpha suffixes are prerelease
-          if printf '%s' "$TAG" | grep -Eq '^v0\.0\.|-(rc|beta|alpha)'; then
-            prerelease="true"
-          fi
-          make_latest="true"
-          if [ "$prerelease" = "true" ]; then
-            make_latest="false"
-          fi
-          echo "prerelease=$prerelease" >> $GITHUB_OUTPUT
-          echo "make_latest=$make_latest" >> $GITHUB_OUTPUT
-
-      - name: Create or update GitHub release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ github.ref_name }}
-          name: AgentSeek Desktop ${{ github.ref_name }}
-          bodyFile: RELEASE_BODY.md
-          artifacts: release-assets/*
-          artifactErrorsFailBuild: true
-          allowUpdates: true
-          replacesArtifacts: true
-          draft: false
-          prerelease: ${{ steps.release_options.outputs.prerelease }}
-          makeLatest: ${{ steps.release_options.outputs.make_latest }}
-
-      - name: Add workflow summary
-        env:
-          REPOSITORY: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          {
-            echo "## Desktop Downloads"
-            echo
-            echo "GitHub Release: https://github.com/$REPOSITORY/releases/tag/$TAG"
-            echo
-            echo "Artifacts in this release:"
-            while IFS= read -r file; do
-              echo "- $(basename "$file")"
-            done < <(find release-assets -maxdepth 1 -type f | sort)
-          } >> "$GITHUB_STEP_SUMMARY"
