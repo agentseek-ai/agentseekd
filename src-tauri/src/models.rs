@@ -324,8 +324,6 @@ pub(crate) fn default_runtime_log_retention_days() -> u32 {
 pub(crate) const NPM_REGISTRY_MIRROR: &str = "https://registry.npmmirror.com";
 /// Node.js binary mirror (for NVM).
 pub(crate) const NVM_NODEJS_MIRROR: &str = "https://cdn.npmmirror.com/binaries/node";
-/// NVM install script mirror (Gitee).
-pub(crate) const NVM_INSTALL_MIRROR: &str = "https://gitee.com/mirrors/nvm";
 /// apt (Debian) mirror.
 pub(crate) const APT_MIRROR: &str = "mirrors.aliyun.com";
 /// PyPI mirror mirror.

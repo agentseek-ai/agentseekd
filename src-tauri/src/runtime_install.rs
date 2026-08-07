@@ -160,21 +160,14 @@ fn posix_runtime_install_script(
             format!("export NVM_DIR={}", shell_quote(&nvm_dir.to_string_lossy())),
             "export PROFILE=/dev/null".to_string(),
             "mkdir -p \"$NVM_DIR\"".to_string(),
-            // Force nvm install script to use Gitee mirror directly, avoiding
-            // unreliable GitHub proxies that may be unreachable.
-            format!("export NVM_SOURCE={}.git", shell_quote(NVM_INSTALL_MIRROR)),
-            {
-                let nvm_gitee = format!(
-                    "{}/raw/v{}/install.sh",
-                    NVM_INSTALL_MIRROR,
-                    &requirements.versions.nvm.managed
-                );
-                format!(
-                    "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {primary} nvm || run_shell_installer {gitee} nvm; fi",
-                    primary = shell_quote(&nvm_installer),
-                    gitee = shell_quote(&nvm_gitee),
-                )
-            },
+            // Use nvm's script installer so it never clones a repository or
+            // prompts the user for Git credentials in a desktop install.
+            "export NVM_METHOD=script".to_string(),
+            "export GIT_TERMINAL_PROMPT=0".to_string(),
+            format!(
+                "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {installer} nvm; fi",
+                installer = shell_quote(&nvm_installer),
+            ),
             ". \"$NVM_DIR/nvm.sh\"".to_string(),
             format!("if curl -fsI --connect-timeout 2 --max-time 3 \"{mirror}/v24.18.0/SHASUMS256.txt\" > /dev/null 2>&1; then export NVM_NODEJS_ORG_MIRROR={mirror}; fi", mirror = NVM_NODEJS_MIRROR),
             format!("nvm install {node_major}"),
@@ -704,6 +697,21 @@ mod tests_runtime_install {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+
+        let node_status = CliStatus {
+            uv_available: true,
+            uv_path: "/usr/local/bin/uv".to_string(),
+            node_compatible: false,
+            npm_compatible: false,
+            cli_compatible: true,
+            ..CliStatus::default()
+        };
+        let node_posix =
+            posix_runtime_install_script(&requirements, &node_status, task_dir, runtime_root);
+        assert!(node_posix.contains("export NVM_METHOD=script"));
+        assert!(node_posix.contains("export GIT_TERMINAL_PROMPT=0"));
+        assert!(!node_posix.contains("gitee.com"));
+        assert!(!node_posix.contains("NVM_SOURCE"));
 
         let windows =
             windows_runtime_install_script(&requirements, &status, task_dir, runtime_root);
