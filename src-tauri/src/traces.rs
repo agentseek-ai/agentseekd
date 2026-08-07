@@ -49,6 +49,32 @@ fn summary(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Normalize span kinds to the labels Phoenix exposes in its tables.
+/// Relay payloads can use lowercase values or the OpenInference enum prefix.
+fn normalize_span_kind(value: &str) -> String {
+    let normalized = value.trim().to_ascii_uppercase();
+    let normalized = normalized
+        .strip_prefix("SPANKIND.")
+        .or_else(|| normalized.strip_prefix("SPAN_KIND."))
+        .unwrap_or(&normalized);
+    if normalized.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+/// Phoenix reports Relay's root `model` scope as an AGENT span. Keep that
+/// root-level convention while preserving LLM kinds for nested model calls.
+fn phoenix_root_kind(name: &str, kind: &str) -> String {
+    let name = name.trim().to_ascii_lowercase();
+    if name == "model" && matches!(kind, "LLM" | "MODEL") {
+        "AGENT".to_string()
+    } else {
+        kind.to_string()
+    }
+}
+
 /// Parse ISO-8601 timestamp (e.g. "2026-08-04T06:30:58.123Z") or a numeric
 /// unix timestamp (seconds or millis) into millis since epoch.
 ///
@@ -76,30 +102,43 @@ fn parse_iso_millis(s: &str) -> Option<u64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    // Strip timezone suffix (Z / +HH:MM / -HH:MM) and fractional seconds.
-    let time = time_part
+    // Separate the clock, fractional seconds, and timezone offset.
+    let raw_time = time_part
         .trim_end_matches('Z')
-        .trim_end_matches('z')
-        .split('+')
-        .next()
-        .unwrap_or("")
-        .split('-')
-        .next()
-        .unwrap_or("");
+        .trim_end_matches('z');
+    let offset_index = raw_time[1..]
+        .find('+')
+        .or_else(|| raw_time[1..].find('-'))
+        .map(|index| index + 1);
+    let (time, timezone_offset_seconds) = if let Some(index) = offset_index {
+        let offset = &raw_time[index..];
+        let sign = if offset.starts_with('-') { -1i64 } else { 1i64 };
+        let mut parts = offset[1..].split(':');
+        let hours = parts.next()?.parse::<i64>().ok()?;
+        let minutes = parts.next().unwrap_or("0").parse::<i64>().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        (&raw_time[..index], sign * (hours * 3_600 + minutes * 60))
+    } else {
+        (raw_time, 0)
+    };
     let mut hms = time.split(':');
     let hour = hms.next()?.parse::<u32>().ok()?;
     let minute = hms.next().unwrap_or("0").parse::<u32>().ok()?;
-    let second = hms
-        .next()
-        .unwrap_or("0")
-        .split('.')
-        .next()
-        .unwrap_or("0")
-        .parse::<u32>()
-        .ok()?;
+    let second_part = hms.next().unwrap_or("0");
+    let (second_value, fraction) = second_part.split_once('.').unwrap_or((second_part, ""));
+    let second = second_value.parse::<u32>().ok()?;
     if hour > 23 || minute > 59 || second > 60 {
         return None;
     }
+    let fraction_digits: String = fraction.chars().take(3).collect();
+    let fraction_ms = if fraction_digits.is_empty() {
+        0i64
+    } else {
+        let value = fraction_digits.parse::<i64>().ok()?;
+        value * 10i64.pow(3 - fraction_digits.len() as u32)
+    };
     // Days-from-civil algorithm (Howard Hinnant) for proleptic Gregorian dates.
     let days_from_civil = |y: i64, m: i64, d: i64| -> i64 {
         let y = if m <= 2 { y - 1 } else { y };
@@ -111,14 +150,15 @@ fn parse_iso_millis(s: &str) -> Option<u64> {
         era * 146_097 + doe - 719_468
     };
     let days = days_from_civil(year as i64, month as i64, day as i64);
-    Some(
-        (days as u64)
-            .saturating_mul(86_400)
-            .saturating_add(u64::from(hour) * 3_600)
-            .saturating_add(u64::from(minute) * 60)
-            .saturating_add(u64::from(second))
-            .saturating_mul(1_000),
-    )
+    let millis = days
+        .saturating_mul(86_400)
+        .saturating_add(i64::from(hour) * 3_600)
+        .saturating_add(i64::from(minute) * 60)
+        .saturating_add(i64::from(second))
+        .saturating_mul(1_000)
+        .saturating_add(fraction_ms)
+        .saturating_sub(timezone_offset_seconds.saturating_mul(1_000));
+    u64::try_from(millis).ok()
 }
 
 fn duration_ms(start: Option<&str>, end: Option<&str>) -> Option<u64> {
@@ -154,7 +194,14 @@ fn parse_raw_span(event: &serde_json::Value) -> Option<RawSpan> {
     let trace_id = json_str(event, &["trace_id", "traceId", "context.trace_id"])?;
     let span_id = json_str(event, &["span_id", "spanId", "context.span_id"])?;
     let name = json_str(event, &["name", "span_name", "spanName"])?;
+    let attributes = event.get("attributes");
     let kind = json_str(event, &["kind", "span_kind", "spanKind"])
+        .or_else(|| {
+            attributes.and_then(|attrs| {
+                json_str(attrs, &["openinference.span.kind", "span.kind", "spanKind", "kind"])
+            })
+        })
+        .map(|value| normalize_span_kind(&value))
         .unwrap_or_else(|| "UNKNOWN".to_string());
     // Status: look for status.code or status.message
     let status = event
@@ -186,7 +233,7 @@ fn parse_raw_span(event: &serde_json::Value) -> Option<RawSpan> {
     let end_time = json_str(event, &["end_time", "endTime"]);
 
     // Attributes often contain input/output inside an "attributes" object
-    let attrs = event.get("attributes");
+    let attrs = attributes;
     let input = attrs
         .and_then(|a| a.get("input"))
         .or_else(|| event.get("input"))
@@ -252,40 +299,12 @@ fn parse_atof_event(event: &serde_json::Value) -> Option<AtofEvent> {
     })
 }
 
-/// Derive a trace id from a root ATOF event (session_id or chat_id in context).
-fn atof_trace_id(event: &AtofEvent, fallback: &str) -> String {
-    let data = event.data.as_ref();
-    if let Some(sid) = data
-        .and_then(|d| d.get("session_id"))
-        .and_then(|v| v.as_str())
-    {
-        if !sid.is_empty() {
-            return sid.to_string();
-        }
-    }
-    if let Some(ctx) = data
-        .and_then(|d| d.get("context"))
-        .and_then(|v| v.as_str())
-    {
-        // Context like "channel=$ag-ui|chat_id=..."
-        for part in ctx.split('|') {
-            if let Some(value) = part.strip_prefix("chat_id=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return value.to_string();
-                }
-            }
-        }
-    }
-    fallback.to_string()
-}
-
 /// Parse a standard ATOF event stream into flat span records.
 ///
 /// Each scope is represented by a start/end event pair sharing a `uuid`;
-/// scopes link via `parent_uuid`. Traces are rooted at events whose parent
-/// is missing from the file; the root's session_id / chat_id becomes the
-/// trace id and is inherited down the parent chain.
+/// scopes link via `parent_uuid`. Each root scope is a separate trace, and
+/// its UUID is inherited by descendants. This matches Phoenix's root-span
+/// view instead of merging multiple root scopes from one session/chat.
 fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
     struct Paired {
         start: Option<AtofEvent>,
@@ -293,7 +312,8 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
     }
 
     let mut by_uuid: HashMap<String, Paired> = HashMap::new();
-    for line in content.lines() {
+    let mut uuid_order: HashMap<String, usize> = HashMap::new();
+    for (line_number, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -304,6 +324,7 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
         let Some(ev) = parse_atof_event(&event) else {
             continue;
         };
+        uuid_order.entry(ev.uuid.clone()).or_insert(line_number);
         let is_end = ev.scope_category.as_deref() == Some("end");
         let pair = by_uuid.entry(ev.uuid.clone()).or_insert(Paired {
             start: None,
@@ -330,16 +351,11 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
         .map(|(uuid, _)| uuid.clone())
         .collect();
 
-    // Roots get a trace id from their session/chat context.
+    // Every root scope is shown as its own trace, even when roots share
+    // the same session_id or chat_id.
     let mut trace_id_of: HashMap<String, String> = HashMap::new();
     for root in &root_uuids {
-        let Some(pair) = by_uuid.get(root) else {
-            continue;
-        };
-        let Some(first) = pair.start.as_ref().or(pair.end.as_ref()) else {
-            continue;
-        };
-        trace_id_of.insert(root.clone(), atof_trace_id(first, root));
+        trace_id_of.insert(root.clone(), root.clone());
     }
 
     let mut spans: Vec<RawSpan> = Vec::new();
@@ -381,7 +397,7 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
                 .clone()
                 .filter(|parent| uuids.contains(parent)),
             name: first.name.clone(),
-            kind: first.category.to_uppercase(),
+            kind: normalize_span_kind(&first.category),
             status: status.to_string(),
             start_time: first.timestamp.clone(),
             end_time: end.and_then(|e| e.timestamp.clone()),
@@ -390,6 +406,12 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
             attributes: None,
         });
     }
+    spans.sort_by_key(|span| {
+        uuid_order
+            .get(&span.span_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     spans
 }
 
@@ -398,6 +420,8 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
 // ---------------------------------------------------------------------------
 
 fn build_span_tree(flat: &[RawSpan]) -> Vec<SpanNode> {
+    // Keep all nodes in one map while building the parent-child index. Nodes
+    // must not be removed before their own children are attached.
     let mut node_map: HashMap<String, SpanNode> = HashMap::new();
     for span in flat {
         node_map.insert(
@@ -421,43 +445,54 @@ fn build_span_tree(flat: &[RawSpan]) -> Vec<SpanNode> {
         );
     }
 
-    // Determine which spans are children (have a parent in the map).
-    // Collect children by parent_id first, then attach.
-    let mut children_by_parent: HashMap<String, Vec<SpanNode>> = HashMap::new();
-    let mut is_child = HashSet::new();
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    let mut is_child: HashSet<String> = HashSet::new();
     for span in flat {
         if let Some(ref parent_id) = span.parent_span_id {
             if node_map.contains_key(parent_id) {
-                if let Some(child) = node_map.remove(&span.span_id) {
-                    children_by_parent
-                        .entry(parent_id.clone())
-                        .or_default()
-                        .push(child);
-                    is_child.insert(span.span_id.clone());
-                }
+                is_child.insert(span.span_id.clone());
+                children_by_parent
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(span.span_id.clone());
             }
         }
     }
 
-    // Attach children to parents
-    for (parent_id, children) in children_by_parent {
-        if let Some(parent) = node_map.get_mut(&parent_id) {
-            parent.children.extend(children);
+    fn build_node(
+        id: &str,
+        node_map: &HashMap<String, SpanNode>,
+        children_by_parent: &HashMap<String, Vec<String>>,
+        visiting: &mut HashSet<String>,
+    ) -> Option<SpanNode> {
+        if !visiting.insert(id.to_string()) {
+            return None;
         }
+
+        let mut node = node_map.get(id)?.clone();
+        let child_ids = children_by_parent.get(id).cloned().unwrap_or_default();
+        node.children = child_ids
+            .iter()
+            .filter_map(|child_id| build_node(child_id, node_map, children_by_parent, visiting))
+            .collect();
+        visiting.remove(id);
+        Some(node)
     }
 
-    // Roots = nodes that are not children
-    let mut roots: Vec<SpanNode> = node_map
-        .into_iter()
-        .filter(|(id, _)| !is_child.contains(id))
-        .map(|(_, node)| node)
+    let root_ids: Vec<String> = flat
+        .iter()
+        .filter(|span| !is_child.contains(&span.span_id))
+        .map(|span| span.span_id.clone())
+        .collect();
+    let mut visiting = HashSet::new();
+    let mut roots: Vec<SpanNode> = root_ids
+        .iter()
+        .filter_map(|id| build_node(id, &node_map, &children_by_parent, &mut visiting))
         .collect();
 
-    // Sort children by start_time
+    // Preserve the source order supplied by ATOF (or Phoenix's fallback
+    // response). The order is established while collecting flat spans.
     fn sort_children(node: &mut SpanNode) {
-        node.children.sort_by_key(|c| {
-            c.start_time.clone().unwrap_or_default()
-        });
         for child in &mut node.children {
             sort_children(child);
         }
@@ -533,7 +568,9 @@ pub(crate) fn parse_trace_summaries(
 
         let status = root.map(|r| r.status.clone()).unwrap_or_else(|| "OK".to_string());
         let name = root.map(|r| r.name.clone()).unwrap_or_default();
-        let kind = root.map(|r| r.kind.clone()).unwrap_or_default();
+        let kind = root
+            .map(|r| phoenix_root_kind(&r.name, &r.kind))
+            .unwrap_or_default();
 
         let input_summary = root.and_then(|r| r.input.as_ref().and_then(summary));
         let output_summary = root.and_then(|r| r.output.as_ref().and_then(summary));
@@ -599,6 +636,11 @@ pub(crate) fn parse_trace_detail(
     });
 
     let spans = build_span_tree(&matching);
+
+    let mut spans = spans;
+    for root in &mut spans {
+        root.kind = phoenix_root_kind(&root.name, &root.kind);
+    }
 
     Ok(Some(TraceDetail {
         trace_id: trace_id.to_string(),
@@ -758,7 +800,11 @@ fn query_phoenix_trace_summaries(
             let num_spans = node.pointer("/trace/numSpans").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
             let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let status = node.get("statusCode").and_then(|v| v.as_str()).unwrap_or("UNSET").to_string();
-            let kind = node.get("spanKind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = node
+                .get("spanKind")
+                .and_then(|v| v.as_str())
+                .map(normalize_span_kind)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             let start_time = node.get("startTime").and_then(|v| v.as_str()).map(|s| s.to_string());
             let latency_ms = node.get("latencyMs").and_then(|v| v.as_f64()).map(|f| f as u64);
             let input_summary = node
@@ -824,7 +870,11 @@ fn query_phoenix_trace_detail(
             let node = edge.get("node")?;
             let span_id = node.get("spanId")?.as_str()?.to_string();
             let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let kind = node.get("spanKind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = node
+                .get("spanKind")
+                .and_then(|v| v.as_str())
+                .map(normalize_span_kind)
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             let status = node.get("statusCode").and_then(|v| v.as_str()).unwrap_or("UNSET").to_string();
             let start_time = node.get("startTime").and_then(|v| v.as_str()).map(|s| s.to_string());
             let end_time = node.get("endTime").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -872,6 +922,23 @@ fn query_phoenix_trace_detail(
 // Trace commands
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AtofEventPage {
+    pub entries: Vec<AtofJsonLine>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AtofJsonLine {
+    pub line_number: usize,
+    pub raw: String,
+}
+
 /// Parse the ATOF archive into trace summaries for the list page.
 /// Groups raw spans by trace_id and returns one row per trace.
 #[tauri::command]
@@ -883,6 +950,45 @@ fn list_atof_traces(work_dir: String, page: usize, page_size: usize) -> Result<T
 #[tauri::command]
 fn get_atof_trace_detail(work_dir: String, trace_id: String) -> Result<Option<TraceDetail>, String> {
     parse_trace_detail(&work_dir, &trace_id)
+}
+
+/// Return raw ATOF events in the append order produced by NeMo Relay.
+#[tauri::command]
+fn read_atof_events(work_dir: String, limit: usize, offset: usize) -> Result<AtofEventPage, String> {
+    let path = atof_path(&work_dir);
+    if !path.exists() {
+        return Ok(AtofEventPage { entries: Vec::new(), total: 0, offset, limit, has_more: false });
+    }
+    let page_size = if limit == 0 { 40 } else { limit.min(100) };
+    let file = fs::File::open(&path).map_err(|e| format!("Failed to read ATOF: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::with_capacity(page_size);
+    let mut total = 0usize;
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read ATOF: {e}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line_number = total + 1;
+        total += 1;
+        if total <= offset || entries.len() >= page_size {
+            continue;
+        }
+        entries.push(AtofJsonLine { line_number, raw: line.to_string() });
+    }
+
+    let start = offset.min(total);
+    let end = start + entries.len();
+
+    Ok(AtofEventPage {
+        entries,
+        total,
+        offset: start,
+        limit: page_size,
+        has_more: end < total,
+    })
 }
 
 /// Query Phoenix GraphQL for trace summaries when ATOF is unavailable.
@@ -943,7 +1049,7 @@ mod tests_traces {
     fn parse_iso_millis_formats() {
         // ISO-8601 with Z suffix and fractional seconds.
         assert_eq!(parse_iso_millis("2025-01-01T00:00:00Z"), Some(1_735_689_600_000));
-        assert_eq!(parse_iso_millis("2025-01-01T00:00:00.123Z"), Some(1_735_689_600_000));
+        assert_eq!(parse_iso_millis("2025-01-01T00:00:00.123Z"), Some(1_735_689_600_123));
         // Numeric seconds (< 1e12) are converted to millis; millis pass through.
         assert_eq!(parse_iso_millis("1735689600"), Some(1_735_689_600_000));
         assert_eq!(parse_iso_millis("1735689600000"), Some(1_735_689_600_000));
@@ -963,15 +1069,17 @@ mod tests_traces {
 {"atof_version":"0.1","category":"agent","name":"agentseek","uuid":"a-root-1","parent_uuid":null,"scope_category":"end","timestamp":"2026-08-05T11:08:58.180467288+00:00","data":{"messages":[]}}
 {"atof_version":"0.1","category":"tool","name":"tavily_search","uuid":"a-tool-1","parent_uuid":"a-root-1","scope_category":"start","timestamp":"2026-08-05T11:08:54.000000000+00:00","data":{"query":"hello"}}
 {"atof_version":"0.1","category":"tool","name":"tavily_search","uuid":"a-tool-1","parent_uuid":"a-root-1","scope_category":"end","timestamp":"2026-08-05T11:08:55.000000000+00:00","data":{"query":"hello","error":"boom"}}
-{"atof_version":"0.1","category":"agent","name":"agentseek","uuid":"b-root-1","parent_uuid":null,"scope_category":"start","timestamp":"2026-08-05T11:09:00.000000000+00:00","data":{"session_id":"trace-two"}}
+{"atof_version":"0.1","category":"llm","name":"model","uuid":"a-model-1","parent_uuid":"a-tool-1","scope_category":"start","timestamp":"2026-08-05T11:08:54.100000000+00:00","data":{"prompt":"nested"}}
+{"atof_version":"0.1","category":"llm","name":"model","uuid":"a-model-1","parent_uuid":"a-tool-1","scope_category":"end","timestamp":"2026-08-05T11:08:54.900000000+00:00","data":{"response":"ok"}}
+{"atof_version":"0.1","category":"agent","name":"agentseek","uuid":"b-root-1","parent_uuid":null,"scope_category":"start","timestamp":"2026-08-05T11:09:00.000000000+00:00","data":{"session_id":"trace-one"}}
 {"atof_version":"0.1","category":"agent","name":"agentseek","uuid":"b-root-1","parent_uuid":null,"scope_category":"end","timestamp":"2026-08-05T11:09:02.000000000+00:00","data":{}}
 "#;
         let spans = parse_atof_spans(content);
-        assert_eq!(spans.len(), 3);
+        assert_eq!(spans.len(), 4);
 
-        // Root agent of trace one: trace id from session/chat, OK status.
+        // Root agent of trace one: its root UUID is the trace id, with OK status.
         let root = spans.iter().find(|s| s.span_id == "a-root-1").expect("root span");
-        assert_eq!(root.trace_id, "trace-one");
+        assert_eq!(root.trace_id, "a-root-1");
         assert_eq!(root.kind, "AGENT");
         assert_eq!(root.status, "OK");
         assert!(root.parent_span_id.is_none());
@@ -985,14 +1093,21 @@ mod tests_traces {
         // Tool span inherits trace one, links to the root, and reports ERROR
         // because its end event carries an error field.
         let tool = spans.iter().find(|s| s.span_id == "a-tool-1").expect("tool span");
-        assert_eq!(tool.trace_id, "trace-one");
+        assert_eq!(tool.trace_id, "a-root-1");
         assert_eq!(tool.parent_span_id.as_deref(), Some("a-root-1"));
         assert_eq!(tool.kind, "TOOL");
         assert_eq!(tool.status, "ERROR");
 
+        let tree = build_span_tree(&spans);
+        let root_node = tree.iter().find(|node| node.span_id == "a-root-1").expect("root node");
+        assert_eq!(root_node.children.len(), 1);
+        assert_eq!(root_node.children[0].span_id, "a-tool-1");
+        assert_eq!(root_node.children[0].children.len(), 1);
+        assert_eq!(root_node.children[0].children[0].span_id, "a-model-1");
+
         // Second trace root gets its own trace id.
         let other = spans.iter().find(|s| s.span_id == "b-root-1").expect("other root");
-        assert_eq!(other.trace_id, "trace-two");
+        assert_eq!(other.trace_id, "b-root-1");
     }
     #[test]
     fn parse_trace_summaries_falls_back_to_atof_events() {
@@ -1012,7 +1127,7 @@ mod tests_traces {
         assert_eq!(page.total, 1);
         assert_eq!(page.entries.len(), 1);
         let entry = &page.entries[0];
-        assert_eq!(entry.trace_id, "t-1");
+        assert_eq!(entry.trace_id, "r-1");
         assert_eq!(entry.status, "OK");
         assert_eq!(entry.kind, "AGENT");
         assert_eq!(entry.latency_ms, Some(1_000));

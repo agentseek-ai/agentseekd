@@ -203,6 +203,14 @@ fn storage_not_initialized() -> String {
     "Desktop storage has not been initialized".to_string()
 }
 
+fn canonical_log_category(category: &str) -> &'static str {
+    if category == "runtime" {
+        "runtime"
+    } else {
+        "lifecycle"
+    }
+}
+
 fn open_sqlite(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection
@@ -218,6 +226,9 @@ fn open_sqlite(path: &Path) -> Result<Connection, String> {
 }
 
 fn initialize_sqlite_schema(connection: &Connection) -> Result<(), String> {
+    let user_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?;
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS instances (
@@ -277,9 +288,26 @@ fn initialize_sqlite_schema(connection: &Connection) -> Result<(), String> {
             );
             INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                 VALUES (2, strftime('%s', 'now'));
-            PRAGMA user_version = 2;",
+            INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+                VALUES (3, strftime('%s', 'now'));
+            INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+                VALUES (4, strftime('%s', 'now'));
+            PRAGMA user_version = 4;",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if user_version < 4 {
+        // Keep historical rows while moving old operation-specific labels into
+        // the two streams used by the current log center.
+        connection
+            .execute(
+                "UPDATE logs
+                 SET category = CASE WHEN category = 'runtime' THEN 'runtime' ELSE 'lifecycle' END
+                 WHERE category <> 'runtime'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn replace_sqlite_store(connection: &mut Connection, data: &AppStore) -> Result<(), String> {
@@ -387,7 +415,7 @@ fn replace_sqlite_tables(
                     log.id,
                     log.instance_id,
                     log.instance_name,
-                    log.category,
+                    canonical_log_category(&log.category),
                     log.level,
                     log.message,
                     log.command,
@@ -560,7 +588,11 @@ impl StorageEngine {
     }
 
     fn query_logs(&mut self, query: &LogQuery) -> Result<LogPage, String> {
-        let limit = query.limit.clamp(1, 1_000);
+        let limit = if query.load_all {
+            100_000
+        } else {
+            query.limit.clamp(1, 1_000)
+        };
         match self {
             Self::Pending => Ok(LogPage {
                 entries: Vec::new(),
@@ -683,7 +715,7 @@ impl StorageEngine {
                         "SELECT EXISTS(
                             SELECT 1 FROM logs
                             WHERE instance_id = ?1
-                              AND category = 'install'
+                              AND category = 'lifecycle'
                               AND level = 'success'
                               AND message = 'Instance deployment completed'
                          )",
@@ -791,29 +823,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn delete_runtime_logs(&mut self, instance_id: &str) -> Result<(), String> {
-        match self {
-            Self::Pending => return Ok(()),
-            Self::Sqlite(path) => {
-                let connection = open_sqlite(path)?;
-                initialize_sqlite_schema(&connection)?;
-                connection
-                    .execute(
-                        "DELETE FROM logs WHERE instance_id = ?1 AND category = 'runtime'",
-                        params![instance_id],
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
-            Self::SeekDb(bridge) => {
-                bridge.request(serde_json::json!({
-                    "op": "delete_runtime_logs",
-                    "instance_id": instance_id,
-                }))?;
-            }
-        }
-        Ok(())
-    }
-
     fn append_logs(&mut self, logs: &[LogEntry]) -> Result<(), String> {
         if logs.is_empty() {
             return Ok(());
@@ -841,7 +850,7 @@ impl StorageEngine {
                                 log.id,
                                 log.instance_id,
                                 log.instance_name,
-                                log.category,
+                                canonical_log_category(&log.category),
                                 log.level,
                                 log.message,
                                 log.command,
@@ -882,7 +891,7 @@ impl StorageEngine {
                             log.id,
                             log.instance_id,
                             log.instance_name,
-                            log.category,
+                            canonical_log_category(&log.category),
                             log.level,
                             log.message,
                             log.command,
@@ -1365,6 +1374,7 @@ async fn configure_storage(
                             before_sequence,
                             after_sequence: None,
                             limit: LOG_CLEANUP_BATCH_SIZE,
+                            load_all: false,
                         })?;
                     if page.entries.is_empty() {
                         break;
@@ -1616,6 +1626,7 @@ mod tests_storage {
                 before_sequence: None,
                 after_sequence: None,
                 limit: 10,
+                load_all: false,
             })
             .expect("query persisted logs");
         assert_eq!(page.entries.len(), 1);
@@ -1640,6 +1651,7 @@ mod tests_storage {
                 before_sequence: None,
                 after_sequence: None,
                 limit: 2,
+                load_all: false,
             })
             .expect("query latest page");
         assert_eq!(
@@ -1657,6 +1669,7 @@ mod tests_storage {
                 before_sequence: Some(5),
                 after_sequence: None,
                 limit: 2,
+                load_all: false,
             })
             .expect("query earlier page");
         assert_eq!(
@@ -1673,6 +1686,7 @@ mod tests_storage {
                 before_sequence: None,
                 after_sequence: Some(4),
                 limit: 10,
+                load_all: false,
             })
             .expect("query newer page");
         assert_eq!(
@@ -1716,13 +1730,13 @@ mod tests_storage {
                 test_log(
                     "old-deleted-lifecycle",
                     Some("deleted"),
-                    "install",
+                    "lifecycle",
                     now - 10 * SECONDS_PER_DAY,
                 ),
                 test_log(
                     "recent-deleted-lifecycle",
                     Some("deleted"),
-                    "install",
+                    "lifecycle",
                     now - SECONDS_PER_DAY,
                 ),
             ])
@@ -1737,6 +1751,7 @@ mod tests_storage {
                 before_sequence: None,
                 after_sequence: None,
                 limit: 10,
+                load_all: false,
             })
             .expect("query remaining logs");
         assert_eq!(remaining.entries.len(), 1);
@@ -1774,6 +1789,7 @@ mod tests_storage {
                     before_sequence,
                     after_sequence: None,
                     limit: 1_000,
+                    load_all: false,
                 })
                 .expect("read migration page");
             if page.entries.is_empty() {
@@ -1855,18 +1871,32 @@ mod tests_storage {
         assert_eq!(loaded.vault[0].comment, "API key");
         assert_eq!(loaded.vault[0].value, "secret");
         assert!(loaded.logs.is_empty());
-        assert_eq!(engine.log_count().expect("count migrated logs"), 1);
+        assert_eq!(engine.log_count().expect("migrated logs are preserved"), 1);
         assert_eq!(
             engine
                 .query_logs(&LogQuery {
                     before_sequence: None,
                     after_sequence: None,
                     limit: 10,
+                    load_all: false,
                 })
                 .expect("query migrated logs")
                 .entries[0]
                 .id,
             "log-1"
+        );
+        assert_eq!(
+            engine
+                .query_logs(&LogQuery {
+                    before_sequence: None,
+                    after_sequence: None,
+                    limit: 10,
+                    load_all: false,
+                })
+                .expect("query migrated logs")
+                .entries[0]
+                .category,
+            "lifecycle"
         );
         let connection = Connection::open(&database).expect("reopen migrated database");
         for table in ["instances", "env_vault", "logs"] {
@@ -1890,7 +1920,7 @@ mod tests_storage {
         let schema_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema version");
-        assert_eq!(schema_version, 2);
+        assert_eq!(schema_version, 4);
         drop(connection);
         fs::remove_dir_all(root).expect("remove storage test directory");
     }

@@ -110,7 +110,7 @@ describe("desktopApi mock layer", () => {
         vault: [],
         logs: [],
       };
-      localStorage.setItem("agentseek-desktop-preview-v2", JSON.stringify({
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({
         ...store,
         vault: [],
       }));
@@ -137,7 +137,7 @@ describe("desktopApi mock layer", () => {
         ],
         logs: [],
       };
-      localStorage.setItem("agentseek-desktop-preview-v2", JSON.stringify({
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({
         ...store,
         vault: store.vault.map((e) => ({ ...e, value: "", modified: false })),
       }));
@@ -164,7 +164,7 @@ describe("desktopApi mock layer", () => {
         vault: [],
         logs: [],
       };
-      localStorage.setItem("agentseek-desktop-preview-v2", JSON.stringify({
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({
         ...store,
         vault: [],
       }));
@@ -180,7 +180,7 @@ describe("desktopApi mock layer", () => {
         vault: [],
         logs: [],
       };
-      localStorage.setItem("agentseek-desktop-preview-v2", JSON.stringify({
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({
         ...store,
         vault: [],
       }));
@@ -211,20 +211,39 @@ describe("desktopApi mock layer", () => {
         id: `log-${i}`,
         instanceId: null,
         instanceName: "Test",
-        category: "install" as const,
+        category: "lifecycle" as const,
         level: "info",
         message: `msg ${i}`,
         createdAt: i,
         sequence: i,
       }));
       const store = { instances: [], vault: [], logs };
-      localStorage.setItem("agentseek-desktop-preview-v2", JSON.stringify({
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({
         ...store,
         vault: [],
       }));
       const page = await desktopApi.listLogs({ limit: 5 });
       expect(page.entries).toHaveLength(5);
       expect(page.hasMore).toBe(true);
+    });
+
+    it("loads all log history through cursor pages", async () => {
+      const logs = Array.from({ length: 1_205 }, (_, i) => ({
+        id: `log-${i}`,
+        instanceId: "instance-1",
+        instanceName: "Test",
+        category: "runtime" as const,
+        level: "info",
+        message: `msg ${i}`,
+        createdAt: i,
+        sequence: i + 1,
+      }));
+      localStorage.setItem("agentseek-desktop-preview-v3", JSON.stringify({ instances: [], vault: [], logs }));
+
+      const page = await desktopApi.listAllLogs();
+
+      expect(page.entries).toHaveLength(1_205);
+      expect(page.hasMore).toBe(false);
     });
 
     it("clamps limit to minimum 1", async () => {

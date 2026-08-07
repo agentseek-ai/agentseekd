@@ -101,6 +101,13 @@ def read_collection(collection):
     return [json.loads(item["payload"]) for _, item in sorted(rows, key=lambda row: row[0])]
 
 
+def read_logs(collection):
+    rows = read_collection(collection)
+    for row in rows:
+        row["category"] = "runtime" if row.get("category") == "runtime" else "lifecycle"
+    return rows
+
+
 def replace_collection(collection, rows, id_field):
     existing = collection.get(include=["metadatas"])
     if existing.get("ids"):
@@ -123,12 +130,19 @@ def clear_collection(collection):
 
 
 def load_domain_data(collections, legacy):
-    data = {name: read_collection(collection) for name, collection in collections.items()}
+    data = {
+        name: read_logs(collection) if name == "logs" else read_collection(collection)
+        for name, collection in collections.items()
+    }
     if not any(data.values()):
         result = legacy.get(ids="singleton", include=["metadatas"])
         metadata = (result.get("metadatas") or [{}])[0] if result.get("ids") else {}
         if metadata.get("payload"):
             data = json.loads(metadata["payload"])
+            data["logs"] = [
+                {**item, "category": "runtime" if item.get("category") == "runtime" else "lifecycle"}
+                for item in data.get("logs", [])
+            ]
             replace_collection(collections["instances"], data.get("instances", []), "id")
             replace_collection(collections["vault"], data.get("vault", []), None)
             replace_collection(collections["logs"], data.get("logs", []), "id")
@@ -182,8 +196,8 @@ def main():
                 query = request.get("query") or {}
                 before = query.get("beforeSequence")
                 after = query.get("afterSequence")
-                limit = max(1, min(int(query.get("limit") or 500), 1000))
-                all_logs = read_collection(collections["logs"])
+                limit = max(1, min(int(query.get("limit") or 500), 100000 if query.get("loadAll") else 1000))
+                all_logs = read_logs(collections["logs"])
                 filtered = [
                     entry
                     for entry in all_logs
@@ -215,10 +229,10 @@ def main():
                 instance_id = request["instanceId"]
                 completed = any(
                     item.get("instanceId") == instance_id
-                    and item.get("category") == "install"
+                    and item.get("category") == "lifecycle"
                     and item.get("level") == "success"
                     and item.get("message") == "Instance deployment completed"
-                    for item in read_collection(collections["logs"])
+                    for item in read_logs(collections["logs"])
                 )
                 respond(ok=True, completed=completed)
             elif request["op"] == "cleanup_logs":
@@ -227,7 +241,7 @@ def main():
                 runtime_cutoff = now - max(1, int(request["runtimeRetentionDays"])) * day
                 deleted_cutoff = now - int(request["deletedRetentionDays"]) * day
                 active_ids = {item["id"] for item in read_collection(collections["instances"])}
-                logs = read_collection(collections["logs"])
+                logs = read_logs(collections["logs"])
                 retained = []
                 removed_ids = []
                 for item in logs:

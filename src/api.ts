@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import requirements from "./runtime-requirements.json";
 import type {
   CliStatus,
+  AtofEventPage,
   EnvVariable,
   ExportEnvResult,
   InstanceRecord,
@@ -27,7 +28,7 @@ import type {
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 export const isNativeDesktop = isTauri();
-const mockKey = "agentseek-desktop-preview-v2";
+const mockKey = "agentseek-desktop-preview-v3";
 const mockLogSettingsKey = "agentseek-desktop-log-settings-v1";
 const mockVaultSecretsKey = "agentseek-desktop-preview-vault-secrets";
 
@@ -172,6 +173,14 @@ export const desktopApi = {
     if (!opened) throw new Error("The browser blocked the new window.");
   },
 
+  async openLocalPath(path: string): Promise<void> {
+    if (isTauri()) {
+      await openPath(path);
+      return;
+    }
+    throw new Error("Opening local files is only available in the desktop app.");
+  },
+
   async cliStatus(checkLatest = true): Promise<CliStatus> {
     if (isTauri()) return invoke("cli_status", { checkLatest });
     return { platform: "macos", dependencyCommands: { uv: "uv self update", node: "managed Node runtime", npm: "managed npm runtime", git: "brew upgrade git", agentseek: "uv tool install --upgrade agentseek" }, minimumVersions: { uv: requirements.versions.uv.minimum, node: requirements.versions.node.minimum, npm: requirements.versions.npm.minimum, git: requirements.versions.git.minimum, agentseek: requirements.versions.agentseek.minimum }, nodeManaged: true, uvAvailable: true, uvPath: "/Users/name/.local/bin/uv", cliAvailable: true, cliCompatible: true, cliUpdateAvailable: false, cliLatestVersion: requirements.versions.agentseek.minimum, cliLatestVersionChecked: true, uvVersion: `uv ${requirements.versions.uv.minimum}`, cliVersion: `agentseek ${requirements.versions.agentseek.minimum}`, nodeAvailable: true, nodeCompatible: true, nodeVersion: `v${requirements.versions.node.managed}`, npmAvailable: true, npmCompatible: true, npmVersion: requirements.versions.npm.managed, gitAvailable: true, gitCompatible: true, gitVersion: `git version ${requirements.versions.git.minimum}`, uvCompatible: true, prerequisitesReady: true, installCommand: "uv tool install agentseek" };
@@ -298,7 +307,7 @@ export const desktopApi = {
     mockLog(
       store,
       instance,
-      "config",
+      "lifecycle",
       "success",
       `Generated ${instance.envPath} (${entries.length} keys, synced ${changed.length} to the vault)`,
     );
@@ -321,9 +330,9 @@ export const desktopApi = {
     instance.status = "installing";
     saveMock(store);
     await wait(900);
-    mockLog(store, instance, "execution", "success", "backend / frontend tasks completed", "uvx agentseek task backend && uvx agentseek task frontend");
-    mockLog(store, instance, "execution", "success", "Doctor passed: 0 failed", "uvx agentseek doctor");
-    mockLog(store, instance, "install", "success", "Instance started successfully", "uvx agentseek dev");
+    mockLog(store, instance, "lifecycle", "success", "backend / frontend tasks completed", "uvx agentseek task backend && uvx agentseek task frontend");
+    mockLog(store, instance, "lifecycle", "success", "Doctor passed: 0 failed", "uvx agentseek doctor");
+    mockLog(store, instance, "lifecycle", "success", "Instance started successfully", "uvx agentseek dev");
     instance.status = "running";
     instance.updatedAt = Math.floor(Date.now() / 1000);
     instance.agentUrl = "http://127.0.0.1:8089";
@@ -350,7 +359,7 @@ export const desktopApi = {
     if (!instance) throw new Error("Instance not found");
     instance.status = "stopped";
     instance.updatedAt = Math.floor(Date.now() / 1000);
-    mockLog(store, instance, "install", "success", "Instance stopped");
+    mockLog(store, instance, "lifecycle", "success", "Instance stopped");
     saveMock(store);
     return instance;
   },
@@ -364,7 +373,7 @@ export const desktopApi = {
     instance.status = "running";
     instance.needsDoctor = false;
     instance.updatedAt = Math.floor(Date.now() / 1000);
-    mockLog(store, instance, "execution", "success", "Doctor passed; instance restarted", "uvx agentseek doctor && uvx agentseek dev");
+    mockLog(store, instance, "lifecycle", "success", "Doctor passed; instance restarted", "uvx agentseek doctor && uvx agentseek dev");
     saveMock(store);
     return instance;
   },
@@ -376,6 +385,7 @@ export const desktopApi = {
     if (instance) {
       instance.needsDoctor = true;
       instance.status = "needs-doctor";
+      mockLog(store, instance, "lifecycle", "warning", "Instance configuration changed; restart is required");
       saveMock(store);
     }
   },
@@ -385,7 +395,7 @@ export const desktopApi = {
     const store = loadMock();
     const instance = store.instances.find((item) => item.id === instanceId) ?? null;
     store.instances = store.instances.filter((item) => item.id !== instanceId);
-    mockLog(store, instance, "install", "success", "Instance processes, working directory, and record deleted");
+    mockLog(store, instance, "lifecycle", "success", "Instance processes, working directory, and record deleted");
     saveMock(store);
   },
 
@@ -397,6 +407,37 @@ export const desktopApi = {
       .sort((left, right) => query.afterSequence == null ? (right.sequence || 0) - (left.sequence || 0) : (left.sequence || 0) - (right.sequence || 0));
     const groupCount = new Set(loadMock().logs.map((log) => log.instanceId || `name:${log.instanceName}`)).size;
     return { entries: entries.slice(0, limit), hasMore: entries.length > limit, groupCount };
+  },
+
+  async listAllLogs(query: LogQuery = {}): Promise<LogPage> {
+    if (isTauri()) {
+      return invoke("list_logs", { query: { ...query, loadAll: true, limit: 100_000 } });
+    }
+    const entries: LogEntry[] = [];
+    let beforeSequence = query.beforeSequence;
+    let hasMore = true;
+    let groupCount = 0;
+    while (hasMore && entries.length < 100_000) {
+      const page = await this.listLogs({
+        ...query,
+        afterSequence: undefined,
+        beforeSequence,
+        limit: 1_000,
+      });
+      groupCount = page.groupCount;
+      entries.push(...page.entries);
+      hasMore = page.hasMore && page.entries.length > 0;
+      const nextBeforeSequence = page.entries.reduce<number | undefined>(
+        (minimum, entry) => {
+          const sequence = Number(entry.sequence ?? 0);
+          return minimum == null ? sequence : Math.min(minimum, sequence);
+        },
+        undefined,
+      );
+      if (nextBeforeSequence == null || nextBeforeSequence === beforeSequence) break;
+      beforeSequence = nextBeforeSequence;
+    }
+    return { entries, hasMore, groupCount };
   },
 
   async logSettings(): Promise<LogSettings> {
@@ -423,7 +464,7 @@ export const desktopApi = {
     const existing = store.vault.find((item) => item.key === imported.key);
     if (existing) Object.assign(existing, imported);
     else store.vault.push(imported);
-    mockLog(store, null, "config", "success", `Imported 1 variable from ${path}`);
+    mockLog(store, null, "lifecycle", "success", `Imported 1 variable from ${path}`);
     saveMock(store);
     return 1;
   },
@@ -466,6 +507,12 @@ export const desktopApi = {
     if (isTauri()) return invoke("get_atof_trace_detail", { workDir, traceId });
     await wait(120);
     return null;
+  },
+
+  async readAtofEvents(workDir: string, limit = 40, offset = 0): Promise<AtofEventPage> {
+    if (isTauri()) return invoke("read_atof_events", { workDir, limit, offset });
+    await wait(120);
+    return { entries: [], total: 0, offset, limit, hasMore: false };
   },
 
   async queryPhoenixTraces(

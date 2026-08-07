@@ -486,6 +486,8 @@ pub(crate) struct LogQuery {
     pub(crate) after_sequence: Option<u64>,
     #[serde(default = "default_log_page_size")]
     pub(crate) limit: usize,
+    #[serde(default)]
+    pub(crate) load_all: bool,
 }
 
 fn default_log_page_size() -> usize {

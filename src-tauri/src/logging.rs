@@ -13,62 +13,6 @@ fn truncate_log_text(mut value: String) -> String {
     value
 }
 
-fn prune_logs(data: &mut AppStore, runtime_retention_days: u32, now: u64) -> Vec<String> {
-    let active_instances = data
-        .instances
-        .iter()
-        .map(|instance| instance.id.as_str())
-        .collect::<HashSet<_>>();
-    let runtime_cutoff = now
-        .saturating_sub(u64::from(runtime_retention_days.max(1)).saturating_mul(SECONDS_PER_DAY));
-    let deleted_cutoff = now.saturating_sub(
-        u64::from(DELETED_INSTANCE_LOG_RETENTION_DAYS).saturating_mul(SECONDS_PER_DAY),
-    );
-    let mut removed = Vec::new();
-    data.logs.retain(|log| {
-        let deleted_instance = log
-            .instance_id
-            .as_deref()
-            .is_some_and(|instance_id| !active_instances.contains(instance_id));
-        let keep = if deleted_instance && log.created_at < deleted_cutoff {
-            false
-        } else if log.category == "runtime" {
-            log.created_at >= runtime_cutoff
-        } else {
-            true
-        };
-        if !keep {
-            removed.push(log.id.clone());
-        }
-        keep
-    });
-    if data.logs.len() > MAX_LOG_ENTRIES {
-        let remove = data.logs.len() - MAX_LOG_ENTRIES + LOG_CLEANUP_BATCH_SIZE;
-        let removable = data
-            .logs
-            .iter()
-            .filter(|log| {
-                log.category == "runtime"
-                    || log
-                        .instance_id
-                        .as_deref()
-                        .is_some_and(|id| !active_instances.contains(id))
-            })
-            .take(remove)
-            .map(|log| log.id.clone())
-            .collect::<HashSet<_>>();
-        data.logs.retain(|log| {
-            if removable.contains(&log.id) {
-                removed.push(log.id.clone());
-                false
-            } else {
-                true
-            }
-        });
-    }
-    removed
-}
-
 fn runtime_stream_level(line: &str) -> &'static str {
     let lower = line.to_lowercase();
     if lower.contains("cannot connect to the docker daemon")
@@ -356,11 +300,63 @@ fn remove_runtime_log_spool(state: &DesktopState, instance_id: &str) {
 #[tauri::command]
 fn list_logs(state: State<'_, DesktopState>, query: LogQuery) -> Result<LogPage, String> {
     sync_runtime_log_spools(state.inner());
-    state
+    let _ = state.flush_pending_logs();
+    let stored = state
         .storage
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?
-        .query_logs(&query)
+        .query_logs(&query);
+    let pending = state.pending_logs();
+    match stored {
+        Ok(mut page) => {
+            if pending.is_empty() {
+                return Ok(page);
+            }
+            let mut entries = page.entries;
+            let mut known = entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            entries.extend(pending.into_iter().filter(|entry| {
+                let after = query.after_sequence.is_none_or(|sequence| entry.sequence > sequence);
+                let before = query.before_sequence.is_none_or(|sequence| entry.sequence < sequence);
+                after && before && known.insert(entry.id.clone())
+            }));
+            if query.after_sequence.is_some() {
+                entries.sort_by_key(|entry| entry.sequence);
+            } else {
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.sequence));
+            }
+            let limit = if query.load_all { 100_000 } else { query.limit.clamp(1, 1_000) };
+            page.has_more |= entries.len() > limit;
+            entries.truncate(limit);
+            page.entries = entries;
+            Ok(page)
+        }
+        Err(_error) if !pending.is_empty() => {
+            let mut entries = pending
+                .into_iter()
+                .filter(|entry| {
+                    query.after_sequence.is_none_or(|sequence| entry.sequence > sequence)
+                        && query.before_sequence.is_none_or(|sequence| entry.sequence < sequence)
+                })
+                .collect::<Vec<_>>();
+            if query.after_sequence.is_some() {
+                entries.sort_by_key(|entry| entry.sequence);
+            } else {
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.sequence));
+            }
+            let limit = if query.load_all { 100_000 } else { query.limit.clamp(1, 1_000) };
+            let has_more = entries.len() > limit;
+            entries.truncate(limit);
+            Ok(LogPage {
+                entries,
+                has_more,
+                group_count: 0,
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[tauri::command]
@@ -503,64 +499,6 @@ mod tests_logging {
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.contains("log content truncated"));
         assert!(truncated.len() < MAX_LOG_TEXT_BYTES + 100);
-    }
-    #[test]
-    fn log_retention_preserves_active_lifecycle_and_expires_runtime_or_deleted_instances() {
-        let now = 20 * SECONDS_PER_DAY;
-        let active = InstanceRecord {
-            id: "active".to_string(),
-            name: "Active".to_string(),
-            template_id: "bub/default".to_string(),
-            status: "running".to_string(),
-            deployment_mode: "local".to_string(),
-            work_dir: "/tmp/active".to_string(),
-            env_example_path: None,
-            env_path: None,
-            note: String::new(),
-            created_at: 1,
-            updated_at: 1,
-            needs_doctor: false,
-            pid: None,
-            agent_url: None,
-            ui_url: None,
-            studio_url: None,
-            project_name: None,
-            lifecycle_version: None,
-            service_endpoints: Vec::new(),
-        };
-        let old = now - 10 * SECONDS_PER_DAY;
-        let recent = now - SECONDS_PER_DAY;
-        let mut store = AppStore {
-            instances: vec![active],
-            vault: Vec::new(),
-            logs: vec![
-                test_log("active-lifecycle", Some("active"), "install", old),
-                test_log("active-runtime", Some("active"), "runtime", old),
-                test_log("deleted-lifecycle-old", Some("deleted"), "install", old),
-                test_log(
-                    "deleted-lifecycle-recent",
-                    Some("deleted"),
-                    "install",
-                    recent,
-                ),
-                test_log("deleted-runtime-recent", Some("deleted"), "runtime", recent),
-                test_log("platform-lifecycle", None, "config", old),
-            ],
-        };
-
-        let removed = prune_logs(&mut store, 7, now);
-        let remaining = store
-            .logs
-            .iter()
-            .map(|log| log.id.as_str())
-            .collect::<HashSet<_>>();
-
-        assert!(removed.contains(&"active-runtime".to_string()));
-        assert!(removed.contains(&"deleted-lifecycle-old".to_string()));
-        assert!(remaining.contains("active-lifecycle"));
-        assert!(remaining.contains("deleted-lifecycle-recent"));
-        assert!(remaining.contains("deleted-runtime-recent"));
-        assert!(remaining.contains("platform-lifecycle"));
     }
     #[test]
     fn runtime_stream_level_does_not_treat_normal_stderr_as_an_error() {

@@ -1,6 +1,6 @@
 export type Page = "instances" | "templates" | "config" | "logs" | "traces";
 export type DeploymentMode = "local" | "docker";
-export type LogCategory = "install" | "config" | "execution" | "runtime";
+export type LogCategory = "lifecycle" | "runtime";
 
 export interface TemplateInfo {
   id: string;
@@ -78,6 +78,7 @@ export interface LogQuery {
   beforeSequence?: number;
   afterSequence?: number;
   limit?: number;
+  loadAll?: boolean;
 }
 
 export interface PrepareInstanceInput {
@@ -222,4 +223,17 @@ export interface TracePage {
   total: number;
   page: number;
   pageSize: number;
+}
+
+export interface AtofJsonLine {
+  lineNumber: number;
+  raw: string;
+}
+
+export interface AtofEventPage {
+  entries: AtofJsonLine[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
 }

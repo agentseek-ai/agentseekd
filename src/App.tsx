@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { filterTemplates, templateFrameworks as collectTemplateFrameworks } from "./template-utils";
+import JsonView from "@uiw/react-json-view";
 import {
+  Bot,
   Boxes,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  CircleDot,
   CircleStop,
   Container,
   Copy,
@@ -36,16 +39,20 @@ import {
   SquareTerminal,
   Sun,
   Trash2,
+  Workflow,
+  Wrench,
   X,
 } from "lucide-react";
 import { desktopApi, isNativeDesktop } from "./api";
 import { translations, type Language, type TranslationKey } from "./i18n";
 import type {
   CliStatus,
+  AtofJsonLine,
   DeploymentStage,
   EnvVariable,
   InstanceRecord,
   LogEntry,
+  LogCategory,
   Page,
   PrepareInstanceInput,
   RuntimeInstallProgress,
@@ -63,6 +70,7 @@ import type {
 type Theme = "light" | "dark";
 type InstallStep = "form" | "env" | "deploying";
 type DependencyKey = "uv" | "node" | "npm" | "git" | "agentseek";
+type DetailTab = "entry" | "trace-center" | "atof";
 
 interface SetupDependency {
   id: DependencyKey;
@@ -112,6 +120,41 @@ function formatTime(value: number, language: Language) {
   }).format(new Date(value * 1000));
 }
 
+function paginationSummary(language: Language, page: number, total: number): string {
+  return language === "zh"
+    ? `第 ${page} 页 / 共 ${total} 条`
+    : `Page ${page} / ${total} total`;
+}
+
+function PaginationControls({
+  language,
+  page,
+  total,
+  pageSize,
+  onPageChange,
+  disabled = false,
+  className = "",
+}: {
+  language: Language;
+  page: number;
+  total: number;
+  pageSize: number;
+  onPageChange: (page: number) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  if (total === 0) return null;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  return (
+    <div className={`log-pagination ${className}`.trim()}>
+      <span className="log-pagination-info">{paginationSummary(language, currentPage, total)}</span>
+      <button className="button secondary compact" disabled={disabled || currentPage <= 1} onClick={() => onPageChange(currentPage - 1)} type="button"><ChevronLeft /></button>
+      <button className="button secondary compact" disabled={disabled || currentPage >= totalPages} onClick={() => onPageChange(currentPage + 1)} type="button"><ChevronRight /></button>
+    </div>
+  );
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -139,6 +182,24 @@ function envExistsPath(error: unknown) {
   const message = errorMessage(error);
   const marker = "ENV_FILE_EXISTS:";
   return message.startsWith(marker) ? message.slice(marker.length) : null;
+}
+
+function hasNemoRelayCapability(instance: InstanceRecord | null | undefined) {
+  if (!instance) return false;
+  const fingerprint = [
+    instance.templateId,
+    instance.name,
+    instance.projectName,
+    instance.workDir,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .toLowerCase();
+  return /(^|[\/_\-\s])relay([\/_\-\s]|$)/.test(fingerprint) || /nemo[\/_\-\s]?relay/.test(fingerprint);
+}
+
+function atofSourceRelativePath() {
+  return ".nemo-relay/atof/events.jsonl";
 }
 
 function portChangeSummary(result: SaveEnvResult) {
@@ -180,6 +241,12 @@ function logSequence(entry: LogEntry) {
   if (typeof entry.sequence === "number") return entry.sequence;
   const match = entry.id.match(/-(\d+)$/);
   return match ? Number(match[1]) : 0;
+}
+
+function mergeLogEntries(current: LogEntry[], incoming: LogEntry[]) {
+  const entries = new Map(current.map((entry) => [entry.id, entry]));
+  for (const entry of incoming) entries.set(entry.id, entry);
+  return Array.from(entries.values()).sort((left, right) => logSequence(right) - logSequence(left));
 }
 
 function LogTerminal({ instanceName, entries, language, liveLabel }: { instanceName: string; entries: LogEntry[]; language: Language; liveLabel: string }) {
@@ -232,8 +299,13 @@ function statusTone(status: string) {
 
 /// Number of log groups displayed per page in the log center.
 const LOGS_PER_PAGE = 10;
+/// Number of instances displayed per page in the instance list.
+const INSTANCES_PER_PAGE = 10;
 /// Number of trace summaries displayed per page.
 const TRACES_PER_PAGE = 20;
+/// Number of trace summaries displayed per page in the instance drawer.
+const TRACE_CENTER_PER_PAGE = 10;
+const ATOF_EVENTS_PAGE_SIZE = 40;
 
 export default function App() {
   const [page, setPage] = useState<Page>("instances");
@@ -290,7 +362,7 @@ export default function App() {
   const [configBusy, setConfigBusy] = useState(false);
   const [configGenerated, setConfigGenerated] = useState<SaveEnvResult | null>(null);
   const [configTab, setConfigTab] = useState<"vault" | "instance">("vault");
-  const [logCategory, setLogCategory] = useState<"all" | "install" | "runtime">("all");
+  const [logCategory, setLogCategory] = useState<"all" | LogCategory>("all");
   const [logInstance, setLogInstance] = useState("all");
   const [traceInstanceId, setTraceInstanceId] = useState("");
   const [traceSummaries, setTraceSummaries] = useState<TraceSummary[]>([]);
@@ -299,16 +371,27 @@ export default function App() {
   const [traceDetailView, setTraceDetailView] = useState<TraceDetail | null>(null);
   const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null);
   const [tracePanelOpen, setTracePanelOpen] = useState(false);
-  const [detailTab, setDetailTab] = useState<"entry" | "trace">("entry");
-  const [tracePanelSummaries, setTracePanelSummaries] = useState<TraceSummary[]>([]);
-  const [tracePanelLoading, setTracePanelLoading] = useState(false);
-  const [tracePanelRefreshKey, setTracePanelRefreshKey] = useState(0);
+  const [detailTab, setDetailTab] = useState<DetailTab>("entry");
+  const [traceCenterSummaries, setTraceCenterSummaries] = useState<TraceSummary[]>([]);
+  const [traceCenterPage, setTraceCenterPage] = useState(1);
+  const [traceCenterTotal, setTraceCenterTotal] = useState(0);
+  const [traceCenterLoading, setTraceCenterLoading] = useState(false);
+  const [traceCenterRefreshKey, setTraceCenterRefreshKey] = useState(0);
   const [tracePanelDetail, setTracePanelDetail] = useState<TraceDetail | null>(null);
   const [tracePanelSelectedSpanId, setTracePanelSelectedSpanId] = useState<string | null>(null);
+  const [atofEvents, setAtofEvents] = useState<AtofJsonLine[]>([]);
+  const [selectedAtofEventIndex, setSelectedAtofEventIndex] = useState(0);
+  const [atofEventTotal, setAtofEventTotal] = useState(0);
+  const [atofEventsHasMore, setAtofEventsHasMore] = useState(false);
+  const [atofEventsLoading, setAtofEventsLoading] = useState(false);
+  const [atofEventsLoadingMore, setAtofEventsLoadingMore] = useState(false);
+  const [atofEventsError, setAtofEventsError] = useState("");
+  const [atofEventsRefreshKey, setAtofEventsRefreshKey] = useState(0);
   const [runtimeRetentionDays, setRuntimeRetentionDays] = useState(7);
   const [logSettingsBusy, setLogSettingsBusy] = useState(false);
   const [expandedLogGroups, setExpandedLogGroups] = useState<Set<string>>(new Set());
   const [logPage, setLogPage] = useState(1);
+  const [instancePage, setInstancePage] = useState(1);
   const [importOpen, setImportOpen] = useState(false);
   const [importPath, setImportPath] = useState("");
   const [exportOpen, setExportOpen] = useState(false);
@@ -322,6 +405,8 @@ export default function App() {
   const [commentTooltip, setCommentTooltip] = useState<CommentTooltipState | null>(null);
   const commentTooltipTimer = useRef<number | null>(null);
   const latestLogSequenceRef = useRef(0);
+  const logHistoryLoadedRef = useRef(false);
+  const logHistoryLoadingRef = useRef(false);
   const initializedRef = useRef(false);
 
   const copy = translations[language];
@@ -375,17 +460,19 @@ export default function App() {
     ]);
     setInstances(nextInstances);
     setVault(nextVault);
-    setLogs(nextLogPage.entries);
+    // Refreshing instance/template data must not replace the complete history
+    // already hydrated by the log center with only the latest 500 entries.
+    setLogs((current) => mergeLogEntries(current, nextLogPage.entries));
     setLogGroupCount(nextLogPage.groupCount);
     latestLogSequenceRef.current = Math.max(0, ...nextLogPage.entries.map((entry) => logSequence(entry)));
     setSelectedConfigId((current) => nextInstances.some((instance) => instance.id === current) ? current : nextInstances[0]?.id || "");
   }, []);
 
   const refreshLatestLogs = useCallback(async () => {
-    const page = await desktopApi.listLogs({ limit: 500 });
-    setLogs(page.entries);
+    const page = await desktopApi.listLogs({ limit: 1_000 });
+    setLogs((current) => mergeLogEntries(current, page.entries));
     setLogGroupCount(page.groupCount);
-    latestLogSequenceRef.current = Math.max(0, ...page.entries.map((entry) => logSequence(entry)));
+    latestLogSequenceRef.current = Math.max(latestLogSequenceRef.current, ...page.entries.map((entry) => logSequence(entry)));
   }, []);
 
   const refreshTemplates = useCallback(async (checkCliVersion = false) => {
@@ -524,6 +611,11 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
+    if (page !== "logs") return;
+    setExpandedLogGroups(logInstance === "all" ? new Set() : new Set([logInstance]));
+  }, [logInstance, page]);
+
+  useEffect(() => {
     setLogPage(1);
   }, [logCategory, logInstance]);
 
@@ -556,11 +648,38 @@ export default function App() {
         polling = false;
       }
     };
-    void pollLogs();
-    const timer = window.setInterval(() => void pollLogs(), 2_000);
+    let timer: number | null = null;
+    const hydrateHistory = async () => {
+      if (logHistoryLoadedRef.current || logHistoryLoadingRef.current) return;
+      logHistoryLoadingRef.current = true;
+      try {
+        const history = await desktopApi.listAllLogs();
+        if (!active) return;
+        startTransition(() => {
+          setLogs(history.entries);
+          setLogGroupCount(history.groupCount);
+        });
+        latestLogSequenceRef.current = Math.max(0, ...history.entries.map((entry) => logSequence(entry)));
+        logHistoryLoadedRef.current = true;
+      } catch {
+        // Keep the recent log view if historical hydration is interrupted.
+      } finally {
+        logHistoryLoadingRef.current = false;
+      }
+    };
+    const hydrateAndPoll = () => {
+      // Let the log page paint its recent entries before parsing/grouping the
+      // full history. This prevents a large store from blocking navigation.
+      const frame = window.requestAnimationFrame(() => void hydrateHistory());
+      void pollLogs();
+      timer = window.setInterval(() => void pollLogs(), 5_000);
+      return () => window.cancelAnimationFrame(frame);
+    };
+    const cancelInitialHydration = hydrateAndPoll();
     return () => {
       active = false;
-      window.clearInterval(timer);
+      cancelInitialHydration();
+      if (timer !== null) window.clearInterval(timer);
     };
   }, [page]);
 
@@ -573,16 +692,34 @@ export default function App() {
     return ep?.url?.replace(/\/+$/, "") ?? null;
   }, []);
 
-  // ── Helper: load one trace page (ATOF first; Phoenix GraphQL fallback when empty) ──
+  // ── Helpers: ATOF provides the stable timeline; Phoenix is the fallback. ──
   const fetchTracePage = async (instance: InstanceRecord, page: number, limit: number) => {
     let result = await desktopApi.listAtofTraces(instance.workDir, page, limit);
-    if (result.entries.length === 0 && result.total === 0) {
-      const pUrl = phoenixUrlFor(instance);
-      if (pUrl) {
-        try { result = await desktopApi.queryPhoenixTraces(pUrl, instance.name, page, limit); } catch { /* keep ATOF empty result */ }
+    if (result.entries.length > 0 || result.total > 0) return result;
+    const pUrl = phoenixUrlFor(instance);
+    if (pUrl) {
+      try {
+        return await desktopApi.queryPhoenixTraces(pUrl, instance.name, page, limit);
+      } catch {
+        // Keep Trace center usable while Phoenix is still starting.
       }
     }
     return result;
+  };
+
+  const fetchTraceDetail = async (instance: InstanceRecord, traceId: string) => {
+    const atofDetail = await desktopApi.getAtofTraceDetail(instance.workDir, traceId);
+    if (atofDetail) return atofDetail;
+    const pUrl = phoenixUrlFor(instance);
+    if (pUrl) {
+      try {
+        const detail = await desktopApi.queryPhoenixTraceDetail(pUrl, traceId);
+        if (detail) return detail;
+      } catch {
+        // Fall through to the local ATOF detail.
+      }
+    }
+    return null;
   };
 
   // ── Trace center data ──
@@ -609,30 +746,99 @@ export default function App() {
     return () => { active = false; window.clearInterval(timer); };
   }, [page, traceInstanceId, instances, traceDetailView, tracePage]);
 
-  // ── Trace panel data (ATOF first; Phoenix fallback when no local data) ──
   const phoenixBaseUrl = useMemo(() => phoenixUrlFor(detailInstance), [detailInstance, phoenixUrlFor]);
+  const detailHasPhoenixTraceCenter = Boolean(phoenixBaseUrl);
+  const detailHasAtofTab = hasNemoRelayCapability(detailInstance);
+  const detailAtofSourceRelativePath = useMemo(
+    () => detailInstance?.workDir ? atofSourceRelativePath() : "",
+    [detailInstance?.workDir],
+  );
 
   useEffect(() => {
-    if (!detailInstance) return;
+    if (!detailInstance || !detailHasPhoenixTraceCenter || detailTab !== "trace-center") {
+      setTraceCenterSummaries([]);
+      setTraceCenterTotal(0);
+      setTraceCenterLoading(false);
+      return;
+    }
     const isRunning = detailInstance.status === "running";
     if (!detailInstance.workDir || !isRunning) {
-      setTracePanelSummaries([]);
+      setTraceCenterSummaries([]);
+      setTraceCenterTotal(0);
+      setTraceCenterLoading(false);
       return;
     }
     let active = true;
-    setTracePanelLoading(true);
+    setTraceCenterLoading(true);
     (async () => {
       try {
-        const result = await fetchTracePage(detailInstance, 1, 50);
-        if (active) { setTracePanelSummaries(result.entries); setTracePanelLoading(false); }
-      } catch (err) { console.error(err); notify(errorMessage(err)); if (active) { setTracePanelSummaries([]); setTracePanelLoading(false); } }
+        const result = await fetchTracePage(detailInstance, traceCenterPage, TRACE_CENTER_PER_PAGE);
+        if (active) { setTraceCenterSummaries(result.entries); setTraceCenterTotal(result.total); setTraceCenterLoading(false); }
+      } catch (err) { console.error(err); notify(errorMessage(err)); if (active) { setTraceCenterSummaries([]); setTraceCenterTotal(0); setTraceCenterLoading(false); } }
     })();
     return () => { active = false; };
-  }, [detailInstance?.id, detailInstance?.workDir, detailInstance?.status, tracePanelRefreshKey]);
+  }, [detailHasPhoenixTraceCenter, detailInstance?.id, detailInstance?.status, detailInstance?.workDir, detailTab, notify, traceCenterPage, traceCenterRefreshKey]);
 
   useEffect(() => {
-    if (!detailInstance) setDetailTab("entry");
-  }, [detailInstance]);
+    if (!detailInstance || !detailHasAtofTab || detailTab !== "atof" || !detailInstance.workDir) {
+      setAtofEvents([]);
+      setSelectedAtofEventIndex(0);
+      setAtofEventTotal(0);
+      setAtofEventsHasMore(false);
+      setAtofEventsLoading(false);
+      setAtofEventsLoadingMore(false);
+      setAtofEventsError("");
+      return;
+    }
+    let active = true;
+    setAtofEventsLoading(true);
+    setAtofEventsError("");
+    desktopApi.readAtofEvents(detailInstance.workDir, ATOF_EVENTS_PAGE_SIZE, 0)
+      .then((result) => {
+        if (!active) return;
+        setAtofEvents(result.entries);
+        setAtofEventTotal(result.total);
+        setAtofEventsHasMore(result.hasMore);
+        setSelectedAtofEventIndex(0);
+      })
+      .catch((error) => {
+        if (!active) return;
+        setAtofEvents([]);
+        setAtofEventsError(errorMessage(error));
+      })
+      .finally(() => { if (active) setAtofEventsLoading(false); });
+    return () => { active = false; };
+  }, [atofEventsRefreshKey, detailHasAtofTab, detailInstance?.id, detailInstance?.workDir, detailTab]);
+
+  const loadMoreAtofEvents = async () => {
+    if (!detailInstance?.workDir || !atofEventsHasMore || atofEventsLoading || atofEventsLoadingMore) return;
+    setAtofEventsLoadingMore(true);
+    try {
+      const result = await desktopApi.readAtofEvents(detailInstance.workDir, ATOF_EVENTS_PAGE_SIZE, atofEvents.length);
+      setAtofEvents((current) => [...current, ...result.entries]);
+      setAtofEventTotal(result.total);
+      setAtofEventsHasMore(result.hasMore);
+    } catch (error) {
+      setAtofEventsError(errorMessage(error));
+    } finally {
+      setAtofEventsLoadingMore(false);
+    }
+  };
+
+  useEffect(() => {
+    setDetailTab("entry");
+    setTraceCenterPage(1);
+  }, [detailInstance?.id]);
+
+  useEffect(() => {
+    if (!detailInstance) return;
+    if (detailTab === "trace-center" && !detailHasPhoenixTraceCenter) {
+      setDetailTab(detailHasAtofTab ? "atof" : "entry");
+    }
+    if (detailTab === "atof" && !detailHasAtofTab) {
+      setDetailTab(detailHasPhoenixTraceCenter ? "trace-center" : "entry");
+    }
+  }, [detailHasAtofTab, detailHasPhoenixTraceCenter, detailInstance, detailTab]);
 
   useEffect(() => {
     setTracePage(1);
@@ -647,7 +853,7 @@ export default function App() {
     try {
       const saved = await desktopApi.saveLogSettings({ runtimeRetentionDays });
       setRuntimeRetentionDays(saved.runtimeRetentionDays);
-      const page = await desktopApi.listLogs({ limit: 500 });
+      const page = await desktopApi.listAllLogs();
       setLogs(page.entries);
       setLogGroupCount(page.groupCount);
       latestLogSequenceRef.current = Math.max(0, ...page.entries.map((entry) => logSequence(entry)));
@@ -811,25 +1017,33 @@ export default function App() {
     );
   }, [instances, search]);
 
+  const totalInstancePages = Math.max(1, Math.ceil(filteredInstances.length / INSTANCES_PER_PAGE));
+  const currentInstancePage = Math.min(instancePage, totalInstancePages);
+  const paginatedInstances = filteredInstances.slice(
+    (currentInstancePage - 1) * INSTANCES_PER_PAGE,
+    currentInstancePage * INSTANCES_PER_PAGE,
+  );
+
   // Distinct template types (framework = first segment of the template id),
   // rendered as tabs above the template list.
   const templateFrameworks = useMemo(() => collectTemplateFrameworks(templates), [templates]);
 
   const filteredTemplates = useMemo(() => filterTemplates(templates, templateTab, search), [templates, templateTab, search]);
 
+  const deferredLogs = useDeferredValue(logs);
   const filteredLogs = useMemo(
     () =>
-      logs.filter(
+      deferredLogs.filter(
         (entry) =>
-          (logCategory === "all" || (logCategory === "runtime" ? entry.category === "runtime" : entry.category !== "runtime")) &&
+          (logCategory === "all" || entry.category === logCategory) &&
           (logInstance === "all" || entry.instanceId === logInstance),
       ),
-    [logCategory, logInstance, logs],
+    [deferredLogs, logCategory, logInstance],
   );
 
-  const logGroups = useMemo(() => {
+  const buildLogGroups = (entries: LogEntry[]) => {
     const grouped = new Map<string, LogEntry[]>();
-    for (const entry of filteredLogs) {
+    for (const entry of entries) {
       const key = entry.instanceId || `name:${entry.instanceName}`;
       const current = grouped.get(key) || [];
       current.push(entry);
@@ -851,14 +1065,16 @@ export default function App() {
         startedAt: Math.min(...entries.map((entry) => entry.createdAt)),
         failed: latestEntry?.level === "error",
         deleted,
-        categories: Array.from(new Set(entries.map((entry) => entry.category === "runtime" ? "runtime" : "install"))),
+        categories: Array.from(new Set(entries.map((entry) => entry.category))),
       };
     }).sort((a, b) => {
       const instanceA = instances.find((i) => i.id === a.id) || instances.find((i) => i.name === a.instanceName);
       const instanceB = instances.find((i) => i.id === b.id) || instances.find((i) => i.name === b.instanceName);
       return (instanceB?.createdAt || 0) - (instanceA?.createdAt || 0);
     });
-  }, [filteredLogs, instances]);
+  };
+
+  const logGroups = useMemo(() => buildLogGroups(filteredLogs), [filteredLogs, instances]);
 
   const totalLogPages = Math.max(1, Math.ceil(logGroups.length / LOGS_PER_PAGE));
   const currentLogPage = Math.min(logPage, totalLogPages);
@@ -867,6 +1083,7 @@ export default function App() {
     currentLogPage * LOGS_PER_PAGE,
   );
 
+  // Keep the sidebar badge aligned with the rows shown in the unfiltered log view.
   const lifecycleCount = logGroupCount;
 
   const statusLabel = (status: string) => {
@@ -1301,6 +1518,11 @@ export default function App() {
     : [];
   const primaryEndpoint = detailEndpoints.find((endpoint) => endpoint.primary && endpoint.kind === "web");
   const integrationEndpoints = detailEndpoints.filter((endpoint) => endpoint !== primaryEndpoint);
+  const observationEndpoints = detailEndpoints.filter((endpoint) => {
+    if (endpoint.kind !== "web") return false;
+    const fingerprint = `${endpoint.name} ${endpoint.label} ${endpoint.url}`.toLowerCase();
+    return /phoenix|langsmith|langfuse|arize|helicone|observability|trace|6006/.test(fingerprint);
+  });
   const detailIsRunning = detailInstance?.status === "running";
   const detailIsReady = detailInstance?.status === "ready-to-install";
   const managedNodeRequired = cliStatus ? !cliStatus.nodeCompatible || !cliStatus.npmCompatible : false;
@@ -1472,7 +1694,7 @@ export default function App() {
               <div className="section-heading instance-section-heading"><div><h2>{tr("instances")}</h2><p>{tr("instancesDesc")}</p></div><button className="button secondary" type="button" onClick={() => setPage("templates")}><Plus />{tr("createInstance")}</button></div>
               {instanceActionError && <div className="instance-action-warning"><CircleAlert /><span>{instanceActionError}</span></div>}
               <div className="table-head instance-grid"><span>{tr("instance")}</span><span>{tr("status")}</span><span>{tr("deployment")}</span><span>{tr("workDir")}</span><span>{tr("note")}</span><span>{tr("actions")}</span></div>
-              {filteredInstances.length ? filteredInstances.map((instance) => (
+              {filteredInstances.length ? paginatedInstances.map((instance) => (
                 <div className="table-row instance-grid" key={instance.id}>
                   <button className="instance-name" type="button" onClick={() => setDetailInstance(instance)}><span><strong>{instance.name}</strong><small>{instance.templateId}</small></span></button>
                   <span><span className={`status ${statusTone(instance.status)}`}><i />{statusLabel(instance.status)}</span></span>
@@ -1488,6 +1710,7 @@ export default function App() {
                   </div>
                 </div>
               )) : <div className="empty-state"><Boxes /><strong>{tr("noInstances")}</strong><span>{tr("noInstancesHint")}</span><button className="button primary" type="button" onClick={() => setPage("templates")}><Plus />{tr("createInstance")}</button></div>}
+              <PaginationControls language={language} page={currentInstancePage} total={filteredInstances.length} pageSize={INSTANCES_PER_PAGE} onPageChange={setInstancePage} className="instance-pagination" />
             </div>
           )}
 
@@ -1547,14 +1770,14 @@ export default function App() {
             <div className="logs-page surface">
               <div className="log-toolbar">
                 <div className="segmented compact">
-                  {(["all", "install", "runtime"] as const).map((category) => <button className={logCategory === category ? "active" : ""} onClick={() => setLogCategory(category)} type="button" key={category}>{category === "all" ? tr("all") : tr(category === "install" ? "installLog" : "runtimeLog")}</button>)}
+                  {(["all", "lifecycle", "runtime"] as const).map((category) => <button className={logCategory === category ? "active" : ""} onClick={() => setLogCategory(category)} type="button" key={category}>{category === "all" ? tr("all") : tr(category === "lifecycle" ? "lifecycleLog" : "runtimeLog")}</button>)}
                 </div>
                 <div className="log-toolbar-actions">
                   {logCategory === "runtime" && <label className="retention-control"><span>{tr("runtimeRetention")}</span><input type="number" min="1" max="3650" value={runtimeRetentionDays} onChange={(event) => setRuntimeRetentionDays(Number(event.target.value))} /><span>{tr("days")}</span><button className="button secondary" disabled={logSettingsBusy || runtimeRetentionDays < 1 || runtimeRetentionDays > 3650} onClick={() => void saveRuntimeLogRetention()} type="button">{logSettingsBusy ? <LoaderCircle className="spin" /> : <Check />}{tr("save")}</button></label>}
                   <label className="select-field compact-select"><select value={logInstance} onChange={(event) => setLogInstance(event.target.value)}><option value="all">{tr("all")}</option>{instances.map((instance) => <option value={instance.id} key={instance.id}>{instance.name}</option>)}</select><ChevronDown /></label>
                 </div>
               </div>
-              <div className={`log-head lifecycle-grid ${logCategory !== "all" ? "without-type" : ""}`}><span>{tr("time")}</span><span>{tr("instance")}</span>{logCategory === "all" && <span>{tr("lifecycle")}</span>}<span>{tr("status")}</span><span>{tr("latestEvent")}</span><span /></div>
+              <div className={`log-head lifecycle-grid ${logCategory !== "all" ? "without-type" : ""}`}><span>{tr("time")}</span><span>{tr("instance")}</span>{logCategory === "all" && <span>{tr("lifecycle")}</span>}<span>{tr("status")}</span><span>{logCategory === "runtime" ? tr("latestLog") : tr("latestEvent")}</span><span /></div>
               <div className="log-list lifecycle-list">
                 {paginatedLogGroups.map((group) => {
                   const expanded = expandedLogGroups.has(group.id);
@@ -1566,8 +1789,8 @@ export default function App() {
                   return <section className={`lifecycle-group ${expanded ? "expanded" : ""}`} key={group.id}>
                     <button className={`lifecycle-summary lifecycle-grid ${logCategory !== "all" ? "without-type" : ""}`} type="button" onClick={() => setExpandedLogGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })}>
                       <time>{formatTime(group.startedAt, language)}</time>
-                      <span className="lifecycle-instance"><strong>{group.instanceName}</strong><small>{group.entries.length} {tr("lifecycleSteps")}</small></span>
-                      {logCategory === "all" && <span className="lifecycle-categories">{group.categories.map((category) => <i key={category}>{tr(category === "runtime" ? "runtimeLog" : "installLog")}</i>)}</span>}
+                      <span className="lifecycle-instance"><strong>{group.instanceName}</strong><small>{group.entries.length} {group.entries.every((entry) => entry.category === "runtime") ? tr("logEntries") : group.entries.every((entry) => entry.category === "lifecycle") ? tr("lifecycleSteps") : tr("logRecords")}</small></span>
+                      {logCategory === "all" && <span className="lifecycle-categories">{group.categories.map((category) => <i key={category}>{tr(category === "runtime" ? "runtimeLog" : "lifecycleLog")}</i>)}</span>}
                       <span className={`log-level ${lifecycleTone}`}>{lifecycleLabel}</span>
                       <span className="lifecycle-latest">{cleanLogText(group.entries[0]?.message || "")}</span>
                       <span className="lifecycle-toggle" aria-label={expanded ? tr("collapseDetails") : tr("expandDetails")}><ChevronDown /></span>
@@ -1577,14 +1800,7 @@ export default function App() {
                 })}
                 {!logGroups.length && <div className="empty-state small"><FileText /><span>{tr("noLogs")}</span></div>}
               </div>
-              {logGroups.length > 0 && (
-                <div className="log-pagination">
-                  <span className="log-pagination-count">{logGroups.length} {tr("logGroupsLabel")}</span>
-                  <button className="button secondary compact" disabled={currentLogPage <= 1} onClick={() => setLogPage(currentLogPage - 1)} type="button"><ChevronLeft /></button>
-                  <span className="log-pagination-info">{currentLogPage} / {totalLogPages}</span>
-                  <button className="button secondary compact" disabled={currentLogPage >= totalLogPages} onClick={() => setLogPage(currentLogPage + 1)} type="button"><ChevronRight /></button>
-                </div>
-              )}
+              <PaginationControls language={language} page={currentLogPage} total={logGroups.length} pageSize={LOGS_PER_PAGE} onPageChange={setLogPage} />
             </div>
           )}
 
@@ -1595,7 +1811,7 @@ export default function App() {
               <div className="log-toolbar">
                 <h2>{tr("traces")}</h2>
               </div>
-              {!traceInstanceId ? <div className="empty-state"><Orbit /><strong>{tr("openTraces")}</strong><span>{tr("selectTraceHint")}</span></div> : traceLoading ? <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div> : traceSummaries.length === 0 ? <div className="empty-state small"><CircleAlert /><span>{tr("noTraces")}</span><span>{tr("noTracesHint")}</span></div> : <><div className="trace-list-page"><div className="trace-table-head"><span>{tr("traceId")}</span><span>{tr("traceStatus")}</span><span>{tr("kind")}</span><span>{tr("traceTabInput")}</span><span>{tr("traceTabOutput")}</span><span>{tr("startTime")}</span><span>{tr("traceLatency")}</span></div>{traceSummaries.map((t) => { const tone = t.status === "ERROR" ? "error" : "success"; const latency = t.latencyMs != null ? t.latencyMs >= 1000 ? `${(t.latencyMs / 1000).toFixed(1)}s` : `${t.latencyMs}ms` : "—"; return (<button className="trace-table-row" key={t.traceId} type="button" onClick={() => { setTraceLoading(true); const inst = instances.find((i) => i.id === traceInstanceId); if (inst) { desktopApi.getAtofTraceDetail(inst.workDir, t.traceId).then((d) => { if (d) { setTraceDetailView(d); setSelectedSpanId(null); return; } const pUrl = phoenixUrlFor(inst); if (pUrl) { return desktopApi.queryPhoenixTraceDetail(pUrl, t.traceId).then((pd) => { setTraceDetailView(pd); setSelectedSpanId(null); }); } }).catch(() => notify(tr("traceDetailLoadFailed"))).finally(() => setTraceLoading(false)); } }}><span className="trace-id-cell" title={t.traceId}>{t.traceId.slice(0, 12)}</span><span className={`status ${tone}`}><i />{t.status}</span><span className="trace-kind-badge">{t.kind}</span><span className="trace-io-cell" title={t.inputSummary ?? ""}>{t.inputSummary ?? "—"}</span><span className="trace-io-cell" title={t.outputSummary ?? ""}>{t.outputSummary ?? "—"}</span><span>{t.startTime ? String(t.startTime).slice(0, 19) : "—"}</span><span>{latency}</span></button>); })}</div>{(() => { const totalTracePages = Math.max(1, Math.ceil(traceTotal / TRACES_PER_PAGE)); return traceTotal > TRACES_PER_PAGE ? <div className="log-pagination"><span className="log-pagination-count">{traceTotal} traces</span><button className="button secondary compact" disabled={tracePage <= 1} onClick={() => setTracePage((p) => p - 1)} type="button"><ChevronLeft /></button><span className="log-pagination-info">{tracePage} / {totalTracePages}</span><button className="button secondary compact" disabled={tracePage >= totalTracePages} onClick={() => setTracePage((p) => p + 1)} type="button"><ChevronRight /></button></div> : null; })()}</>}
+              {!traceInstanceId ? <div className="empty-state"><Orbit /><strong>{tr("openTraces")}</strong><span>{tr("selectTraceHint")}</span></div> : traceLoading ? <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div> : traceSummaries.length === 0 ? <div className="empty-state small"><CircleAlert /><span>{tr("noTraces")}</span><span>{tr("noTracesHint")}</span></div> : <><div className="trace-list-page"><div className="trace-table-head"><span>{tr("traceId")}</span><span>{tr("traceStatus")}</span><span>{tr("kind")}</span><span>{tr("traceTabInput")}</span><span>{tr("traceTabOutput")}</span><span>{tr("startTime")}</span><span>{tr("traceLatency")}</span></div>{traceSummaries.map((t) => { const tone = t.status === "ERROR" ? "error" : "success"; const latency = t.latencyMs != null ? t.latencyMs >= 1000 ? `${(t.latencyMs / 1000).toFixed(1)}s` : `${t.latencyMs}ms` : "—"; return (<button className="trace-table-row" key={t.traceId} type="button" onClick={() => { setTraceLoading(true); const inst = instances.find((i) => i.id === traceInstanceId); if (inst) { desktopApi.getAtofTraceDetail(inst.workDir, t.traceId).then((d) => { if (d) { setTraceDetailView(d); setSelectedSpanId(null); return; } const pUrl = phoenixUrlFor(inst); if (pUrl) { return desktopApi.queryPhoenixTraceDetail(pUrl, t.traceId).then((pd) => { setTraceDetailView(pd); setSelectedSpanId(null); }); } }).catch(() => notify(tr("traceDetailLoadFailed"))).finally(() => setTraceLoading(false)); } }}><span className="trace-id-cell" title={t.traceId}>{t.traceId.slice(0, 12)}</span><span className={`status ${tone}`}><i />{t.status}</span><span className="trace-kind-badge">{t.kind}</span><span className="trace-io-cell" title={t.inputSummary ?? ""}>{t.inputSummary ?? "—"}</span><span className="trace-io-cell" title={t.outputSummary ?? ""}>{t.outputSummary ?? "—"}</span><span>{t.startTime ? String(t.startTime).slice(0, 19) : "—"}</span><span>{latency}</span></button>); })}</div><PaginationControls language={language} page={tracePage} total={traceTotal} pageSize={TRACES_PER_PAGE} onPageChange={setTracePage} className="trace-pagination" /></>}
                 </>
               ) : (
                 <TraceDetailPanel detail={traceDetailView!} onBack={() => { setTraceDetailView(null); setSelectedSpanId(null); }} selectedSpanId={selectedSpanId} onSelectSpan={setSelectedSpanId} tr={tr} language={language} />
@@ -1648,55 +1864,51 @@ export default function App() {
         <div className="modal-backdrop align-right" onMouseDown={(event) => event.currentTarget === event.target && setDetailInstance(null)}>
           <aside className="detail-drawer">
             <div className="modal-head"><div><span className="eyebrow">{detailInstance.templateId}</span><h2>{detailInstance.name}</h2></div><button className="icon-button" onClick={() => setDetailInstance(null)} type="button"><X /></button></div>
-            <div className="detail-body">
-              <div className="detail-status"><span className={`status ${statusTone(detailInstance.status)}`}><i />{statusLabel(detailInstance.status)}</span><span>{detailInstance.deploymentMode === "docker" ? tr("docker") : tr("local")}</span></div>
+            <div className="detail-body instance-detail-body">
               {detailIsReady && <div className="deploy-ready-notice"><CircleAlert /><div><strong>{tr("deployReadyTitle")}</strong><p>{tr("deployReadyHint")}</p></div></div>}
               <section className="detail-overview"><h3>{tr("detail")}</h3><dl><dt>{tr("projectName")}</dt><dd>{detailInstance.projectName || detailInstance.name}</dd><dt>{tr("template")}</dt><dd><code>{detailInstance.templateId}</code></dd><dt>{tr("workDir")}</dt><dd><code title={detailInstance.workDir}>{detailInstance.workDir}</code></dd><dt>{tr("lifecycleVersion")}</dt><dd>V{detailInstance.lifecycleVersion || 1}</dd><dt>{tr("note")}</dt><dd>{detailInstance.note || "—"}</dd></dl></section>
               {/* ── Tab Switcher ── */}
               <div className="detail-tabs">
                 <button className={`detail-tab ${detailTab === "entry" ? "active" : ""}`} onClick={() => setDetailTab("entry")} type="button">{tr("applicationEntry")}</button>
-                <button className={`detail-tab ${detailTab === "trace" ? "active" : ""}`} onClick={() => { setDetailTab("trace"); setTracePanelRefreshKey((key) => key + 1); }} type="button">{tr("traces")}{tracePanelSummaries.length > 0 && <span className="detail-tab-badge">{tracePanelSummaries.length}</span>}</button>
+                {detailHasPhoenixTraceCenter && <button className={`detail-tab ${detailTab === "trace-center" ? "active" : ""}`} onClick={() => { setTraceCenterPage(1); setDetailTab("trace-center"); setTraceCenterRefreshKey((key) => key + 1); }} type="button">{tr("traces")}{traceCenterTotal > 0 && <span className="detail-tab-badge">{traceCenterTotal}</span>}</button>}
+                {detailHasAtofTab && <button className={`detail-tab ${detailTab === "atof" ? "active" : ""}`} onClick={() => setDetailTab("atof")} type="button">{tr("atofTab")}</button>}
               </div>
 
               {/* ── Tab: Application entry ── */}
               {detailTab === "entry" && (
                 <>
-                  <section className="application-section"><h3>{tr("applicationEntry")}</h3>{primaryEndpoint ? <div className={`application-entry ${!detailIsRunning ? "inactive" : ""}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{primaryEndpoint.label}</span><strong>{primaryEndpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(primaryEndpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(primaryEndpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("openApplication")}</button></div></div> : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
+                  <section className="application-section"><h3>{tr("webEntry")}</h3>{primaryEndpoint ? <div className={`application-entry ${!detailIsRunning ? "inactive" : ""}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{primaryEndpoint.label}</span><strong>{primaryEndpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(primaryEndpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(primaryEndpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("openApplication")}</button></div></div> : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
                   {integrationEndpoints.length > 0 && <section><h3>{tr("integrationEndpoints")}</h3>{integrationEndpoints.map((endpoint) => <div className={`endpoint ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div>{endpoint.kind === "web" && <button className="icon-button" disabled={!detailIsRunning} title={tr("openAddress")} aria-label={tr("openAddress")} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink /></button>}</div>)}</section>}
                 </>
               )}
 
-              {/* ── Tab: Trace list ── */}
-              {detailTab === "trace" && (
+              {/* ── Tab: Trace center ── */}
+              {detailTab === "trace-center" && (
                 <>
-                  {tracePanelLoading ? (
+                  {traceCenterLoading ? (
                     <div className="inline-loading"><LoaderCircle className="spin" />{tr("loading")}</div>
-                  ) : tracePanelSummaries.length === 0 ? (
+                  ) : traceCenterSummaries.length === 0 ? (
                     <div className="empty-state small"><CircleAlert /><span>{tr("noTraces")}</span><span>{tr("noTracesHint")}</span></div>
                   ) : (
-                    <div className="trace-list-page">
+                    <div className="detail-trace-content">
+                      <div className="trace-list-page">
                       <div className="trace-table-head"><span>{tr("traceId")}</span><span>{tr("traceStatus")}</span><span>{tr("kind")}</span><span>{tr("traceTabInput")}</span><span>{tr("traceTabOutput")}</span><span>{tr("startTime")}</span><span>{tr("traceLatency")}</span></div>
-                      {tracePanelSummaries.map((t) => {
+                      {traceCenterSummaries.map((t) => {
                         const tone = t.status === "ERROR" ? "error" : "success";
                         const latency = t.latencyMs != null ? t.latencyMs >= 1000 ? `${(t.latencyMs / 1000).toFixed(1)}s` : `${t.latencyMs}ms` : "—";
                         return (
                           <button className="trace-table-row" key={t.traceId} type="button" onClick={() => {
-                            setTracePanelLoading(true);
-                            desktopApi.getAtofTraceDetail(detailInstance.workDir, t.traceId)
+                            setTraceCenterLoading(true);
+                            fetchTraceDetail(detailInstance, t.traceId)
                               .then((d) => {
-                                if (d) { setTracePanelDetail(d); setTracePanelSelectedSpanId(null); setTracePanelOpen(true); return; }
-                                const pUrl = phoenixUrlFor(detailInstance);
-                                if (pUrl) {
-                                  return desktopApi.queryPhoenixTraceDetail(pUrl, t.traceId)
-                                    .then((pd) => { setTracePanelDetail(pd); setTracePanelSelectedSpanId(null); setTracePanelOpen(true); });
-                                }
+                                if (d) { setTracePanelDetail(d); setTracePanelSelectedSpanId(null); setTracePanelOpen(true); }
                               })
                               .catch(() => notify(tr("traceDetailLoadFailed")))
-                              .finally(() => setTracePanelLoading(false));
+                              .finally(() => setTraceCenterLoading(false));
                           }}>
                             <span className="trace-id-cell" title={t.traceId}>{t.traceId.slice(0, 12)}</span>
                             <span className={`status ${tone}`}><i />{t.status}</span>
-                            <span className="trace-kind-badge">{t.kind}</span>
+                            <span className="trace-kind-badge">{spanKindLabel(t.kind)}</span>
                             <span className="trace-io-cell" title={t.inputSummary ?? ""}>{t.inputSummary ?? "—"}</span>
                             <span className="trace-io-cell" title={t.outputSummary ?? ""}>{t.outputSummary ?? "—"}</span>
                             <span>{t.startTime ? String(t.startTime).slice(0, 19) : "—"}</span>
@@ -1704,12 +1916,76 @@ export default function App() {
                           </button>
                         );
                       })}
+                      </div>
+                      <PaginationControls language={language} page={traceCenterPage} total={traceCenterTotal} pageSize={TRACE_CENTER_PER_PAGE} onPageChange={setTraceCenterPage} disabled={traceCenterLoading} className="detail-trace-pagination" />
                     </div>
                   )}
                 </>
               )}
+
+              {/* ── Tab: ATOF source ── */}
+              {detailTab === "atof" && (
+                <section className="atof-source-panel">
+                  <div className="atof-source-content">
+                    <div className="atof-source-field">
+                      <div className="atof-source-field-header">
+                        <span>{tr("atofPathLabel")}</span>
+                        <button className="icon-button compact" type="button" onClick={() => { void navigator.clipboard.writeText(detailAtofSourceRelativePath); notify(tr("copied")); }} title={tr("copyAddress")} aria-label={tr("copyAddress")}><Copy /></button>
+                      </div>
+                      <code title={detailAtofSourceRelativePath || tr("unavailable")}>{detailAtofSourceRelativePath || tr("unavailable")}</code>
+                    </div>
+                  </div>
+                  <div className="atof-events-viewer">
+                    <div className="atof-viewer-header">
+                      <div>
+                        <strong>{tr("atofEventsTitle")}</strong>
+                        <small>{atofEventTotal > 0 ? `${atofEvents.length}/${atofEventTotal} ${tr("atofEventsLoaded")}` : tr("atofEventsHint")}</small>
+                      </div>
+                      <button className="icon-button compact" type="button" onClick={() => setAtofEventsRefreshKey((key) => key + 1)} title={tr("refresh")} aria-label={tr("refresh")} disabled={atofEventsLoading}>
+                        <RefreshCw className={atofEventsLoading ? "spin" : ""} />
+                      </button>
+                    </div>
+                    {atofEventsLoading ? (
+                      <div className="inline-loading atof-viewer-loading"><LoaderCircle className="spin" />{tr("loading")}</div>
+                    ) : atofEventsError ? (
+                      <div className="atof-viewer-empty"><CircleAlert /><span>{tr("atofEventsLoadFailed")}</span><small>{atofEventsError}</small></div>
+                    ) : atofEvents.length === 0 ? (
+                      <div className="atof-viewer-empty"><FileText /><span>{tr("atofNoEvents")}</span></div>
+                    ) : (
+                      <div className="atof-viewer-grid">
+                        <div className="atof-event-list" onScroll={(event) => {
+                          const list = event.currentTarget;
+                          if (list.scrollTop + list.clientHeight >= list.scrollHeight - 36) void loadMoreAtofEvents();
+                        }}>
+                          {atofEvents.map((entry, index) => {
+                            return (
+                              <button className={`atof-event-item ${selectedAtofEventIndex === index ? "active" : ""}`} key={entry.lineNumber} type="button" onClick={() => setSelectedAtofEventIndex(index)}>
+                                <span className="atof-event-index">L{entry.lineNumber}</span>
+                                <code className="atof-event-raw-preview">{entry.raw}</code>
+                              </button>
+                            );
+                          })}
+                          {atofEventsLoadingMore && <div className="atof-events-loading-more"><LoaderCircle className="spin" />{tr("atofEventsLoadingMore")}</div>}
+                        </div>
+                        <div className="atof-event-json">
+                          {(() => {
+                            const selected = atofEvents[selectedAtofEventIndex];
+                            const formatted = selected ? parseAtofJson(selected.raw) : null;
+                            return formatted ? <JsonView value={formatted} keyName={`line_${selected?.lineNumber || 1}`} collapsed={1} displayObjectSize enableClipboard shortenTextAfterLength={180} /> : <pre className="atof-event-raw">{selected?.raw || tr("unavailable")}</pre>;
+                          })()}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
             </div>
-            <div className="drawer-foot">{detailTab === "trace" && phoenixBaseUrl ? <div className="drawer-foot-phoenix"><div className="phoenix-foot-left"><span className="phoenix-foot-subtitle">{tr("phoenixSubtitle")}</span></div><button className="phoenix-foot-btn" onClick={() => { void desktopApi.openExternalUrl(phoenixBaseUrl).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("phoenixDashboard")}</button></div> : <><button className="button secondary" onClick={() => { setSelectedConfigId(detailInstance.id); setConfigTab("instance"); setPage("config"); setDetailInstance(null); }} type="button"><FileKey />{tr("editConfig")}</button>{detailIsReady ? <button className="button primary" onClick={() => void continueReadyInstance(detailInstance)} type="button"><SquareTerminal />{tr("continueDeploy")}</button> : <button className="button primary" onClick={() => { setLogInstance(detailInstance.id); setPage("logs"); setDetailInstance(null); }} type="button"><FileText />{tr("openLogs")}</button>}</>}</div>
+            <div className="drawer-foot">
+              {(detailTab === "trace-center" || detailTab === "atof") && observationEndpoints.length > 0 ? observationEndpoints.map((endpoint) => {
+                const isPhoenix = endpoint.name.toLowerCase().includes("phoenix") || endpoint.url.includes(":6006");
+                return <button className="phoenix-foot-btn observability-foot-btn" key={`${endpoint.name}-${endpoint.url}`} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{isPhoenix ? tr("phoenixDashboard") : endpoint.label || endpoint.name}</button>;
+              }) : <><button className="button secondary" onClick={() => { setSelectedConfigId(detailInstance.id); setConfigTab("instance"); setPage("config"); setDetailInstance(null); }} type="button"><FileKey />{tr("editConfig")}</button>{detailIsReady ? <button className="button primary" onClick={() => void continueReadyInstance(detailInstance)} type="button"><SquareTerminal />{tr("continueDeploy")}</button> : <button className="button primary" onClick={() => { setLogInstance(detailInstance.id); setPage("logs"); setDetailInstance(null); }} type="button"><FileText />{tr("openLogs")}</button>}</>}
+            </div>
           </aside>
         </div>
       )}
@@ -1921,6 +2197,40 @@ function TraceDetailPanel({
   tr: (key: TranslationKey) => string;
   language: Language;
 }) {
+  const [treePanelWidth, setTreePanelWidth] = useState(280);
+  const [treePanelResizing, setTreePanelResizing] = useState(false);
+  const treePanelResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    if (!treePanelResizing) return;
+    const onMouseMove = (event: MouseEvent) => {
+      const resize = treePanelResizeRef.current;
+      if (!resize) return;
+      const nextWidth = resize.startWidth + event.clientX - resize.startX;
+      setTreePanelWidth(Math.max(220, Math.min(520, nextWidth)));
+    };
+    const onMouseUp = () => {
+      treePanelResizeRef.current = null;
+      setTreePanelResizing(false);
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [treePanelResizing]);
+
+  const startTreePanelResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    treePanelResizeRef.current = { startX: event.clientX, startWidth: treePanelWidth };
+    setTreePanelResizing(true);
+  };
+
   const selectedSpan = selectedSpanId
     ? findSpanById(detail.spans, selectedSpanId)
     : detail.spans[0] ?? null;
@@ -1930,6 +2240,7 @@ function TraceDetailPanel({
       ? `${(detail.latencyMs / 1000).toFixed(1)}s`
       : `${detail.latencyMs}ms`
     : "—";
+  const spanCount = countSpanNodes(detail.spans);
 
   return (
     <div className="trace-detail">
@@ -1940,14 +2251,14 @@ function TraceDetailPanel({
           <code className="trace-detail-id">{detail.traceId.slice(0, 16)}…</code>
           <span className={`status ${detail.status === "ERROR" ? "error" : "success"}`}><i />{detail.status}</span>
           <span className="trace-detail-stat">{tr("traceLatency")} <strong>{latency}</strong></span>
-          <span className="trace-detail-stat">{tr("traceSpans")} <strong>{detail.spans.length}</strong></span>
+          <span className="trace-detail-stat">{tr("traceSpans")} <strong>{spanCount}</strong></span>
         </div>
       </div>
 
       {/* Three-pane body */}
       <div className="trace-detail-body">
         {/* Left: Span tree */}
-        <aside className="trace-tree-panel">
+        <aside className="trace-tree-panel" style={{ width: treePanelWidth }}>
           <h3 className="trace-pane-title">{tr("traceSpans")}</h3>
           <div className="trace-tree">
             {detail.spans.map((span) => (
@@ -1955,6 +2266,13 @@ function TraceDetailPanel({
             ))}
           </div>
         </aside>
+        <div
+          className={`trace-tree-resizer ${treePanelResizing ? "active" : ""}`}
+          onMouseDown={startTreePanelResize}
+          role="separator"
+          aria-label={language === "zh" ? "调整左侧导航宽度" : "Resize span navigation"}
+          aria-orientation="vertical"
+        />
 
         {/* Center: Inspector */}
         <section className="trace-inspector">
@@ -1965,7 +2283,7 @@ function TraceDetailPanel({
                 <div className="trace-inspector-meta">
                   <code>{selectedSpan.spanId.slice(0, 12)}</code>
                   <span className={`status ${selectedSpan.status === "ERROR" ? "error" : "success"}`}>{selectedSpan.status}</span>
-                  <span>{selectedSpan.kind}</span>
+                  <span>{spanKindLabel(selectedSpan.kind)}</span>
                   {selectedSpan.durationMs != null && <span>{selectedSpan.durationMs >= 1000 ? `${(selectedSpan.durationMs / 1000).toFixed(1)}s` : `${selectedSpan.durationMs}ms`}</span>}
                 </div>
               </div>
@@ -1975,7 +2293,7 @@ function TraceDetailPanel({
                   if (data == null) return null;
                   const tabKey = tab === "input" ? "traceTabInput" : tab === "output" ? "traceTabOutput" : "traceTabAttributes";
                   return (
-                    <details className="trace-inspector-section" key={tab} open={tab === "input"}>
+                    <details className="trace-inspector-section" key={tab} open={tab === "input" || tab === "output"}>
                       <summary>{tr(tabKey)}</summary>
                       <pre className="trace-json">{formatJson(data)}</pre>
                     </details>
@@ -2006,7 +2324,8 @@ function SpanTreeNode({
   const isSelected = selectedSpanId === span.spanId;
   const hasChildren = span.children.length > 0;
   const [expanded, setExpanded] = useState(true);
-  const kindIcon = span.kind === "LLM" ? "🤖" : span.kind === "TOOL" ? "🔧" : span.kind === "AGENT" ? "🧠" : span.kind === "CHAIN" ? "🔗" : "📌";
+  const kind = spanKindLabel(span.kind);
+  const KindIcon = kind === "LLM" ? Bot : kind === "TOOL" ? Wrench : kind === "CHAIN" ? Workflow : kind === "AGENT" ? Boxes : CircleDot;
 
   return (
     <div className="trace-tree-node">
@@ -2022,7 +2341,7 @@ function SpanTreeNode({
           </span>
         )}
         {!hasChildren && <span className="trace-tree-toggle" />}
-        <span className="trace-tree-icon">{kindIcon}</span>
+        <span className="trace-tree-icon"><KindIcon /></span>
         <span className="trace-tree-name">{span.name}</span>
         <span className="trace-tree-status">
           <span className={`status ${span.status === "ERROR" ? "error" : "success"}`}>{span.status}</span>
@@ -2042,6 +2361,11 @@ function SpanTreeNode({
   );
 }
 
+function spanKindLabel(kind: string): string {
+  const normalized = kind.trim().toUpperCase().replace(/^SPAN_?KIND\./, "");
+  return normalized || "UNKNOWN";
+}
+
 function findSpanById(spans: SpanNode[], id: string): SpanNode | null {
   for (const span of spans) {
     if (span.spanId === id) return span;
@@ -2051,9 +2375,22 @@ function findSpanById(spans: SpanNode[], id: string): SpanNode | null {
   return null;
 }
 
+function countSpanNodes(spans: SpanNode[]): number {
+  return spans.reduce((total, span) => total + 1 + countSpanNodes(span.children), 0);
+}
+
 function formatJson(value: unknown): string {
   if (typeof value === "string") {
     try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
   }
   try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+
+function parseAtofJson(raw: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
 }

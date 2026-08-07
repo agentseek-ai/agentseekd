@@ -122,6 +122,7 @@ pub fn run() {
             check_instance_docker_requirements,
             list_atof_traces,
             get_atof_trace_detail,
+            read_atof_events,
             query_phoenix_traces,
             query_phoenix_trace_detail_cmd,
         ])

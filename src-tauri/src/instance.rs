@@ -638,9 +638,6 @@ fn run_and_log(
         let mut output = Vec::new();
         if let Some(stdout) = stdout {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.contains("sha256:") && line.contains(" / ") && !line.contains("done") {
-                    continue;
-                }
                 stdout_state.log(
                     Some(&stdout_id),
                     &stdout_name,
@@ -662,9 +659,6 @@ fn run_and_log(
         let mut output = Vec::new();
         if let Some(stderr) = stderr {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if line.contains("sha256:") && line.contains(" / ") && !line.contains("done") {
-                    continue;
-                }
                 stderr_state.log(
                     Some(&stderr_id),
                     &stderr_name,
@@ -914,15 +908,6 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result
     }
 
     let (program, prefix) = cli_parts();
-    if let Ok(mut storage) = state.storage.lock() {
-        let _ = storage.delete_runtime_logs(&instance.id);
-    }
-    if let Ok(mut data) = state.data.lock() {
-        data.logs.retain(|log| {
-            !(log.instance_id.as_deref() == Some(instance.id.as_str())
-                && log.category == "runtime")
-        });
-    }
     let (stdout, stderr) = prepare_runtime_log_spool(state, &instance.id)?;
     let mut command = configured_command(&program);
     let environment = apply_instance_environment(&mut command, instance)?;
@@ -1114,7 +1099,7 @@ fn stop_instance_process(
 ) -> Result<Vec<StoppedProcess>, String> {
     if instance.deployment_mode == "docker" {
         let output = Command::new("docker")
-            .args(["compose", "down"])
+            .args(["compose", "down", "--remove-orphans"])
             .current_dir(&instance.work_dir)
             .output()
             .map_err(|error| format!("Failed to execute Docker Compose: {error}"))?;
@@ -1213,43 +1198,150 @@ fn docker_compose_file(project_dir: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-/// Stop and remove Docker containers associated with an instance.
-/// Runs `docker compose down` in the instance's working directory.
-/// Best-effort: returns `Ok(true)` if containers were cleaned up,
-/// `Ok(false)` if no compose file exists, or `Err` on failure (non-fatal).
-fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
-    if docker_compose_file(Path::new(work_dir)).is_none() {
-        return Ok(false);
+/// Recursively search for docker compose files up to `max_depth` levels.
+fn find_compose_files_recursive(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    if max_depth == 0 {
+        return Vec::new();
     }
-    let output = Command::new("docker")
-        .args(["compose", "down", "--remove-orphans"])
-        .current_dir(work_dir)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stopped = stdout
-                .lines()
-                .filter(|line| line.contains("Removed") || line.contains("Stopped"))
-                .count();
-            Ok(stopped > 0 || stdout.contains("Going to remove"))
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Not an error if Docker reports no containers to remove
-            if stderr.contains("no configuration file provided")
-                || stderr.contains("no containers to start")
+    let mut found = Vec::new();
+    if let Some(file) = docker_compose_file(root) {
+        found.push(file);
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && !path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
             {
-                Ok(false)
-            } else {
-                Err(format!(
-                    "docker compose down failed (exit {}): {}",
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
-                ))
+                found.extend(find_compose_files_recursive(&path, max_depth - 1));
             }
         }
-        Err(error) => Err(format!("Failed to execute docker compose down: {error}")),
+    }
+    found
+}
+
+/// Find and remove Docker containers whose compose working directory label
+/// matches `work_dir`. This is a fallback for when the compose file has been
+/// deleted or is not at the expected location.
+fn cleanup_docker_containers_by_label(work_dir: &str) -> Result<usize, String> {
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=com.docker.compose.project.working_dir",
+            "--format",
+            "{{.ID}} {{.Label \"com.docker.compose.project.working_dir\"}}",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Ok(0);
+    };
+    if !output.status.success() {
+        return Ok(0);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let matching_ids: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let id = parts.next()?.trim().to_string();
+            let dir = parts.next().unwrap_or("").trim().to_string();
+            if !id.is_empty() && dir == work_dir {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if matching_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut args = vec!["rm".to_string(), "-f".to_string()];
+    args.extend(matching_ids.clone());
+    let remove_output = Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|error| format!("Failed to execute docker rm: {error}"))?;
+    if remove_output.status.success() {
+        Ok(matching_ids.len())
+    } else {
+        let stderr = String::from_utf8_lossy(&remove_output.stderr);
+        Err(format!(
+            "Failed to remove {} container(s) by label: {}",
+            matching_ids.len(),
+            stderr.trim()
+        ))
+    }
+}
+
+/// Stop and remove Docker containers associated with an instance.
+/// 1. Recursively searches for compose files under the working directory
+///    and runs `docker compose down --remove-orphans` for each.
+/// 2. Falls back to label-based cleanup: finds containers whose
+///    `com.docker.compose.project.working_dir` label matches `work_dir`
+///    and removes them via `docker rm -f`.
+/// Returns `Ok(true)` if any containers were cleaned up, `Ok(false)` if
+/// no compose files or matching containers were found.
+fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
+    let work_dir_path = Path::new(work_dir);
+    let compose_files = find_compose_files_recursive(work_dir_path, 3);
+    let mut any_cleaned = false;
+    let mut errors: Vec<String> = Vec::new();
+
+    for compose_file in &compose_files {
+        let compose_dir = compose_file
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| work_dir.to_string());
+        let output = Command::new("docker")
+            .args(["compose", "down", "--remove-orphans"])
+            .current_dir(&compose_dir)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                any_cleaned = true;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !(stderr.contains("no configuration file provided")
+                    || stderr.contains("no containers to start"))
+                {
+                    errors.push(format!(
+                        "docker compose down in {} failed (exit {}): {}",
+                        compose_dir,
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    ));
+                }
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "Failed to execute docker compose down in {}: {error}",
+                    compose_dir
+                ));
+            }
+        }
+    }
+
+    // Label-based fallback: find containers whose compose working directory
+    // matches this instance's work_dir, even if the compose file is gone.
+    match cleanup_docker_containers_by_label(work_dir) {
+        Ok(count) if count > 0 => {
+            any_cleaned = true;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(any_cleaned)
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -1604,15 +1696,8 @@ fn finalize_failed_deployment(
     needs_restart_on_doctor: bool,
 ) {
     remove_runtime_log_spool(state, instance_id);
-    // Instance failed to run; clean up runtime log (error info already shown in lifecycle log)
-    if let Ok(mut storage) = state.storage.lock() {
-        let _ = storage.delete_runtime_logs(instance_id);
-    }
-    if let Ok(mut data) = state.data.lock() {
-        data.logs.retain(|log| {
-            !(log.instance_id.as_deref() == Some(instance_id) && log.category == "runtime")
-        });
-    }
+    // Keep the runtime output so the failure can be diagnosed from the
+    // Runtime tab. The lifecycle error below remains the concise summary.
     if let Ok(mut instance) = instance_by_id(state, instance_id) {
         instance.status = if needs_restart_on_doctor && instance.needs_doctor {
             "needs-restart".to_string()
@@ -1644,12 +1729,30 @@ fn mark_env_edited(state: State<'_, DesktopState>, instance_id: String) -> Resul
             "configuring".to_string()
         };
         instance.updated_at = timestamp();
-        return update_instance(&state, instance);
+        update_instance(&state, instance.clone())?;
+        state.log(
+            Some(&instance.id),
+            &instance.name,
+            "lifecycle",
+            "info",
+            "Instance configuration changed; deployment is required",
+            None,
+        );
+        return Ok(());
     }
     instance.needs_doctor = true;
     instance.status = "needs-restart".to_string();
     instance.updated_at = timestamp();
-    update_instance(&state, instance)
+    update_instance(&state, instance.clone())?;
+    state.log(
+        Some(&instance.id),
+        &instance.name,
+        "lifecycle",
+        "warning",
+        "Instance configuration changed; restart is required",
+        None,
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1671,8 +1774,9 @@ async fn delete_instance(
             instance.updated_at = timestamp();
             update_instance(&state, instance.clone())?;
             // Clean up Docker containers (e.g. Phoenix, SeekDB) started by
-            // tasks or docker compose in local deployment mode. Best-effort:
-            // log failure but don't block instance deletion.
+            // tasks or docker compose in local deployment mode.
+            // If cleanup fails, refuse to delete the working directory so
+            // that the compose file remains available for manual cleanup.
             let docker_cleaned = match cleanup_docker_containers(&instance.work_dir) {
                 Ok(cleaned) => {
                     if cleaned {
@@ -1693,10 +1797,12 @@ async fn delete_instance(
                         &instance.name,
                         "install",
                         "warning",
-                        format!("Docker container cleanup failed (non-fatal): {error}"),
+                        format!("Docker container cleanup failed: {error}"),
                         None,
                     );
-                    false
+                    return Err(format!(
+                        "Failed to clean up Docker containers; instance working directory preserved for manual cleanup: {error}"
+                    ));
                 }
             };
             remove_instance_work_dir(&instance.work_dir)?;
@@ -1871,36 +1977,6 @@ mod tests_instance {
         assert!(files.iter().any(|file| file.ends_with("/.env1")));
         assert!(files.iter().all(|file| !file.contains("frontend")));
         fs::remove_dir_all(root).expect("remove test directory");
-    }
-    #[test]
-    fn historical_desktop_operations_move_to_lifecycle_category() {
-        let mut store = AppStore {
-            instances: Vec::new(),
-            vault: Vec::new(),
-            logs: [
-                "Instance stopped",
-                "Instance associated processes stopped\nWorking directory: /tmp/demo",
-                "Doctor passed; instance restarted",
-                "Instance processes, working directory, and record deleted",
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, message)| LogEntry {
-                id: format!("lifecycle-log-{index}"),
-                instance_id: Some("instance".to_string()),
-                instance_name: "Instance".to_string(),
-                category: "runtime".to_string(),
-                level: "success".to_string(),
-                message: message.to_string(),
-                command: None,
-                created_at: index as u64,
-                sequence: index as u64,
-            })
-            .collect(),
-        };
-
-        assert!(repair_lifecycle_log_categories(&mut store));
-        assert!(store.logs.iter().all(|log| log.category == "install"));
     }
     #[cfg(unix)]
     #[test]

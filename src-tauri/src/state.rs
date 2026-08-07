@@ -2,7 +2,13 @@
 // and pre-deployment status repair helpers.
 
 fn is_deployment_completed_log(log: &LogEntry) -> bool {
-    log.category == "install" && log.level == "success" && log.message == "Instance deployment completed"
+    log.category == "lifecycle" && log.level == "success" && log.message == "Instance deployment completed"
+}
+
+fn normalize_log_categories(data: &mut AppStore) {
+    for log in &mut data.logs {
+        log.category = canonical_log_category(&log.category).to_string();
+    }
 }
 
 /// Reset a stale "needs-restart" instance that was never actually deployed.
@@ -32,40 +38,6 @@ fn repair_predeployment_restart_statuses(data: &mut AppStore) -> bool {
     for instance in &mut data.instances {
         let is_deployed = instance.pid.is_some() || deployed.contains(&instance.id);
         changed |= repair_instance_restart_status(instance, is_deployed);
-    }
-    changed
-}
-
-fn is_desktop_lifecycle_message(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower == "instance stopped"
-        || lower.starts_with("stopped instance process tree")
-        || lower.starts_with("instance associated processes stopped")
-        || lower.starts_with("instance deletion completed")
-        || lower.contains("instance restarted")
-        || lower.contains("delete instance")
-        || (lower.contains("instance") && lower.contains("deleted"))
-}
-
-fn repair_lifecycle_log_categories(data: &mut AppStore) -> bool {
-    let mut changed = false;
-    for log in &mut data.logs {
-        if log.category == "runtime" && is_desktop_lifecycle_message(&log.message) {
-            log.category = "install".to_string();
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn repair_log_sequences(data: &mut AppStore) -> bool {
-    let mut changed = false;
-    for (sequence, log) in data.logs.iter_mut().enumerate() {
-        let sequence = sequence as u64;
-        if log.sequence != sequence {
-            log.sequence = sequence;
-            changed = true;
-        }
     }
     changed
 }
@@ -289,6 +261,7 @@ impl DesktopState {
         };
         let migrating_legacy = database_data.is_none() && legacy_exists;
         let mut data = database_data.unwrap_or(legacy_data);
+        normalize_log_categories(&mut data);
         let credentials_required =
             matches!(config.mode.as_str(), "seekdb_server" | "oceanbase_server");
         let mut storage_ready = config_file_exists
@@ -310,18 +283,6 @@ impl DesktopState {
             }
             changed
         };
-        if migrating_legacy {
-            repair_lifecycle_log_categories(&mut data);
-            repair_log_sequences(&mut data);
-            data.logs.sort_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.sequence.cmp(&right.sequence))
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            prune_logs(&mut data, config.runtime_log_retention_days, timestamp());
-        }
-
         // 7. Persist migrated data and clean up logs.
         if storage_ready {
             let persist_result = (|| -> Result<(), String> {
@@ -486,6 +447,48 @@ impl DesktopState {
         Ok(removed)
     }
 
+    /// Flush entries that were queued while the storage backend was briefly
+    /// unavailable. Keep the queue in memory on failure so the log center can
+    /// still display those entries and a later request can retry the write.
+    fn flush_pending_logs(&self) -> Result<(), String> {
+        let pending = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| "State lock is poisoned".to_string())?;
+            if data.logs.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut data.logs)
+        };
+
+        let result = self
+            .ensure_storage_ready()
+            .and_then(|_| {
+                self.storage
+                    .lock()
+                    .map_err(|_| "Storage lock is poisoned".to_string())?
+                    .append_logs(&pending)
+            });
+        if let Err(error) = result {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| "State lock is poisoned".to_string())?;
+            data.logs.extend(pending);
+            data.logs.sort_by_key(|log| log.sequence);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn pending_logs(&self) -> Vec<LogEntry> {
+        self.data
+            .lock()
+            .map(|data| data.logs.clone())
+            .unwrap_or_default()
+    }
+
     fn redact_log_text(&self, value: String) -> String {
         let secrets = self
             .data
@@ -522,6 +525,9 @@ impl DesktopState {
             }
             Err(_) => return false,
         };
+        // The log center has only two top-level streams. Callers can keep using
+        // operation-specific labels internally, but storage stays semantic.
+        let category = if category == "runtime" { "runtime" } else { "lifecycle" };
         let log = LogEntry {
             id: format!("log-{now}-{sequence}"),
             instance_id: instance_id.map(str::to_string),
@@ -539,42 +545,23 @@ impl DesktopState {
                 .map_err(|_| "Storage lock is poisoned".to_string())?
                 .append_log(&log, &[])
         });
-        if persist_result.is_err() {
+        if persist_result.is_ok() && sequence % 100 == 0 {
+            let _ = self.cleanup_logs();
+        }
+        if let Err(error) = persist_result {
+            eprintln!("Failed to persist log {sequence}: {error}");
             if let Ok(mut data) = self.data.lock() {
-                let storage_ready = self
-                    .storage_ready
-                    .lock()
-                    .map(|ready| *ready)
-                    .unwrap_or(false);
-                if storage_ready {
-                    drop(data);
-                    if self
-                        .storage
-                        .lock()
-                        .map_err(|_| "Storage lock is poisoned".to_string())
-                        .and_then(|mut storage| storage.append_log(&log, &[]))
-                        .is_ok()
-                    {
-                        return true;
-                    }
-                    data = match self.data.lock() {
-                        Ok(data) => data,
-                        Err(_) => return false,
-                    };
-                }
                 data.logs.push(log);
                 if data.logs.len() > MAX_PENDING_LOG_ENTRIES {
                     let remove = data.logs.len() - MAX_PENDING_LOG_ENTRIES;
                     data.logs.drain(..remove);
                 }
             }
-            false
-        } else if sequence % 100 == 0 {
-            let _ = self.cleanup_logs();
-            true
-        } else {
-            true
         }
+        // A queued log is still a valid source record. Runtime spool syncing
+        // can advance its cursor without duplicating this entry on the next
+        // poll, while the queued entry remains visible until it is persisted.
+        true
     }
 }
 
