@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AgentSeek Desktop",
+  "productName": "AgentSeek_Desktop",
   "mainBinaryName": "agentseek-desktop",
   "version": "../package.json",
   "identifier": "com.oceanbase.agentseek.desktop",
