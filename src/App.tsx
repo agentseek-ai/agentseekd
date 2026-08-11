@@ -632,6 +632,37 @@ export default function App() {
     setLogPage(1);
   }, [logCategory, logInstance]);
 
+  // Whether any instance is currently in a transitioning state. Used as a
+  // stable boolean dependency so the polling interval is not torn down and
+  // recreated on every poll cycle (which caused re-render storms + errors).
+  const hasTransitioning = useMemo(
+    () =>
+      instances.some((inst) =>
+        ["installing", "starting", "checking", "restarting", "stopping", "deleting"].includes(inst.status),
+      ),
+    [instances],
+  );
+
+  // Poll instance status while any instance is in a transitioning state so the
+  // UI reflects backend status changes (e.g. restart finishing or failing).
+  useEffect(() => {
+    if (!hasTransitioning) return;
+    let active = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await desktopApi.listInstances();
+        if (!active) return;
+        setInstances(next);
+      } catch {
+        // Ignore transient polling errors.
+      }
+    }, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [hasTransitioning]);
+
   useEffect(() => {
     if (page !== "logs") return;
     let active = true;
@@ -1878,11 +1909,20 @@ export default function App() {
               <div className="log-list lifecycle-list">
                 {paginatedLogGroups.map((group) => {
                   const expanded = expandedLogGroups.has(group.id);
-                  const inProgress = group.instanceStatus === "installing" || group.instanceStatus === "starting" || group.instanceStatus === "checking" || group.instanceStatus === "deleting";
-                  const waiting = group.instanceStatus === "configuring" || group.instanceStatus === "ready-to-install";
-                  const failed = group.instanceStatus ? ["failed", "delete-failed"].includes(group.instanceStatus) : group.failed;
-                  const lifecycleLabel = group.deleted ? tr("deleted") : group.instanceStatus === "deleting" ? tr("deleting") : group.instanceStatus === "starting" ? tr("starting") : inProgress ? tr("installing") : group.instanceStatus === "configuring" ? tr("configuring") : group.instanceStatus === "ready-to-install" ? tr("ready") : group.instanceStatus === "delete-failed" ? tr("deleteFailed") : failed ? tr("lifecycleFailed") : group.instanceStatus === "running" ? tr("running") : group.instanceStatus === "stopped" ? tr("stopped") : tr("lifecycleSuccess");
-                  const lifecycleTone = group.deleted ? "neutral" : inProgress ? "progress" : waiting ? "warning" : failed ? "error" : "success";
+                  const lifecycleLabel = group.deleted
+                    ? tr("deleted")
+                    : group.instanceStatus
+                      ? statusLabel(group.instanceStatus)
+                      : group.failed
+                        ? tr("lifecycleFailed")
+                        : tr("lifecycleSuccess");
+                  const lifecycleTone = group.deleted
+                    ? "neutral"
+                    : group.instanceStatus
+                      ? statusTone(group.instanceStatus)
+                      : group.failed
+                        ? "error"
+                        : "success";
                   return <section className={`lifecycle-group ${expanded ? "expanded" : ""}`} key={group.id}>
                     <button className={`lifecycle-summary lifecycle-grid ${logCategory !== "all" ? "without-type" : ""}`} type="button" onClick={() => setExpandedLogGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })}>
                       <time>{formatTime(group.startedAt, language)}</time>
