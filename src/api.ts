@@ -4,6 +4,7 @@ import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import requirements from "./runtime-requirements.json";
 import type {
   CliStatus,
+  DockerEnvironmentStatus,
   AtofEventPage,
   EnvVariable,
   ExportEnvResult,
@@ -318,7 +319,6 @@ export const desktopApi = {
       syncedCount: changed.length,
       portChanges: [],
       entries: entries.map((entry) => ({ ...entry, modified: false })),
-      dockerWarning: undefined,
     };
   },
 
@@ -342,9 +342,14 @@ export const desktopApi = {
     return instance;
   },
 
-  async checkInstanceDockerRequirements(instanceId: string): Promise<string | null> {
-    if (isTauri()) return invoke("check_instance_docker_requirements", { instanceId });
+
+  async getInstanceDockerStatus(instanceId: string): Promise<DockerEnvironmentStatus | null> {
+    if (isTauri()) return invoke("get_instance_docker_status", { instanceId });
     return null;
+  },
+
+  async startInstanceDockerRuntime(instanceId: string): Promise<void> {
+    if (isTauri()) await invoke("start_instance_docker_runtime", { instanceId });
   },
 
   async deploymentProgress(instanceId: string): Promise<string> {

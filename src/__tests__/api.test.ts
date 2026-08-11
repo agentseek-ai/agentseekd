@@ -7,7 +7,6 @@ const mockInstance: InstanceRecord = {
   name: "test_instance",
   templateId: "langchain/default",
   status: "ready-to-install",
-  deploymentMode: "local",
   workDir: "/tmp/test_instance",
   note: "test note",
   createdAt: 100,

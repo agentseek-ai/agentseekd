@@ -11,7 +11,6 @@ import {
   CircleAlert,
   CircleDot,
   CircleStop,
-  Container,
   Copy,
   Database,
   ExternalLink,
@@ -47,6 +46,7 @@ import { desktopApi, isNativeDesktop } from "./api";
 import { translations, type Language, type TranslationKey } from "./i18n";
 import type {
   CliStatus,
+  DockerEnvironmentStatus,
   AtofJsonLine,
   DeploymentStage,
   EnvVariable,
@@ -68,7 +68,7 @@ import type {
 } from "./types";
 
 type Theme = "light" | "dark";
-type InstallStep = "form" | "env" | "deploying";
+type InstallStep = "form" | "env" | "deploying" | "failed";
 type DependencyKey = "uv" | "node" | "npm" | "git" | "agentseek";
 type DetailTab = "entry" | "trace-center" | "atof";
 
@@ -92,11 +92,24 @@ interface InstallState {
   warning: string;
   error: string;
   deploymentStage: DeploymentStage;
+  dockerStatus: DockerEnvironmentStatus | null;
+  dockerChecking: boolean;
 }
 
 interface EnvOverwriteState {
   context: "install" | "config" | "export";
   path: string;
+}
+
+type DockerConfirmationAction = "deploy" | "restart" | "delete";
+
+interface DockerConfirmationState {
+  instance: InstanceRecord;
+  action: DockerConfirmationAction;
+  status: DockerEnvironmentStatus | null;
+  checking: boolean;
+  starting: boolean;
+  error: string;
 }
 
 interface CommentTooltipState {
@@ -315,7 +328,6 @@ export default function App() {
   const [instances, setInstances] = useState<InstanceRecord[]>([]);
   const [vault, setVault] = useState<EnvVariable[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logGroupCount, setLogGroupCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshingTemplates, setRefreshingTemplates] = useState(false);
   const [templateUpdateInfo, setTemplateUpdateInfo] = useState<TemplateUpdateCheck | null>(null);
@@ -351,6 +363,9 @@ export default function App() {
   const [openActionMenuId, setOpenActionMenuId] = useState<string | null>(null);
   const [instanceAction, setInstanceAction] = useState<{ id: string; action: "stop" | "restart" | "delete" } | null>(null);
   const [instanceActionError, setInstanceActionError] = useState("");
+  const [dockerConfirmation, setDockerConfirmation] = useState<DockerConfirmationState | null>(null);
+  const dockerConfirmationResolver = useRef<((approved: boolean) => void) | null>(null);
+  const dockerConfirmationRequestId = useRef(0);
   const [showSystemInfo, setShowSystemInfo] = useState(false);
   const [storageConfig, setStorageConfig] = useState<(StorageStatus & { password?: string }) | null>(null);
   const [storageSetupRequired, setStorageSetupRequired] = useState(false);
@@ -463,7 +478,6 @@ export default function App() {
     // Refreshing instance/template data must not replace the complete history
     // already hydrated by the log center with only the latest 500 entries.
     setLogs((current) => mergeLogEntries(current, nextLogPage.entries));
-    setLogGroupCount(nextLogPage.groupCount);
     latestLogSequenceRef.current = Math.max(0, ...nextLogPage.entries.map((entry) => logSequence(entry)));
     setSelectedConfigId((current) => nextInstances.some((instance) => instance.id === current) ? current : nextInstances[0]?.id || "");
   }, []);
@@ -471,7 +485,6 @@ export default function App() {
   const refreshLatestLogs = useCallback(async () => {
     const page = await desktopApi.listLogs({ limit: 1_000 });
     setLogs((current) => mergeLogEntries(current, page.entries));
-    setLogGroupCount(page.groupCount);
     latestLogSequenceRef.current = Math.max(latestLogSequenceRef.current, ...page.entries.map((entry) => logSequence(entry)));
   }, []);
 
@@ -640,7 +653,6 @@ export default function App() {
             return added.length ? [...added, ...current] : current;
           });
         }
-        setLogGroupCount(nextLogPage.groupCount);
         setInstances(nextInstances);
       } catch {
         // Preserve the current terminal output when a background poll is interrupted.
@@ -657,7 +669,6 @@ export default function App() {
         if (!active) return;
         startTransition(() => {
           setLogs(history.entries);
-          setLogGroupCount(history.groupCount);
         });
         latestLogSequenceRef.current = Math.max(0, ...history.entries.map((entry) => logSequence(entry)));
         logHistoryLoadedRef.current = true;
@@ -855,7 +866,6 @@ export default function App() {
       setRuntimeRetentionDays(saved.runtimeRetentionDays);
       const page = await desktopApi.listAllLogs();
       setLogs(page.entries);
-      setLogGroupCount(page.groupCount);
       latestLogSequenceRef.current = Math.max(0, ...page.entries.map((entry) => logSequence(entry)));
       notify(tr("retentionSaved"));
     } catch (error) {
@@ -1067,11 +1077,7 @@ export default function App() {
         deleted,
         categories: Array.from(new Set(entries.map((entry) => entry.category))),
       };
-    }).sort((a, b) => {
-      const instanceA = instances.find((i) => i.id === a.id) || instances.find((i) => i.name === a.instanceName);
-      const instanceB = instances.find((i) => i.id === b.id) || instances.find((i) => i.name === b.instanceName);
-      return (instanceB?.createdAt || 0) - (instanceA?.createdAt || 0);
-    });
+    }).sort((a, b) => b.id.localeCompare(a.id));
   };
 
   const logGroups = useMemo(() => buildLogGroups(filteredLogs), [filteredLogs, instances]);
@@ -1084,7 +1090,7 @@ export default function App() {
   );
 
   // Keep the sidebar badge aligned with the rows shown in the unfiltered log view.
-  const lifecycleCount = logGroupCount;
+  const lifecycleCount = logGroups.length;
 
   const statusLabel = (status: string) => {
     if (status === "running") return tr("running");
@@ -1107,18 +1113,91 @@ export default function App() {
     setDetailInstance((current) => (current?.id === updated.id ? updated : current));
   };
 
+  const closeDockerConfirmation = (approved: boolean) => {
+    dockerConfirmationRequestId.current += 1;
+    dockerConfirmationResolver.current?.(approved);
+    dockerConfirmationResolver.current = null;
+    setDockerConfirmation(null);
+  };
+
+  const requestDockerConfirmation = (instance: InstanceRecord, action: DockerConfirmationAction) => {
+    dockerConfirmationResolver.current?.(false);
+    const requestId = dockerConfirmationRequestId.current + 1;
+    dockerConfirmationRequestId.current = requestId;
+    setDockerConfirmation({ instance, action, status: null, checking: true, starting: false, error: "" });
+    const result = new Promise<boolean>((resolve) => {
+      dockerConfirmationResolver.current = resolve;
+    });
+    void desktopApi.getInstanceDockerStatus(instance.id).then((status) => {
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      if (!status) {
+        closeDockerConfirmation(true);
+        return;
+      }
+      setDockerConfirmation((current) => current?.instance.id === instance.id ? { ...current, status, checking: false } : current);
+    }).catch((error) => {
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      setDockerConfirmation((current) => current?.instance.id === instance.id ? { ...current, checking: false, error: errorMessage(error) } : current);
+    });
+    return result;
+  };
+
+  const recheckDockerConfirmation = async () => {
+    if (!dockerConfirmation) return;
+    const instanceId = dockerConfirmation.instance.id;
+    const requestId = dockerConfirmationRequestId.current;
+    setDockerConfirmation((current) => current ? { ...current, checking: true, error: "" } : current);
+    try {
+      const status = await desktopApi.getInstanceDockerStatus(instanceId);
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      if (!status) {
+        closeDockerConfirmation(true);
+        return;
+      }
+      setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, status, checking: false, error: "" } : current);
+    } catch (error) {
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, checking: false, error: errorMessage(error) } : current);
+    }
+  };
+
+  const startDockerFromConfirmation = async () => {
+    if (!dockerConfirmation) return;
+    const instanceId = dockerConfirmation.instance.id;
+    const requestId = dockerConfirmationRequestId.current;
+    setDockerConfirmation((current) => current ? { ...current, starting: true, error: "" } : current);
+    try {
+      await desktopApi.startInstanceDockerRuntime(instanceId);
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, starting: false, checking: true } : current);
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (dockerConfirmationRequestId.current !== requestId) return;
+        const status = await desktopApi.getInstanceDockerStatus(instanceId);
+        if (dockerConfirmationRequestId.current !== requestId) return;
+        if (!status) {
+          closeDockerConfirmation(true);
+          return;
+        }
+        if (status.daemonRunning) {
+          setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, status, checking: false, starting: false, error: "" } : current);
+          return;
+        }
+        setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, status, checking: true } : current);
+      }
+      setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, checking: false, starting: false, error: tr("dockerStartTimeout") } : current);
+    } catch (error) {
+      if (dockerConfirmationRequestId.current !== requestId) return;
+      setDockerConfirmation((current) => current?.instance.id === instanceId ? { ...current, checking: false, starting: false, error: errorMessage(error) } : current);
+    }
+  };
+
   const runInstanceAction = async (action: "stop" | "restart" | "delete", instance: InstanceRecord) => {
     setOpenActionMenuId(null);
     setInstanceActionError("");
     try {
-      if (action === "restart") {
-        const dockerWarning = await desktopApi.checkInstanceDockerRequirements(instance.id);
-        if (dockerWarning) {
-          setInstanceActionError(dockerWarning);
-          notify(dockerWarning);
-          await refreshLatestLogs();
-          return;
-        }
+      if (action === "restart" && !(await requestDockerConfirmation(instance, "restart"))) {
+        return;
       }
       if (action === "stop" || action === "restart") {
         setInstanceAction({ id: instance.id, action });
@@ -1128,6 +1207,9 @@ export default function App() {
       if (action === "restart") replaceInstance(await desktopApi.restartInstance(instance.id));
       if (action === "delete") {
         if (!window.confirm(tr("confirmDelete"))) return;
+        if (!(await requestDockerConfirmation(instance, "delete"))) {
+          return;
+        }
         setInstanceAction({ id: instance.id, action: "delete" });
         replaceInstance({ ...instance, status: "deleting", updatedAt: Math.floor(Date.now() / 1000) });
         await desktopApi.deleteInstance(instance.id);
@@ -1150,13 +1232,15 @@ export default function App() {
     setInstallState({
       template,
       step: "form",
-      form: { name: "", templateId: template.id, targetDir: "", deploymentMode: "local", note: "" },
+      form: { name: "", templateId: template.id, targetDir: "", note: "" },
       instance: null,
       entries: [],
       generated: null,
       warning: "",
       error: "",
       deploymentStage: "create",
+      dockerStatus: null,
+      dockerChecking: false,
     });
   };
 
@@ -1174,7 +1258,7 @@ export default function App() {
     setInstallState({ ...installState, step: "deploying", deploymentStage: "create", error: "" });
     try {
       const prepared = await desktopApi.prepareInstance(installState.form);
-      setInstallState({ ...installState, step: "env", instance: prepared.instance, entries: prepared.env, generated: null, warning: prepared.dockerWarning || "", deploymentStage: "tasks", error: "" });
+      setInstallState({ ...installState, step: "env", instance: prepared.instance, entries: prepared.env, generated: null, warning: "", deploymentStage: "tasks", error: "", dockerStatus: null, dockerChecking: false });
       await refreshData();
     } catch (error) {
       await refreshData();
@@ -1187,7 +1271,7 @@ export default function App() {
     try {
       const generated = await desktopApi.saveInstanceEnv(installState.instance.id, installState.entries, overwrite);
       setEnvOverwrite(null);
-      setInstallState({ ...installState, entries: generated.entries, generated, warning: generated.dockerWarning || installState.warning });
+      setInstallState({ ...installState, entries: generated.entries, generated, warning: installState.warning });
       await refreshData();
     } catch (error) {
       const path = envExistsPath(error);
@@ -1199,16 +1283,14 @@ export default function App() {
   const continueInstall = async () => {
     if (!installState?.instance || !installState.generated) return;
     const targetInstanceId = installState.instance.id;
-    setInstallModalVisible(true);
-    const dockerWarning = await desktopApi.checkInstanceDockerRequirements(installState.instance.id);
-    if (dockerWarning) {
-      setInstallState((current) => current?.instance?.id === targetInstanceId ? { ...current, step: "env", warning: dockerWarning, error: dockerWarning } : current);
-      notify(dockerWarning);
-      await refreshLatestLogs();
+    setInstallModalVisible(false);
+    if (!(await requestDockerConfirmation(installState.instance, "deploy"))) {
+      setInstallModalVisible(true);
       return;
     }
+    setInstallModalVisible(true);
     const deployingInstance = { ...installState.instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) };
-    setInstallState({ ...installState, instance: deployingInstance, step: "deploying", deploymentStage: "tasks", error: "" });
+    setInstallState({ ...installState, instance: deployingInstance, step: "deploying", deploymentStage: "tasks", dockerStatus: null, dockerChecking: false, error: "" });
     replaceInstance(deployingInstance);
     try {
       const updated = await desktopApi.continueInstall(targetInstanceId);
@@ -1220,7 +1302,14 @@ export default function App() {
       notify(tr("success"));
     } catch (error) {
       await refreshData();
-      setInstallState((current) => current?.instance?.id === targetInstanceId ? { ...current, step: "env", error: errorMessage(error) } : current);
+      const message = errorMessage(error);
+      let failedDockerStatus: DockerEnvironmentStatus | null = null;
+      try {
+        failedDockerStatus = await desktopApi.getInstanceDockerStatus(targetInstanceId);
+      } catch {
+        // Preserve the deployment error even if the follow-up status check fails.
+      }
+      setInstallState((current) => current?.instance?.id === targetInstanceId ? { ...current, step: "failed", deploymentStage: "failed", dockerStatus: failedDockerStatus ?? current.dockerStatus, dockerChecking: false, error: message } : current);
     }
   };
 
@@ -1243,23 +1332,24 @@ export default function App() {
     setInstallState({
       template,
       step: "env",
-      form: { name: instance.name, templateId: instance.templateId, targetDir: instance.workDir, deploymentMode: instance.deploymentMode, note: instance.note },
+      form: { name: instance.name, templateId: instance.templateId, targetDir: instance.workDir, note: instance.note },
       instance,
       entries,
       generated: { path: instance.envPath || `${instance.workDir}/.env`, keyCount: entries.length, syncedCount: 0, portChanges: [], entries },
       warning: "",
       error: "",
       deploymentStage: "tasks",
+      dockerStatus: null,
+      dockerChecking: false,
     });
-    const dockerWarning = await desktopApi.checkInstanceDockerRequirements(instance.id);
-    if (dockerWarning) {
-      setInstallState((current) => current ? { ...current, warning: dockerWarning, error: dockerWarning } : current);
-      notify(dockerWarning);
-      await refreshLatestLogs();
+    setInstallModalVisible(false);
+    if (!(await requestDockerConfirmation(instance, "deploy"))) {
+      setInstallModalVisible(true);
       return;
     }
+    setInstallModalVisible(true);
     const targetInstanceId = instance.id;
-    setInstallState((current) => current ? { ...current, step: "deploying", instance: { ...instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) } } : current);
+    setInstallState((current) => current ? { ...current, step: "deploying", dockerStatus: null, dockerChecking: false, instance: { ...instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) } } : current);
     replaceInstance({ ...instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) });
     try {
       const updated = await desktopApi.continueInstall(targetInstanceId);
@@ -1270,7 +1360,14 @@ export default function App() {
       notify(tr("success"));
     } catch (error) {
       await refreshData();
-      setInstallState((current) => current?.instance?.id === targetInstanceId ? { ...current, step: "env", error: errorMessage(error) } : current);
+      const message = errorMessage(error);
+      let failedDockerStatus: DockerEnvironmentStatus | null = null;
+      try {
+        failedDockerStatus = await desktopApi.getInstanceDockerStatus(targetInstanceId);
+      } catch {
+        // Preserve the deployment error even if the follow-up status check fails.
+      }
+      setInstallState((current) => current?.instance?.id === targetInstanceId ? { ...current, step: "failed", deploymentStage: "failed", dockerStatus: failedDockerStatus ?? current.dockerStatus, dockerChecking: false, error: message } : current);
     }
   };
 
@@ -1540,6 +1637,7 @@ export default function App() {
     { label: "dry-run / dev", icon: Server },
   ];
   const deploymentStageIndex: Record<string, number> = { create: 0, pending: 1, tasks: 1, doctor: 2, "dry-run": 3, starting: 3, complete: 4 };
+  const dockerProviderLabel = (provider: string) => provider === "orbstack" ? "OrbStack" : provider === "docker-desktop" ? "Docker Desktop" : provider === "rancher-desktop" ? "Rancher Desktop" : provider === "colima" ? "Colima" : "Docker Engine";
   const installScopeItems = cliStatus ? [
     (runtimeInstallPlan ? runtimeInstallPlan.dependencies.includes("uv") : !cliStatus.uvCompatible) ? { name: "uv", description: tr("uvInstallScope") } : null,
     (runtimeInstallPlan ? runtimeInstallPlan.dependencies.includes("node/npm") : !cliStatus.nodeCompatible || !cliStatus.npmCompatible) ? { name: "Node.js / npm", description: tr("nodeInstallScope") } : null,
@@ -1693,12 +1791,11 @@ export default function App() {
             <div className="surface instance-surface">
               <div className="section-heading instance-section-heading"><div><h2>{tr("instances")}</h2><p>{tr("instancesDesc")}</p></div><button className="button secondary" type="button" onClick={() => setPage("templates")}><Plus />{tr("createInstance")}</button></div>
               {instanceActionError && <div className="instance-action-warning"><CircleAlert /><span>{instanceActionError}</span></div>}
-              <div className="table-head instance-grid"><span>{tr("instance")}</span><span>{tr("status")}</span><span>{tr("deployment")}</span><span>{tr("workDir")}</span><span>{tr("note")}</span><span>{tr("actions")}</span></div>
+              <div className="table-head instance-grid"><span>{tr("instance")}</span><span>{tr("status")}</span><span>{tr("workDir")}</span><span>{tr("note")}</span><span>{tr("actions")}</span></div>
               {filteredInstances.length ? paginatedInstances.map((instance) => (
                 <div className="table-row instance-grid" key={instance.id}>
                   <button className="instance-name" type="button" onClick={() => setDetailInstance(instance)}><span><strong>{instance.name}</strong><small>{instance.templateId}</small></span></button>
                   <span><span className={`status ${statusTone(instance.status)}`}><i />{statusLabel(instance.status)}</span></span>
-                  <span className="deployment-cell">{instance.deploymentMode === "docker" ? tr("docker") : tr("local")}</span>
                   <span className="path-cell" title={instance.workDir}>{instance.workDir}</span>
                   <span className="note-cell">{instance.note || "—"}</span>
                   <div className="action-menu">
@@ -1823,21 +1920,47 @@ export default function App() {
 
       {runtimeInstallConfirmDialog}
 
+      {dockerConfirmation && (
+        <div className="modal-backdrop docker-confirm-backdrop">
+          <div className="modal docker-confirm-modal" role="dialog" aria-modal="true">
+            <div className="modal-head"><div><span className="eyebrow">DOCKER CHECK</span><h2>{tr("dockerConfirmTitle")}</h2><p>{dockerConfirmation.instance.name} · {tr(`dockerAction_${dockerConfirmation.action}` as TranslationKey)}</p></div><button className="icon-button" onClick={() => closeDockerConfirmation(false)} type="button"><X /></button></div>
+            <div className="modal-body docker-confirm-body">
+              {dockerConfirmation.checking && !dockerConfirmation.status ? <div className="docker-confirm-loading"><LoaderCircle className="spin" /><strong>{tr("dockerChecking")}</strong><span>{tr("dockerCheckingHint")}</span></div> : dockerConfirmation.status && <>
+                <div className={`docker-confirm-hero ${dockerConfirmation.status.ready ? "ready" : "attention"}`}><span>{dockerConfirmation.status.ready ? <ShieldCheck /> : <CircleAlert />}</span><div><strong>{dockerConfirmation.status.ready ? tr("dockerEnvironmentReady") : tr("dockerEnvironmentUnavailable")}</strong><p>{dockerProviderLabel(dockerConfirmation.status.provider)} · {dockerConfirmation.status.platform}</p></div></div>
+                <div className="docker-confirm-checks">
+                  {[
+                    ["Docker", dockerConfirmation.status.dockerInstalled],
+                    [`Docker daemon (${dockerProviderLabel(dockerConfirmation.status.provider)})`, dockerConfirmation.status.daemonRunning],
+                    ["Docker Compose v2", dockerConfirmation.status.composeV2Installed],
+                  ].map(([label, ready]) => <div className={ready ? "ready" : "failed"} key={String(label)}>{ready ? <Check /> : <CircleAlert />}<span>{label}</span><strong>{ready ? tr("dockerReady") : tr("dockerUnavailable")}</strong></div>)}
+                </div>
+                {!dockerConfirmation.status.dockerInstalled && <section className="docker-confirm-action"><strong>{tr("dockerNotInstalled")}</strong><p>{tr("dockerInstallHint")}</p>{dockerConfirmation.status.installScript && <div className="docker-command"><code>{dockerConfirmation.status.installScript}</code><button className="icon-button" type="button" onClick={() => { void navigator.clipboard.writeText(dockerConfirmation.status!.installScript!); notify(tr("copied")); }}><Copy /></button></div>}<button className="button primary" type="button" onClick={() => void desktopApi.openExternalUrl(dockerConfirmation.status!.installUrl)}><ExternalLink />{tr("installDocker")}</button></section>}
+                {dockerConfirmation.status.dockerInstalled && !dockerConfirmation.status.daemonRunning && <section className="docker-confirm-action"><strong>{tr("dockerNotRunning")}</strong><p>{dockerConfirmation.status.guidance}</p>{dockerConfirmation.status.startSupported && <button className="button primary" disabled={dockerConfirmation.starting || dockerConfirmation.checking} type="button" onClick={() => void startDockerFromConfirmation()}>{dockerConfirmation.starting || dockerConfirmation.checking ? <LoaderCircle className="spin" /> : <SquareTerminal />}{dockerConfirmation.starting || dockerConfirmation.checking ? tr("dockerStarting") : tr("startDocker")}</button>}</section>}
+                {dockerConfirmation.status.dockerInstalled && !dockerConfirmation.status.composeV2Installed && <section className="docker-confirm-action"><strong>{tr("composeV2Missing")}</strong><p>{tr("composeV2InstallHint")}</p>{dockerConfirmation.status.composeInstallCommand && <div className="docker-command"><code>{dockerConfirmation.status.composeInstallCommand}</code><button className="icon-button" type="button" onClick={() => { void navigator.clipboard.writeText(dockerConfirmation.status!.composeInstallCommand!); notify(tr("copied")); }}><Copy /></button></div>}</section>}
+                {dockerConfirmation.status.composeFile && <code className="docker-confirm-compose-file">{dockerConfirmation.status.composeFile}</code>}
+              </>}
+              {dockerConfirmation.error && <div className="docker-confirm-error"><CircleAlert /><div><strong>{tr("dockerStartFailed")}</strong><p>{dockerConfirmation.error}</p></div></div>}
+            </div>
+            <div className="modal-foot"><button className="button secondary" type="button" onClick={() => closeDockerConfirmation(false)}>{tr("cancel")}</button>{dockerConfirmation.status && !dockerConfirmation.status.ready && <button className="button secondary" disabled={dockerConfirmation.checking || dockerConfirmation.starting} type="button" onClick={() => void recheckDockerConfirmation()}><RefreshCw className={dockerConfirmation.checking ? "spin" : ""} />{tr("recheck")}</button>}{dockerConfirmation.status?.ready && <button className="button primary" type="button" onClick={() => closeDockerConfirmation(true)}><Check />{tr("confirmContinue")}</button>}</div>
+          </div>
+        </div>
+      )}
+
       {installState && installModalVisible && (
         <div className="modal-backdrop">
           <div className={`modal install-modal ${installState.step === "env" ? "wide" : ""}`} role="dialog" aria-modal="true">
-            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
+            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : installState.step === "failed" ? tr("deploymentFailed") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
             {installState.step === "form" && <div className="modal-body form-grid">
               <label><span>{tr("instanceName")}</span><input autoFocus value={installState.form.name} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, name: event.target.value }, error: "" })} placeholder="rag-development" /></label>
               <label className="full"><span>{tr("targetDir")}</span><div className="path-picker"><input value={installState.form.targetDir} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, targetDir: event.target.value }, error: "" })} placeholder="/Users/name/AgentSeek/instances" /><button type="button" onClick={async () => { const path = await desktopApi.chooseDirectory(); if (path) setInstallState({ ...installState, form: { ...installState.form, targetDir: path }, error: "" }); }}><FolderOpen />{tr("choose")}</button></div>{installState.form.targetDir.trim() && installState.form.name.trim() && <code className="target-path-preview">{`${installState.form.targetDir.replace(/[\\/]+$/, "")}/${installState.form.name.trim()}`}</code>}</label>
-              <fieldset className="full"><legend>{tr("deployment")}</legend><div className="deployment-options"><button className="selected" type="button"><SquareTerminal /><span><strong>{tr("local")}</strong><small>UV · AgentSeek dev</small></span><Check /></button><button className="disabled-option" disabled type="button"><Container /><span><strong>{tr("docker")}</strong><small>{tr("dockerUnavailable")}</small></span><Check /></button></div></fieldset>
               <label className="full"><span>{tr("note")}</span><textarea value={installState.form.note} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, note: event.target.value } })} rows={3} /></label>
               {!isNativeDesktop && <div className="native-required full"><CircleAlert /><span><strong>{tr("nativeRequired")}</strong><code>{tr("nativeCommand")}</code></span></div>}
             </div>}
             {installState.step === "env" && <div className="modal-body env-modal-body"><div className="env-context"><ShieldCheck /><div><strong>{tr("envTitle")}</strong><p>{tr("envHint")}</p><code>{installState.instance?.envExamplePath}</code></div></div>{installState.warning && <div className="modal-warning"><CircleAlert />{installState.warning}</div>}<div className="env-toolbar"><button className="button secondary" onClick={() => setInstallState({ ...installState, entries: [...installState.entries, { key: "", value: "", comment: "", source: "instance", modified: true }], generated: null })} type="button"><Plus />{tr("addVariable")}</button></div><div className="env-scroll modal-env-scroll">{renderEnvTable(installState.entries, (entries) => setInstallState({ ...installState, entries, generated: null }), "install", true)}</div>{installState.generated && <div className="generated-banner"><Check /><span>{tr("generated")} {installState.generated.path} ({installState.generated.keyCount} {tr("keys")}, {installState.generated.syncedCount} → {tr("vault")}){installState.generated.portChanges.length ? ` · ${portChangeSummary(installState.generated)}` : ""}</span></div>}</div>}
             {installState.step === "deploying" && <div className="modal-body progress-body"><div className="progress-ring"><LoaderCircle className="spin" /></div><strong>{installState.instance ? tr("deploying") : tr("preparing")}</strong><div className="progress-steps">{deploymentSteps.map(({ label, icon: Icon }, index) => { const currentIndex = deploymentStageIndex[installState.deploymentStage] ?? 0; const done = installState.deploymentStage === "complete" || index < currentIndex; const active = installState.deploymentStage !== "complete" && index === currentIndex; return <span className={done ? "done" : active ? "active" : "pending"} key={label}>{done ? <Check /> : active ? <LoaderCircle className="spin" /> : <Icon />}{label}</span>; })}</div></div>}
-            {installState.error && <div className="modal-error"><CircleAlert />{installState.error}</div>}
-            {installState.step !== "deploying" && <div className="modal-foot">{installState.step !== "env" || installState.generated ? <button className="button secondary" onClick={() => setInstallState(null)} type="button">{tr("cancel")}</button> : <button className="button secondary" disabled type="button">{tr("configureEnvFirst")}</button>}{installState.step === "form" ? <button className="button primary" onClick={prepareInstall} disabled={!isNativeDesktop} type="button"><SquareTerminal />{tr("next")}</button> : <><button className="button secondary" onClick={() => generateInstallEnv()} type="button"><FileKey />{tr("generateEnv")}</button><button className="button primary" onClick={continueInstall} disabled={!installState.generated} type="button"><Check />{tr("saveContinue")}</button></>}</div>}
+            {installState.step === "failed" && <div className="modal-body deployment-failed-body"><div className="deployment-failed-icon"><CircleAlert /></div><strong>{tr("deploymentFailed")}</strong><p>{installState.error}</p></div>}
+            {installState.error && !installState.dockerStatus && installState.step !== "failed" && <div className="modal-error"><CircleAlert />{installState.error}</div>}
+            {installState.step === "failed" ? <div className="modal-foot"><button className="button secondary" onClick={() => setInstallState((current) => current ? { ...current, step: "env", error: "" } : current)} type="button"><ChevronLeft />{tr("backToConfig")}</button><button className="button primary" onClick={() => void continueInstall()} type="button"><RefreshCw />{tr("dockerRecheckContinue")}</button></div> : installState.step !== "deploying" && <div className="modal-foot">{installState.step !== "env" || installState.generated ? <button className="button secondary" onClick={() => setInstallState(null)} type="button">{tr("cancel")}</button> : <button className="button secondary" disabled type="button">{tr("configureEnvFirst")}</button>}{installState.step === "form" ? <button className="button primary" onClick={prepareInstall} disabled={!isNativeDesktop} type="button"><SquareTerminal />{tr("next")}</button> : <><button className="button secondary" onClick={() => generateInstallEnv()} type="button"><FileKey />{tr("generateEnv")}</button><button className="button primary" onClick={continueInstall} disabled={!installState.generated} type="button"><Check />{tr("saveContinue")}</button></>}</div>}
           </div>
         </div>
       )}

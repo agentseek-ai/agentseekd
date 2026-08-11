@@ -1,5 +1,4 @@
 export type Page = "instances" | "templates" | "config" | "logs" | "traces";
-export type DeploymentMode = "local" | "docker";
 export type LogCategory = "lifecycle" | "runtime";
 
 export interface TemplateInfo {
@@ -20,7 +19,6 @@ export interface InstanceRecord {
   name: string;
   templateId: string;
   status: string;
-  deploymentMode: DeploymentMode;
   workDir: string;
   envExamplePath?: string | null;
   envPath?: string | null;
@@ -85,14 +83,12 @@ export interface PrepareInstanceInput {
   name: string;
   templateId: string;
   targetDir: string;
-  deploymentMode: DeploymentMode;
   note: string;
 }
 
 export interface PrepareInstanceResult {
   instance: InstanceRecord;
   env: EnvVariable[];
-  dockerWarning?: string;
 }
 
 export interface SaveEnvResult {
@@ -101,7 +97,21 @@ export interface SaveEnvResult {
   syncedCount: number;
   portChanges: Array<{ key: string; oldPort: number; newPort: number }>;
   entries: EnvVariable[];
-  dockerWarning?: string;
+}
+
+export interface DockerEnvironmentStatus {
+  composeFile: string;
+  platform: string;
+  provider: string;
+  dockerInstalled: boolean;
+  daemonRunning: boolean;
+  composeV2Installed: boolean;
+  ready: boolean;
+  installUrl: string;
+  installScript?: string | null;
+  composeInstallCommand?: string | null;
+  startSupported: boolean;
+  guidance?: string | null;
 }
 
 export interface ExportEnvResult {
