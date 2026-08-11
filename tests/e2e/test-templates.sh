@@ -253,6 +253,9 @@ TEMPLATE_OVERRIDES=(
   # AG-UI gateway served via docker compose (no LangGraph protocol);
   # TAVILY_API_KEY is declared required in its lifecycle.toml doctor.
   "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
+  # rubric is a code-evaluation pipeline (not a chat agent); uses a custom
+  # input schema (request.rubric + request.max_iterations) and returns a report.
+  "langchain/rubric|langgraph-rubric|rubric-live|0|||"
 )
 
 # Templates are resolved through the agentseek CLI's explicit-catalog mode
@@ -279,6 +282,9 @@ FALLBACK_TEMPLATES=(
   "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
   "langchain/markdown-messages|langgraph|agent|0|||"
   "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
+  # rubric is a code-evaluation pipeline (not a chat agent); uses a custom
+  # input schema (request.rubric + request.max_iterations) and returns a report.
+  "langchain/rubric|langgraph-rubric|rubric-live|0|||"
 )
 
 # Filled by discover_templates() before the test loop runs.
@@ -582,8 +588,9 @@ send_message_bub() {
 
   # The response should be an SSE stream with data: lines.
   local event_count
-  event_count=$(echo "$response" | grep -c "^data:" 2>/dev/null || echo "0")
-  
+  event_count=$(echo "$response" | grep -c "^data:" 2>/dev/null || true)
+  event_count=${event_count:-0}
+
   # Check for error responses (JSON error, not SSE stream).
   if [[ "$event_count" -eq 0 ]]; then
     log_fail "  No SSE events in response (gateway may have rejected the message)"
@@ -680,7 +687,8 @@ send_message_langgraph() {
 
   # Check that we got some SSE events (data: lines).
   local event_count
-  event_count=$(echo "$run_response" | grep -c "^event:\|^data:" 2>/dev/null || echo "0")
+  event_count=$(echo "$run_response" | grep -c "^event:\|^data:" 2>/dev/null || true)
+  event_count=${event_count:-0}
 
   if [[ "$event_count" -lt 1 ]]; then
     log_fail "  No SSE events in response"
@@ -727,6 +735,103 @@ else:
   log_info "  Assistant reply: ${reply}"
   if [[ "$reply" == "(no text content extracted)" || "$reply" == "(failed to parse response)" ]]; then
     log_fail "  No text content in assistant reply"
+    return 1
+  fi
+  return 0
+}
+
+# Send a rubric evaluation request to a LangGraph API and verify the report.
+# Unlike chat templates, rubric expects input.request with a code snippet and
+# max_iterations.  The response is an SSE stream of values events containing
+# a report object.  We verify the report exists — grading success depends on
+# the LLM backend (mock mode may produce grader_error), so we only fail when
+# the API returns no report at all.
+# Usage: send_message_rubric <base_url> <graph_id>
+send_message_rubric() {
+  local base_url="$1"
+  local graph_id="$2"
+
+  log_info "  Sending rubric evaluation request to: $base_url (graph: $graph_id)"
+
+  # A simple function definition as the rubric (code to evaluate).
+  local rubric_code='def find_duplicates(values):\n    seen = set()\n    duplicates = set()\n    for v in values:\n        if v in seen:\n            duplicates.add(v)\n        else:\n            seen.add(v)\n    return list(duplicates)\n'
+
+  # Step 1: Create a thread.
+  local thread_response
+  thread_response=$(curl -s -m 10 -X POST "${base_url}/threads" \
+    -H "Content-Type: application/json" \
+    -d '{"metadata": {}}' 2>/dev/null || echo "")
+
+  local thread_id
+  thread_id=$(echo "$thread_response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('thread_id',''))" 2>/dev/null || echo "")
+
+  if [[ -z "$thread_id" ]]; then
+    log_fail "  Failed to create thread"
+    return 1
+  fi
+  log_info "  Thread created: $thread_id"
+
+  # Step 2: Send rubric evaluation request via runs/stream (SSE stream).
+  local run_response
+  run_response=$(curl -s -m 60 -X POST "${base_url}/threads/${thread_id}/runs/stream" \
+    -H "Content-Type: application/json" \
+    -d "{\"assistant_id\": \"${graph_id}\", \"input\": {\"request\": {\"rubric\": \"${rubric_code}\", \"max_iterations\": 1}}}" \
+    2>/dev/null || echo "")
+
+  if [[ -z "$run_response" ]]; then
+    log_fail "  Empty response from rubric run"
+    return 1
+  fi
+
+  # Check that we got some SSE events.
+  local event_count
+  event_count=$(echo "$run_response" | grep -c "^event:\|^data:" 2>/dev/null || true)
+  event_count=${event_count:-0}
+
+  if [[ "$event_count" -lt 1 ]]; then
+    log_fail "  No SSE events in response"
+    log_info "  Response: $(echo "$run_response" | head -5)"
+    return 1
+  fi
+
+  log_info "  Response received ($event_count SSE events, ${#run_response} bytes)"
+
+  # Extract report from SSE stream and display result.
+  local report_summary
+  report_summary=$(echo "$run_response" | python3 -c "
+import sys, json
+report = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data: '):
+        continue
+    try:
+        data = json.loads(line[6:])
+    except:
+        continue
+    # LangGraph values events carry the state; look for report key.
+    if isinstance(data, dict) and 'report' in data:
+        report = data['report']
+    # Error values also indicate a response.
+    if isinstance(data, dict) and 'error' in data:
+        report = data
+if report:
+    ts = report.get('terminal_status', 'unknown')
+    accepted = report.get('accepted', False)
+    iters = report.get('iterations', 0)
+    candidates = len(report.get('candidates', []))
+    if 'error' in report:
+        print(f'API error: {report["error"]}')
+    else:
+        print(f'terminal_status={ts}, accepted={accepted}, iterations={iters}, candidates={candidates}')
+else:
+    print('(no report in response)')
+" 2>/dev/null || echo "(failed to parse response)")
+
+  log_info "  Rubric report: ${report_summary}"
+
+  if [[ "$report_summary" == "(no report in response)" || "$report_summary" == "(failed to parse response)" ]]; then
+    log_fail "  No report in rubric response"
     return 1
   fi
   return 0
@@ -972,7 +1077,7 @@ test_template() {
     if [[ -n "$gateway_url" ]]; then
       health_urls+=("${gateway_url}/health|gateway")
     fi
-  elif [[ "$tpl_type" == "langgraph" ]]; then
+  elif [[ "$tpl_type" == "langgraph" || "$tpl_type" == "langgraph-rubric" ]]; then
     if [[ -n "$backend_url" ]]; then
       health_urls+=("${backend_url}|langgraph")
     fi
@@ -1011,6 +1116,10 @@ test_template() {
     fi
   elif [[ "$tpl_type" == "langgraph" ]]; then
     if [[ -n "$backend_url" ]] && send_message_langgraph "$backend_url" "$graph_id"; then
+      message_ok=true
+    fi
+  elif [[ "$tpl_type" == "langgraph-rubric" ]]; then
+    if [[ -n "$backend_url" ]] && send_message_rubric "$backend_url" "$graph_id"; then
       message_ok=true
     fi
   fi
