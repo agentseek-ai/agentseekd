@@ -2070,13 +2070,23 @@ async fn delete_instance(
         instance.updated_at = timestamp();
         update_instance(&state, instance.clone())?;
         let result = (|| -> Result<(), String> {
-            let stopped = if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
-                // Deletion uses `compose down` below; `compose stop` would fail
-                // early when a damaged instance has already lost its .env.
-                Vec::new()
-            } else {
-                stop_instance_process(&state, &instance, "install")
-                    .map_err(|error| format!("Failed to stop instance associated processes: {error}"))?
+            // Always try to stop the dev process first (hybrid projects have both
+            // a running agentseek dev process and Docker containers).  If the
+            // process is already gone or stop fails because .env is missing,
+            // we still proceed to Docker cleanup below.
+            let stopped = match stop_instance_process(&state, &instance, "install") {
+                Ok(processes) => processes,
+                Err(error) => {
+                    state.log(
+                        Some(&instance.id),
+                        &instance.name,
+                        "install",
+                        "warning",
+                        format!("Instance process stop failed, continuing with cleanup: {error}"),
+                        None,
+                    );
+                    Vec::new()
+                }
             };
             instance.pid = None;
             instance.updated_at = timestamp();
