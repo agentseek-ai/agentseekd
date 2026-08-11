@@ -877,7 +877,7 @@ fn ensure_docker_compose_ready(
 
 fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result<(), String> {
     ensure_docker_compose_ready(state, instance, "install")?;
-    if instance.deployment_mode == "docker" {
+    if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
         let output = configured_command("docker")
             .args(["compose", "up", "-d"])
             .current_dir(&instance.work_dir)
@@ -1097,9 +1097,10 @@ fn stop_instance_process(
     instance: &InstanceRecord,
     log_category: &str,
 ) -> Result<Vec<StoppedProcess>, String> {
-    if instance.deployment_mode == "docker" {
+    if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
         let output = Command::new("docker")
-            .args(["compose", "down", "--remove-orphans"])
+            // Stopping an instance must preserve its containers for the next start.
+            .args(["compose", "stop"])
             .current_dir(&instance.work_dir)
             .output()
             .map_err(|error| format!("Failed to execute Docker Compose: {error}"))?;
@@ -1277,7 +1278,7 @@ fn cleanup_docker_containers_by_label(work_dir: &str) -> Result<usize, String> {
     }
 }
 
-/// Stop and remove Docker containers associated with an instance.
+/// Remove Docker containers associated with an instance.
 /// 1. Recursively searches for compose files under the working directory
 ///    and runs `docker compose down --remove-orphans` for each.
 /// 2. Falls back to label-based cleanup: finds containers whose
@@ -1292,14 +1293,27 @@ fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
     let mut errors: Vec<String> = Vec::new();
 
     for compose_file in &compose_files {
-        let compose_dir = compose_file
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| work_dir.to_string());
+        let compose_dir = compose_file.parent().unwrap_or(work_dir_path);
+        // Compose validates service-level `env_file` entries even for `down`.
+        // Use a temporary empty root .env when a broken instance has lost it.
+        let env_path = compose_dir.join(".env");
+        let temporary_env = !env_path.exists();
+        if temporary_env {
+            if let Err(error) = fs::write(&env_path, "") {
+                errors.push(format!(
+                    "Failed to create temporary {} for Docker cleanup: {error}",
+                    env_path.display()
+                ));
+                continue;
+            }
+        }
         let output = Command::new("docker")
             .args(["compose", "down", "--remove-orphans"])
-            .current_dir(&compose_dir)
+            .current_dir(compose_dir)
             .output();
+        if temporary_env {
+            let _ = fs::remove_file(&env_path);
+        }
         match output {
             Ok(output) if output.status.success() => {
                 any_cleaned = true;
@@ -1311,7 +1325,7 @@ fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
                 {
                     errors.push(format!(
                         "docker compose down in {} failed (exit {}): {}",
-                        compose_dir,
+                        compose_dir.display(),
                         output.status.code().unwrap_or(-1),
                         stderr.trim()
                     ));
@@ -1320,7 +1334,7 @@ fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
             Err(error) => {
                 errors.push(format!(
                     "Failed to execute docker compose down in {}: {error}",
-                    compose_dir
+                    compose_dir.display()
                 ));
             }
         }
@@ -1341,34 +1355,123 @@ fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
     if errors.is_empty() {
         Ok(any_cleaned)
     } else {
-        Err(errors.join("; "))
+        let detail = errors.join("; ");
+        let docker_status = check_docker();
+        if !docker_status.cli_available || !docker_status.daemon_running {
+            Err(format!(
+                "{detail}\n\n{}",
+                docker_platform_guidance(&platform_id(), &docker_status)
+            ))
+        } else {
+            Err(detail)
+        }
     }
 }
 
 fn docker_compose_check(project_dir: &Path) -> Option<String> {
     let compose_file = docker_compose_file(project_dir)?;
     let docker_status = check_docker();
-    let mut missing = Vec::new();
+    let mut problems = Vec::new();
     if !docker_status.cli_available {
-        missing.push("Docker CLI not installed");
+        problems.push("Docker is not installed");
+        problems.push("Docker Compose V2 has not been checked because Docker is unavailable");
+    } else {
+        if !docker_status.daemon_running {
+            problems.push("Docker daemon is not running");
+        }
+        if !docker_status.compose_v2_available {
+            problems.push("Docker Compose V2 is not installed");
+        }
     }
-    if !docker_status.compose_v2_available {
-        missing.push("Docker Compose V2 not installed");
-    }
-    if !docker_status.daemon_running {
-        missing.push("Docker not started");
-    }
-    if missing.is_empty() {
+    if problems.is_empty() {
         None
     } else {
+        let platform = platform_id();
         Some(format!(
-            "Project contains {}, but{}. Please install and start Docker before continuing.",
+            "Project contains {}, but {}.\n\n{}",
             compose_file
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("docker-compose.yml"),
-            missing.join(", ")
+            problems.join("; "),
+            docker_platform_guidance(&platform, &docker_status)
         ))
+    }
+}
+
+fn docker_platform_guidance(platform: &str, status: &DockerStatus) -> String {
+    let mut guidance = Vec::new();
+
+    if !status.cli_available {
+        guidance.push(match platform {
+            "macos" => {
+                "Docker (macOS): install OrbStack from https://orbstack.dev/download/stable/latest/arm64\nAfter installation, run `open -a OrbStack` and wait for OrbStack to finish starting."
+            }
+            "windows" => {
+                "Docker (Windows): install Docker Desktop from https://docs.docker.com/desktop/install/windows-install/\nAfter installation, start Docker Desktop and wait until it reports that Docker is running."
+            }
+            "debian" => {
+                "Docker (Ubuntu/Debian): install Docker Engine with the official guide at https://docs.docker.com/engine/install/\nThen run `sudo systemctl enable --now docker`."
+            }
+            "rhel" => {
+                "Docker (CentOS/RHEL/Fedora): install Docker Engine with the official guide at https://docs.docker.com/engine/install/\nThen run `sudo systemctl enable --now docker`."
+            }
+            _ => {
+                "Docker (Linux): install Docker Engine with the official guide at https://docs.docker.com/engine/install/\nThen start the Docker service using your distribution's service manager."
+            }
+        });
+        guidance.push(
+            "Docker Compose V2: install and verify this component after Docker is available. Run `docker compose version` to check it.",
+        );
+        return guidance.join("\n\n");
+    }
+
+    if !status.daemon_running {
+        guidance.push(match platform {
+            "macos" if status.provider == "orbstack" => {
+                "Docker daemon (OrbStack): start OrbStack with `open -a OrbStack`, then retry. If needed, verify the active context with `docker context show`."
+            }
+            "macos" if status.provider == "colima" => {
+                "Docker daemon (Colima): start it with `colima start`, then retry."
+            }
+            "macos" if status.provider == "rancher-desktop" => {
+                "Docker daemon (Rancher Desktop): open Rancher Desktop and wait for its container engine to start, then retry."
+            }
+            "macos" if status.provider == "docker-desktop" => {
+                "Docker daemon (Docker Desktop): start it with `open -a Docker`, then retry."
+            }
+            "macos" => {
+                "Docker daemon: start the Docker runtime selected by `docker context show`, then retry."
+            }
+            "windows" => "Docker daemon: start Docker Desktop, then retry.",
+            _ => "Docker daemon: start it with `sudo systemctl start docker`, then retry.",
+        });
+    }
+
+    if !status.compose_v2_available {
+        guidance.push(match platform {
+            "macos" => {
+                "Docker Compose V2: macOS 上 OrbStack/Docker Desktop 通常自带。若缺失，可通过下方命令手动下载官方二进制到 ~/.docker/cli-plugins/。"
+            }
+            "windows" => {
+                "Docker Compose V2: Windows 上 Docker Desktop 通常自带。若缺失，可通过下方 PowerShell 命令手动下载官方二进制到 %USERPROFILE%\\.docker\\cli-plugins\\。"
+            }
+            "debian" => {
+                "Docker Compose V2 (Ubuntu/Debian): 通过下方命令下载官方二进制到 ~/.docker/cli-plugins/ 即可。"
+            }
+            "rhel" => {
+                "Docker Compose V2 (CentOS/RHEL/Fedora): 通过下方命令下载官方二进制到 ~/.docker/cli-plugins/ 即可。"
+            }
+            _ => {
+                "Docker Compose V2 (Linux): 通过下方命令下载官方二进制到 ~/.docker/cli-plugins/ 即可。"
+            }
+        });
+    }
+
+    if guidance.is_empty() {
+        "Docker and Docker Compose V2 are ready.".to_string()
+    } else {
+        guidance.join("\n\n")
     }
 }
 
@@ -1378,22 +1481,192 @@ fn check_docker() -> DockerStatus {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let compose_v2_available = cli_available
+    let mut compose_v2_available = cli_available
         && configured_command("docker")
             .args(["compose", "version", "--short"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
+    // Dev override: set AGENTSEEK_FORCE_NO_COMPOSE=1 to simulate a missing
+    // Docker Compose v2 plugin for testing the confirmation page UI.
+    if std::env::var("AGENTSEEK_FORCE_NO_COMPOSE").as_deref() == Ok("1") {
+        compose_v2_available = false;
+    }
     let daemon_running = cli_available
         && configured_command("docker")
             .args(["info", "--format", "{{.ServerVersion}}"])
             .output()
-            .map(|o| o.status.success())
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                output.status.success()
+                    && !stdout.trim().is_empty()
+                    && !stderr.contains("cannot connect")
+                    && !stderr.contains("permission denied")
+                    && !stderr.contains("is the docker daemon running")
+            })
             .unwrap_or(false);
+    let provider = docker_provider(cli_available);
     DockerStatus {
         cli_available,
         compose_v2_available,
         daemon_running,
+        provider,
+    }
+}
+
+fn docker_provider(cli_available: bool) -> String {
+    if !cli_available {
+        return "unavailable".to_string();
+    }
+    let context = configured_command("docker")
+        .args(["context", "show"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_lowercase())
+        .unwrap_or_default();
+    if context.contains("orbstack") {
+        "orbstack".to_string()
+    } else if context.contains("colima") {
+        "colima".to_string()
+    } else if context.contains("rancher") {
+        "rancher-desktop".to_string()
+    } else if context.contains("desktop") {
+        "docker-desktop".to_string()
+    } else if context.is_empty() || context == "default" {
+        "docker-engine".to_string()
+    } else {
+        context
+    }
+}
+
+fn instance_docker_status(project_dir: &Path) -> Option<DockerEnvironmentStatus> {
+    let compose_file = docker_compose_file(project_dir)?;
+    let docker_status = check_docker();
+    let ready = docker_status.cli_available
+        && docker_status.compose_v2_available
+        && docker_status.daemon_running;
+    let platform = platform_id();
+    let (install_url, install_script, compose_install_command) = docker_install_resources(&platform);
+    Some(DockerEnvironmentStatus {
+        compose_file: compose_file.to_string_lossy().to_string(),
+        platform: platform.clone(),
+        provider: docker_status.provider.clone(),
+        docker_installed: docker_status.cli_available,
+        daemon_running: docker_status.daemon_running,
+        compose_v2_installed: docker_status.compose_v2_available,
+        ready,
+        install_url,
+        install_script,
+        compose_install_command,
+        start_supported: docker_status.cli_available && docker_start_supported(&platform, &docker_status.provider),
+        guidance: (!ready).then(|| docker_platform_guidance(&platform, &docker_status)),
+    })
+}
+
+fn docker_install_resources(platform: &str) -> (String, Option<String>, Option<String>) {
+    match platform {
+        "macos" => (
+            "https://orbstack.dev/download/stable/latest/arm64".to_string(),
+            None,
+            Some(
+                "mkdir -p ~/.docker/cli-plugins && curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-darwin-aarch64 -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose".to_string(),
+            ),
+        ),
+        "windows" => (
+            "https://docs.docker.com/desktop/install/windows-install/".to_string(),
+            None,
+            Some(
+                "New-Item -ItemType Directory -Force $env:USERPROFILE\\.docker\\cli-plugins; Invoke-WebRequest -Uri https://github.com/docker/compose/releases/latest/download/docker-compose-windows-x86_64.exe -OutFile $env:USERPROFILE\\.docker\\cli-plugins\\docker-compose.exe".to_string(),
+            ),
+        ),
+        "debian" => (
+            "https://docs.docker.com/engine/install/ubuntu/".to_string(),
+            Some("curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh".to_string()),
+            Some(
+                "ARCH=$(uname -m | sed 's/arm64/aarch64/') && mkdir -p ~/.docker/cli-plugins && curl -SL \"https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH}\" -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose".to_string(),
+            ),
+        ),
+        "rhel" => (
+            "https://docs.docker.com/engine/install/centos/".to_string(),
+            Some("curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh".to_string()),
+            Some(
+                "ARCH=$(uname -m | sed 's/arm64/aarch64/') && mkdir -p ~/.docker/cli-plugins && curl -SL \"https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH}\" -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose".to_string(),
+            ),
+        ),
+        _ => (
+            "https://docs.docker.com/engine/install/".to_string(),
+            Some("curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh".to_string()),
+            Some(
+                "ARCH=$(uname -m | sed 's/arm64/aarch64/') && mkdir -p ~/.docker/cli-plugins && curl -SL \"https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH}\" -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose".to_string(),
+            ),
+        ),
+    }
+}
+
+fn docker_start_supported(platform: &str, provider: &str) -> bool {
+    match platform {
+        "macos" => matches!(provider, "orbstack" | "docker-desktop" | "colima" | "rancher-desktop"),
+        "windows" | "debian" | "rhel" | "linux" => true,
+        _ => false,
+    }
+}
+
+fn start_docker_runtime(platform: &str, provider: &str) -> Result<(), String> {
+    let mut command = match platform {
+        "macos" if provider == "orbstack" => {
+            let mut command = Command::new("/usr/bin/open");
+            command.args(["-a", "OrbStack"]);
+            command
+        }
+        "macos" if provider == "docker-desktop" => {
+            let mut command = Command::new("/usr/bin/open");
+            command.args(["-a", "Docker"]);
+            command
+        }
+        "macos" if provider == "colima" => {
+            let mut command = Command::new("colima");
+            command.arg("start");
+            command
+        }
+        "macos" if provider == "rancher-desktop" => {
+            let mut command = Command::new("/usr/bin/open");
+            command.args(["-a", "Rancher Desktop"]);
+            command
+        }
+        "windows" => {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe'",
+            ]);
+            command
+        }
+        "debian" | "rhel" | "linux" => {
+            let mut command = Command::new("pkexec");
+            command.args(["systemctl", "start", "docker"]);
+            command
+        }
+        _ => return Err("Automatic Docker startup is not supported for the current runtime".to_string()),
+    };
+    let output = command
+        .output()
+        .map_err(|error| format!("Failed to start Docker runtime: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Err(if detail.trim().is_empty() {
+            "Docker runtime startup failed".to_string()
+        } else {
+            detail.trim().to_string()
+        })
     }
 }
 
@@ -1511,7 +1784,6 @@ async fn continue_install(
             enrich_service_endpoints(&mut instance);
             state.set_deployment_stage(&instance_id, "doctor");
             run_and_log(&state, &instance, &["doctor"], "execution")?;
-            ensure_docker_compose_ready(&state, &instance, "install")?;
             state.set_deployment_stage(&instance_id, "dry-run");
             run_and_log(&state, &instance, &["dev", "--dry-run"], "execution")?;
             state.set_deployment_stage(&instance_id, "starting");
@@ -1648,7 +1920,6 @@ async fn restart_instance(
             instance.updated_at = timestamp();
             update_instance(&state, instance.clone())?;
             run_and_log(&state, &instance, &["doctor"], "execution")?;
-            ensure_docker_compose_ready(&state, &instance, "install")?;
             let _stopped = stop_instance_process(&state, &instance, "install")?;
             instance.pid = None;
             spawn_instance(&state, &mut instance)?;
@@ -1768,13 +2039,19 @@ async fn delete_instance(
         instance.updated_at = timestamp();
         update_instance(&state, instance.clone())?;
         let result = (|| -> Result<(), String> {
-            let stopped = stop_instance_process(&state, &instance, "install")
-                .map_err(|error| format!("Failed to stop instance associated processes: {error}"))?;
+            let stopped = if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
+                // Deletion uses `compose down` below; `compose stop` would fail
+                // early when a damaged instance has already lost its .env.
+                Vec::new()
+            } else {
+                stop_instance_process(&state, &instance, "install")
+                    .map_err(|error| format!("Failed to stop instance associated processes: {error}"))?
+            };
             instance.pid = None;
             instance.updated_at = timestamp();
             update_instance(&state, instance.clone())?;
             // Clean up Docker containers (e.g. Phoenix, SeekDB) started by
-            // tasks or docker compose in local deployment mode.
+            // lifecycle tasks or Compose services.
             // If cleanup fails, refuse to delete the working directory so
             // that the compose file remains available for manual cleanup.
             let docker_cleaned = match cleanup_docker_containers(&instance.work_dir) {
@@ -1854,29 +2131,72 @@ async fn delete_instance(
 }
 
 #[tauri::command]
-fn check_instance_docker_requirements(
+fn get_instance_docker_status(
     state: State<'_, DesktopState>,
     instance_id: String,
-) -> Result<Option<String>, String> {
+) -> Result<Option<DockerEnvironmentStatus>, String> {
     let instance = instance_by_id(&state, &instance_id)?;
-    if let Some(message) = docker_compose_check(Path::new(&instance.work_dir)) {
-        state.log(
-            Some(&instance.id),
-            &instance.name,
-            "install",
-            "error",
-            &message,
-            Some("docker --version && docker compose version --short && docker info".to_string()),
-        );
-        Ok(Some(format!("{} instance startup process exited, please check lifecycle logs", instance.name)))
-    } else {
-        Ok(None)
+    Ok(instance_docker_status(Path::new(&instance.work_dir)))
+}
+
+#[tauri::command]
+fn start_instance_docker_runtime(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<(), String> {
+    let instance = instance_by_id(&state, &instance_id)?;
+    let status = instance_docker_status(Path::new(&instance.work_dir))
+        .ok_or_else(|| "This instance does not require Docker Compose".to_string())?;
+    if !status.docker_installed {
+        return Err("Docker is not installed; automatic installation is not supported".to_string());
     }
+    if status.daemon_running {
+        return Ok(());
+    }
+    start_docker_runtime(&status.platform, &status.provider)
 }
 
 #[cfg(test)]
 mod tests_instance {
     use super::*;
+
+    #[test]
+    fn docker_guidance_is_platform_specific() {
+        let missing = DockerStatus {
+            cli_available: false,
+            compose_v2_available: false,
+            daemon_running: false,
+            provider: "unavailable".to_string(),
+        };
+        assert!(docker_platform_guidance("macos", &missing).contains("OrbStack"));
+        assert!(docker_platform_guidance("windows", &missing).contains("Windows"));
+        assert!(docker_platform_guidance("debian", &missing).contains("Ubuntu/Debian"));
+        assert!(docker_platform_guidance("rhel", &missing).contains("CentOS/RHEL/Fedora"));
+        let missing_compose = DockerStatus {
+            cli_available: true,
+            compose_v2_available: false,
+            daemon_running: true,
+            provider: "docker-engine".to_string(),
+        };
+        assert!(docker_platform_guidance("debian", &missing_compose).contains("cli-plugins"));
+        assert!(docker_platform_guidance("rhel", &missing_compose).contains("cli-plugins"));
+        let daemon_and_compose_missing = DockerStatus {
+            cli_available: true,
+            compose_v2_available: false,
+            daemon_running: false,
+            provider: "docker-engine".to_string(),
+        };
+        let guidance = docker_platform_guidance("debian", &daemon_and_compose_missing);
+        assert!(guidance.contains("Docker daemon:"));
+        assert!(guidance.contains("Docker Compose V2 (Ubuntu/Debian):"));
+        let orbstack_stopped = DockerStatus {
+            cli_available: true,
+            compose_v2_available: true,
+            daemon_running: false,
+            provider: "orbstack".to_string(),
+        };
+        assert!(docker_platform_guidance("macos", &orbstack_stopped).contains("open -a OrbStack"));
+    }
 
     #[test]
     fn replace_port_in_context_only_touches_port_like_contexts() {

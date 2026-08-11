@@ -68,8 +68,8 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let runtime_dir = data_dir.join("runtime");
-            let requirements =
-                load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS).map_err(std::io::Error::other)?;
+            let requirements = load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS)
+                .map_err(std::io::Error::other)?;
             let node_bin = managed_node_bin(&runtime_dir, &requirements.versions.node.managed);
             let _ = fs::create_dir_all(&runtime_dir);
             // SAFETY: `env::set_var` is not thread-safe in general, but this
@@ -119,7 +119,8 @@ pub fn run() {
             export_env,
             storage_status,
             configure_storage,
-            check_instance_docker_requirements,
+            get_instance_docker_status,
+            start_instance_docker_runtime,
             list_atof_traces,
             get_atof_trace_detail,
             read_atof_events,

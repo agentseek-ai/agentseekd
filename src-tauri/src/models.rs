@@ -74,7 +74,9 @@ pub(crate) fn load_runtime_requirements(
     Ok(requirements)
 }
 
-pub(crate) fn validate_runtime_requirements(requirements: &RuntimeRequirements) -> Result<(), String> {
+pub(crate) fn validate_runtime_requirements(
+    requirements: &RuntimeRequirements,
+) -> Result<(), String> {
     for (field, value) in [
         ("versions.uv.minimum", &requirements.versions.uv.minimum),
         ("versions.node.minimum", &requirements.versions.node.minimum),
@@ -185,7 +187,6 @@ pub(crate) struct InstanceRecord {
     pub(crate) name: String,
     pub(crate) template_id: String,
     pub(crate) status: String,
-    pub(crate) deployment_mode: String,
     pub(crate) work_dir: String,
     pub(crate) env_example_path: Option<String>,
     pub(crate) env_path: Option<String>,
@@ -377,8 +378,6 @@ pub(crate) struct PrepareInstanceInput {
 pub(crate) struct PrepareInstanceResult {
     pub(crate) instance: InstanceRecord,
     pub(crate) env: Vec<EnvVariable>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) docker_warning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -398,8 +397,6 @@ pub(crate) struct SaveEnvResult {
     pub(crate) synced_count: usize,
     pub(crate) port_changes: Vec<PortChange>,
     pub(crate) entries: Vec<EnvVariable>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) docker_warning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -441,11 +438,32 @@ pub(crate) struct SystemInfo {
     pub(crate) docker_running: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct DockerStatus {
     pub(crate) cli_available: bool,
     pub(crate) compose_v2_available: bool,
     pub(crate) daemon_running: bool,
+    pub(crate) provider: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DockerEnvironmentStatus {
+    pub(crate) compose_file: String,
+    pub(crate) platform: String,
+    pub(crate) provider: String,
+    pub(crate) docker_installed: bool,
+    pub(crate) daemon_running: bool,
+    pub(crate) compose_v2_installed: bool,
+    pub(crate) ready: bool,
+    pub(crate) install_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) install_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compose_install_command: Option<String>,
+    pub(crate) start_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) guidance: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -1004,7 +1004,6 @@ async fn prepare_instance(
             name: input.name.trim().to_string(),
             template_id: input.template_id,
             status: "configuring".to_string(),
-            deployment_mode: "local".to_string(),
             work_dir: target.to_string_lossy().to_string(),
             env_example_path: Some(env_example.to_string_lossy().to_string()),
             env_path: None,
@@ -1028,24 +1027,9 @@ async fn prepare_instance(
             .map_err(|_| "State lock is poisoned".to_string())?
             .instances
             .push(instance.clone());
-        if let Some(message) = docker_compose_check(&target) {
-            state.log(
-                Some(&instance.id),
-                &instance.name,
-                "install",
-                "error",
-                &message,
-                Some("docker --version && docker compose version --short && docker info".to_string()),
-            );
-            instance.status = "failed".to_string();
-            instance.updated_at = timestamp();
-            let _ = update_instance(&state, instance.clone());
-            return Err(format!("{} instance startup process exited, please check lifecycle logs", instance.name));
-        }
         Ok(PrepareInstanceResult {
             instance,
             env,
-            docker_warning: None,
         })
     })
     .await

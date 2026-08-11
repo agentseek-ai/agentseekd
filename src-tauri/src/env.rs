@@ -654,17 +654,6 @@ fn save_instance_env(
             None,
         );
     }
-    let docker_warning = docker_compose_check(&root);
-    if let Some(message) = &docker_warning {
-        state.log(
-            Some(&instance.id),
-            &instance.name,
-            "config",
-            "error",
-            message,
-            Some("docker --version && docker compose version --short && docker info".to_string()),
-        );
-    }
     state.log(
         Some(&instance.id),
         &instance.name,
@@ -691,7 +680,6 @@ fn save_instance_env(
         synced_count,
         port_changes,
         entries: saved_entries,
-        docker_warning,
     })
 }
 

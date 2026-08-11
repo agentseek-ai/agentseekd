@@ -236,7 +236,6 @@ fn initialize_sqlite_schema(connection: &Connection) -> Result<(), String> {
                 name TEXT NOT NULL,
                 template_id TEXT NOT NULL,
                 status TEXT NOT NULL,
-                deployment_mode TEXT NOT NULL,
                 work_dir TEXT NOT NULL,
                 env_example_path TEXT,
                 env_path TEXT,
@@ -307,6 +306,29 @@ fn initialize_sqlite_schema(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|error| error.to_string())?;
     }
+    if user_version < 5 {
+        let has_deployment_mode = connection
+            .prepare("PRAGMA table_info(instances)")
+            .and_then(|mut statement| {
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|column| column == "deployment_mode");
+        if has_deployment_mode {
+            connection
+                .execute_batch("ALTER TABLE instances DROP COLUMN deployment_mode;")
+                .map_err(|error| error.to_string())?;
+        }
+        connection
+            .execute_batch(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+                 VALUES (5, strftime('%s', 'now'));
+                 PRAGMA user_version = 5;",
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -342,13 +364,13 @@ fn replace_sqlite_tables(
         let mut statement = transaction
             .prepare(
                 "INSERT INTO instances (
-                    id, name, template_id, status, deployment_mode, work_dir,
+                    id, name, template_id, status, work_dir,
                     env_example_path, env_path, note, created_at, updated_at,
                     needs_doctor, pid, agent_url, ui_url, studio_url, project_name,
                     lifecycle_version, service_endpoints
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19
+                    ?14, ?15, ?16, ?17, ?18
                 )",
             )
             .map_err(|error| error.to_string())?;
@@ -361,7 +383,6 @@ fn replace_sqlite_tables(
                     instance.name,
                     instance.template_id,
                     instance.status,
-                    instance.deployment_mode,
                     instance.work_dir,
                     instance.env_example_path,
                     instance.env_path,
@@ -433,7 +454,7 @@ fn read_sqlite_store(connection: &Connection) -> Result<Option<AppStore>, String
     {
         let mut statement = connection
             .prepare(
-                "SELECT id, name, template_id, status, deployment_mode, work_dir,
+                "SELECT id, name, template_id, status, work_dir,
                         env_example_path, env_path, note, created_at, updated_at,
                         needs_doctor, pid, agent_url, ui_url, studio_url, project_name,
                         lifecycle_version, service_endpoints
@@ -442,26 +463,25 @@ fn read_sqlite_store(connection: &Connection) -> Result<Option<AppStore>, String
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], |row| {
-                let endpoints: String = row.get(18)?;
+                let endpoints: String = row.get(17)?;
                 Ok(InstanceRecord {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     template_id: row.get(2)?,
                     status: row.get(3)?,
-                    deployment_mode: row.get(4)?,
-                    work_dir: row.get(5)?,
-                    env_example_path: row.get(6)?,
-                    env_path: row.get(7)?,
-                    note: row.get(8)?,
-                    created_at: row.get::<_, i64>(9)? as u64,
-                    updated_at: row.get::<_, i64>(10)? as u64,
-                    needs_doctor: row.get(11)?,
-                    pid: row.get::<_, Option<i64>>(12)?.map(|value| value as u32),
-                    agent_url: row.get(13)?,
-                    ui_url: row.get(14)?,
-                    studio_url: row.get(15)?,
-                    project_name: row.get(16)?,
-                    lifecycle_version: row.get::<_, Option<i64>>(17)?.map(|value| value as u32),
+                    work_dir: row.get(4)?,
+                    env_example_path: row.get(5)?,
+                    env_path: row.get(6)?,
+                    note: row.get(7)?,
+                    created_at: row.get::<_, i64>(8)? as u64,
+                    updated_at: row.get::<_, i64>(9)? as u64,
+                    needs_doctor: row.get(10)?,
+                    pid: row.get::<_, Option<i64>>(11)?.map(|value| value as u32),
+                    agent_url: row.get(12)?,
+                    ui_url: row.get(13)?,
+                    studio_url: row.get(14)?,
+                    project_name: row.get(15)?,
+                    lifecycle_version: row.get::<_, Option<i64>>(16)?.map(|value| value as u32),
                     service_endpoints: serde_json::from_str(&endpoints).unwrap_or_default(),
                 })
             })
@@ -932,20 +952,19 @@ impl StorageEngine {
                 connection
                     .execute(
                         "INSERT OR REPLACE INTO instances (
-                            id, name, template_id, status, deployment_mode, work_dir,
+                            id, name, template_id, status, work_dir,
                             env_example_path, env_path, note, created_at, updated_at,
                             needs_doctor, pid, agent_url, ui_url, studio_url, project_name,
                             lifecycle_version, service_endpoints
                          ) VALUES (
                             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                            ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                            ?13, ?14, ?15, ?16, ?17, ?18
                          )",
                         params![
                             instance.id,
                             instance.name,
                             instance.template_id,
                             instance.status,
-                            instance.deployment_mode,
                             instance.work_dir,
                             instance.env_example_path,
                             instance.env_path,
@@ -1920,7 +1939,7 @@ mod tests_storage {
         let schema_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema version");
-        assert_eq!(schema_version, 4);
+        assert_eq!(schema_version, 5);
         drop(connection);
         fs::remove_dir_all(root).expect("remove storage test directory");
     }

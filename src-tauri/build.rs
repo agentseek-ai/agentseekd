@@ -3,8 +3,8 @@ fn main() {
 
     // Read version from ../package.json (single source of truth) and expose
     // it to Rust code via env!("APP_VERSION").
-    let manifest = std::fs::read_to_string("../package.json")
-        .expect("Failed to read ../package.json");
+    let manifest =
+        std::fs::read_to_string("../package.json").expect("Failed to read ../package.json");
     let version: String = serde_json::from_str::<serde_json::Value>(&manifest)
         .expect("Failed to parse package.json")
         .get("version")
