@@ -903,8 +903,13 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result
         if !output.status.success() {
             return Err("Docker Compose failed to start".to_string());
         }
-        instance.pid = None;
-        return Ok(());
+        // Docker Compose starts infrastructure containers (seekdb, phoenix, etc.).
+        // Fall through to also start the application process via `agentseek dev`
+        // unless the project is a pure compose stack with no langgraph.json.
+        if !Path::new(&instance.work_dir).join("langgraph.json").exists() {
+            instance.pid = None;
+            return Ok(());
+        }
     }
 
     let (program, prefix) = cli_parts();
@@ -1097,18 +1102,13 @@ fn stop_instance_process(
     instance: &InstanceRecord,
     log_category: &str,
 ) -> Result<Vec<StoppedProcess>, String> {
-    if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
-        let output = Command::new("docker")
-            // Stopping an instance must preserve its containers for the next start.
-            .args(["compose", "stop"])
-            .current_dir(&instance.work_dir)
-            .output()
-            .map_err(|error| format!("Failed to execute Docker Compose: {error}"))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).to_string());
-        }
-        Ok(Vec::new())
-    } else {
+    let has_compose = docker_compose_file(Path::new(&instance.work_dir)).is_some();
+    let is_hybrid = has_compose
+        && Path::new(&instance.work_dir)
+            .join("langgraph.json")
+            .exists();
+
+    if is_hybrid || !has_compose {
         let (listener_pids, skipped_listeners) = listener_process_ids(instance);
         let mut roots = listener_pids;
         if let Some(pid) = instance.pid {
@@ -1150,7 +1150,38 @@ fn stop_instance_process(
             ),
             None,
         );
+        if is_hybrid {
+            let docker_output = Command::new("docker")
+                .args(["compose", "stop"])
+                .current_dir(&instance.work_dir)
+                .output();
+            if let Ok(out) = docker_output {
+                if !out.status.success() {
+                    state.log(
+                        Some(&instance.id),
+                        &instance.name,
+                        log_category,
+                        "warn",
+                        format!(
+                            "Docker compose stop completed with warnings:\n{}",
+                            String::from_utf8_lossy(&out.stderr)
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
         Ok(stopped)
+    } else {
+        let output = Command::new("docker")
+            .args(["compose", "stop"])
+            .current_dir(&instance.work_dir)
+            .output()
+            .map_err(|error| format!("Failed to execute Docker Compose: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+        Ok(Vec::new())
     }
 }
 
