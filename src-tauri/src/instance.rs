@@ -875,7 +875,7 @@ fn ensure_docker_compose_ready(
     Ok(())
 }
 
-fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result<(), String> {
+fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord, truncate: bool) -> Result<(), String> {
     ensure_docker_compose_ready(state, instance, "install")?;
     if docker_compose_file(Path::new(&instance.work_dir)).is_some() {
         let output = configured_command("docker")
@@ -913,7 +913,7 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result
     }
 
     let (program, prefix) = cli_parts();
-    let (stdout, stderr) = prepare_runtime_log_spool(state, &instance.id)?;
+    let (stdout, stderr) = prepare_runtime_log_spool(state, &instance.id, truncate)?;
     let mut command = configured_command(&program);
     let environment = apply_instance_environment(&mut command, instance)?;
     command
@@ -941,7 +941,9 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord) -> Result
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|error| {
-        remove_runtime_log_spool(state, &instance.id);
+        if truncate {
+            remove_runtime_log_spool(state, &instance.id);
+        }
         format!(
             "Failed to start instance: cannot execute {} (working directory: {}): {}",
             program, instance.work_dir, error
@@ -1818,7 +1820,7 @@ async fn continue_install(
             state.set_deployment_stage(&instance_id, "dry-run");
             run_and_log(&state, &instance, &["dev", "--dry-run"], "execution")?;
             state.set_deployment_stage(&instance_id, "starting");
-            spawn_instance(&state, &mut instance)?;
+            spawn_instance(&state, &mut instance, true)?;
             instance.status = "starting".to_string();
             instance.updated_at = timestamp();
             update_instance(&state, instance.clone())?;
@@ -1953,7 +1955,15 @@ async fn restart_instance(
             run_and_log(&state, &instance, &["doctor"], "execution")?;
             let _stopped = stop_instance_process(&state, &instance, "install")?;
             instance.pid = None;
-            spawn_instance(&state, &mut instance)?;
+            state.log(
+                Some(&instance.id),
+                &instance.name,
+                "install",
+                "info",
+                "--- Instance restarting ---".to_string(),
+                None,
+            );
+            spawn_instance(&state, &mut instance, false)?;
             instance.status = "starting".to_string();
             instance.updated_at = timestamp();
             update_instance(&state, instance.clone())?;
@@ -1989,17 +1999,20 @@ async fn restart_instance(
     .map_err(|error| error.to_string())?
 }
 
-/// Shared failure cleanup for a deployment attempt: drop spooled runtime logs
-/// and mark the instance failed (or needs-restart when a doctor check flagged it).
+/// Shared failure cleanup for a deployment attempt: mark the instance failed
+/// (or needs-restart when a doctor check flagged it). Runtime log spool is only
+/// removed on initial deployment failure; restart failures keep it for diagnosis.
 fn finalize_failed_deployment(
     state: &DesktopState,
     instance_id: &str,
     error: &str,
     needs_restart_on_doctor: bool,
 ) {
-    remove_runtime_log_spool(state, instance_id);
-    // Keep the runtime output so the failure can be diagnosed from the
-    // Runtime tab. The lifecycle error below remains the concise summary.
+    // On restart failures, preserve the runtime log so the user can inspect
+    // what went wrong in the Runtime tab. Only clean up on initial deployment.
+    if !needs_restart_on_doctor {
+        remove_runtime_log_spool(state, instance_id);
+    }
     if let Ok(mut instance) = instance_by_id(state, instance_id) {
         instance.status = if needs_restart_on_doctor && instance.needs_doctor {
             "needs-restart".to_string()

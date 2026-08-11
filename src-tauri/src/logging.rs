@@ -80,6 +80,7 @@ fn write_runtime_log_cursor(path: &Path, cursor: &RuntimeLogCursor) -> Result<()
 fn prepare_runtime_log_spool(
     state: &DesktopState,
     instance_id: &str,
+    truncate: bool,
 ) -> Result<(fs::File, fs::File), String> {
     let (log_path, cursor_path) = runtime_log_spool_paths(&state.data_dir, instance_id);
     let parent = log_path
@@ -88,7 +89,12 @@ fn prepare_runtime_log_spool(
     fs::create_dir_all(parent).map_err(|error| format!("Failed to create runtime log spool directory: {error}"))?;
 
     let mut options = fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    options.create(true).write(true);
+    if truncate {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
     #[cfg(unix)]
     options.mode(0o600);
     let stdout = options
@@ -97,8 +103,12 @@ fn prepare_runtime_log_spool(
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("Failed to open runtime log error stream: {error}"))?;
-    write_runtime_log_cursor(&cursor_path, &RuntimeLogCursor::default())
-        .map_err(|error| format!("Failed to initialize runtime log cursor: {error}"))?;
+    if truncate {
+        write_runtime_log_cursor(&cursor_path, &RuntimeLogCursor::default())
+            .map_err(|error| format!("Failed to initialize runtime log cursor: {error}"))?;
+    }
+    // In append mode (restart), the existing cursor is preserved so
+    // sync_runtime_log_spools only reads newly appended records.
     Ok((stdout, stderr))
 }
 
