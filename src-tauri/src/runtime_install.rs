@@ -400,6 +400,41 @@ fn prepare_runtime_install_plan(
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
+const APPIMAGE_CHILD_ENV_VARS: [&str; 16] = [
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GDK_PIXBUF_MODULEDIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SCANNER",
+    "QT_PLUGIN_PATH",
+    "QML2_IMPORT_PATH",
+    "XDG_DATA_DIRS",
+];
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_system_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+    );
+    // AppImage runtime paths are valid for the bundled app only. System GUI
+    // programs must load the host's GTK, GLib, GIO, GStreamer, and Qt libraries.
+    for variable in APPIMAGE_CHILD_ENV_VARS {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn launch_runtime_install_terminal(script_path: &Path) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         let output = Command::new("/usr/bin/open")
@@ -421,27 +456,56 @@ fn launch_runtime_install_terminal(script_path: &Path) -> Result<(), String> {
             .map_err(|error| format!("Failed to open PowerShell: {error}"))?;
         return Ok(());
     }
-    let script = script_path.to_string_lossy().to_string();
-    let candidates: [(&str, Vec<String>); 3] = [
-        (
-            "x-terminal-emulator",
-            vec!["-e".to_string(), "bash".to_string(), script.clone()],
-        ),
-        (
-            "gnome-terminal",
-            vec!["--".to_string(), "bash".to_string(), script.clone()],
-        ),
-        (
-            "konsole",
-            vec!["-e".to_string(), "bash".to_string(), script],
-        ),
-    ];
-    for (program, args) in candidates {
-        if configured_command(program).args(args).spawn().is_ok() {
-            return Ok(());
+
+    #[cfg(target_os = "linux")]
+    {
+        let script = script_path.to_string_lossy().to_string();
+        let candidates: [(&str, Vec<String>); 4] = [
+            (
+                "xfce4-terminal",
+                vec![
+                    "--disable-server".to_string(),
+                    "--command".to_string(),
+                    format!("bash {}", shell_quote(&script)),
+                ],
+            ),
+            (
+                "x-terminal-emulator",
+                vec!["-e".to_string(), "bash".to_string(), script.clone()],
+            ),
+            (
+                "gnome-terminal",
+                vec!["--".to_string(), "bash".to_string(), script.clone()],
+            ),
+            (
+                "konsole",
+                vec!["-e".to_string(), "bash".to_string(), script],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (program, args) in candidates {
+            match linux_system_command(program).args(args).spawn() {
+                Ok(mut child) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    match child.try_wait() {
+                        Ok(Some(status)) if !status.success() => {
+                            failures.push(format!("{program} exited with {status}"));
+                        }
+                        Ok(_) => return Ok(()),
+                        Err(error) => failures.push(format!("{program}: {error}")),
+                    }
+                }
+                Err(error) => failures.push(format!("{program}: {error}")),
+            }
         }
+        return Err(format!(
+            "No available system terminal could be started: {}",
+            failures.join("; ")
+        ));
     }
-    Err("No available system terminal found; please install x-terminal-emulator, GNOME Terminal, or Konsole".to_string())
+
+    #[allow(unreachable_code)]
+    Err("No supported system terminal launcher is available on this platform".to_string())
 }
 
 fn install_log_tail(path: &Path) -> String {
@@ -537,6 +601,34 @@ async fn execute_runtime_install(
         );
         launch_runtime_install_terminal(&script_path)?;
         let status_path = task_dir.join("status.json");
+        #[cfg(target_os = "linux")]
+        {
+            let mut install_started = false;
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(500));
+                let status = fs::read_to_string(&status_path)
+                    .ok()
+                    .and_then(|content| {
+                        serde_json::from_str::<serde_json::Value>(content.trim()).ok()
+                    })
+                    .and_then(|status| {
+                        status
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                if status.as_deref().is_some_and(|value| value != "pending") {
+                    install_started = true;
+                    break;
+                }
+            }
+            if !install_started {
+                return Err(
+                    "System terminal opened, but the install script did not start within 15 seconds. Please verify that the desktop terminal can run, then retry."
+                        .to_string(),
+                );
+            }
+        }
         for _ in 0..3_600 {
             std::thread::sleep(Duration::from_millis(500));
             let Ok(content) = fs::read_to_string(&status_path) else {
@@ -741,5 +833,33 @@ mod tests_runtime_install {
         assert!(command.contains("nvm install 24"));
         assert!(command.contains("node --version && npm --version"));
         assert!(!command.contains("install -g npm"));
+    }
+
+    #[test]
+    fn linux_system_commands_remove_appimage_library_environment_only() {
+        let command = linux_system_command("xfce4-terminal");
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then(|| name.to_string_lossy().to_string()))
+            .collect::<HashSet<_>>();
+
+        for variable in APPIMAGE_CHILD_ENV_VARS {
+            assert!(removed.contains(variable), "{variable} should be removed");
+        }
+        for variable in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "SESSION_MANAGER",
+            "HOME",
+            "LANG",
+        ] {
+            assert!(
+                !removed.contains(variable),
+                "{variable} must remain available to the desktop terminal"
+            );
+        }
     }
 }
