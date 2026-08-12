@@ -99,12 +99,12 @@ describe("desktopApi mock layer", () => {
       expect(instances).toEqual([]);
     });
 
-    it("returns sorted by createdAt descending", async () => {
+    it("returns sorted by id descending", async () => {
       // Manually populate mock store
       const store: { instances: InstanceRecord[]; vault: EnvVariable[]; logs: unknown[] } = {
         instances: [
-          { ...mockInstance, id: "old", createdAt: 100 },
-          { ...mockInstance, id: "new", createdAt: 200 },
+          { ...mockInstance, id: "instance-001", createdAt: 200 },
+          { ...mockInstance, id: "instance-002", createdAt: 100 },
         ],
         vault: [],
         logs: [],
@@ -114,8 +114,8 @@ describe("desktopApi mock layer", () => {
         vault: [],
       }));
       const instances = await desktopApi.listInstances();
-      expect(instances[0].id).toBe("new");
-      expect(instances[1].id).toBe("old");
+      expect(instances[0].id).toBe("instance-002");
+      expect(instances[1].id).toBe("instance-001");
     });
   });
 
