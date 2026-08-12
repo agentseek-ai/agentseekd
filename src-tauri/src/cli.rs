@@ -89,20 +89,74 @@ fn managed_node_bin(runtime_root: &Path, node_version: &str) -> PathBuf {
     }
 }
 
+const PYTHON_CHILD_ENV_VARS: [&str; 6] = [
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "CONDA_PROMPT_MODIFIER",
+];
+
+const LINUX_PYTHON_CHILD_ENV_VARS: [&str; 4] = [
+    "PYTHONPLATLIBDIR",
+    "PYTHONEXECUTABLE",
+    "PYTHONSTARTUP",
+    "UV_PYTHON",
+];
+
+const APPIMAGE_CHILD_ENV_VARS: [&str; 16] = [
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GDK_PIXBUF_MODULEDIR",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SCANNER",
+    "QT_PLUGIN_PATH",
+    "QML2_IMPORT_PATH",
+    "XDG_DATA_DIRS",
+];
+
+fn remove_python_environment(command: &mut Command) {
+    for variable in PYTHON_CHILD_ENV_VARS {
+        command.env_remove(variable);
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn remove_appimage_environment(command: &mut Command) {
+    for variable in APPIMAGE_CHILD_ENV_VARS {
+        command.env_remove(variable);
+    }
+}
+
+fn configure_python_command(command: &mut Command) {
+    remove_python_environment(command);
+    #[cfg(target_os = "linux")]
+    {
+        for variable in LINUX_PYTHON_CHILD_ENV_VARS {
+            command.env_remove(variable);
+        }
+        remove_appimage_environment(command);
+    }
+}
+
 fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env("PATH", runtime_path());
     // Prevent Python from importing a local agentseek source tree
     // that may shadow the installed package when CWD contains agentseek/.
     command.current_dir(std::env::temp_dir());
-    // Clear Python env vars that may leak from conda/venv and cause agentseek
-    // to import from the wrong environment.
-    command.env_remove("PYTHONPATH");
-    command.env_remove("PYTHONHOME");
-    command.env_remove("VIRTUAL_ENV");
-    command.env_remove("CONDA_PREFIX");
-    command.env_remove("CONDA_DEFAULT_ENV");
-    command.env_remove("CONDA_PROMPT_MODIFIER");
+    // External runtimes must not inherit Python or AppImage paths from the
+    // desktop process. Those paths can point at a transient AppImage mount.
+    configure_python_command(&mut command);
     command
 }
 
@@ -733,6 +787,23 @@ fn system_info(state: State<'_, DesktopState>) -> SystemInfo {
 #[cfg(test)]
 mod tests_cli {
     use super::*;
+
+    fn removed_environment(command: &Command) -> HashSet<String> {
+        command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then(|| name.to_string_lossy().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn configured_commands_remove_python_runtime_environment() {
+        let command = configured_command("agentseek");
+        let removed = removed_environment(&command);
+
+        for variable in PYTHON_CHILD_ENV_VARS {
+            assert!(removed.contains(variable), "{variable} should be removed");
+        }
+    }
 
     #[test]
     fn dependency_versions_are_compared_across_command_formats() {

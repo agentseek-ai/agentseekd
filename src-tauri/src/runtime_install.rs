@@ -49,6 +49,17 @@ fn required_runtime_dependencies(status: &CliStatus) -> Vec<String> {
     dependencies
 }
 
+fn append_posix_runtime_environment_cleanup(lines: &mut Vec<String>, linux: bool) {
+    if linux {
+        lines.push(format!("unset {}", PYTHON_CHILD_ENV_VARS.join(" ")));
+        lines.push(format!(
+            "unset {}",
+            LINUX_PYTHON_CHILD_ENV_VARS.join(" ")
+        ));
+        lines.push(format!("unset {}", APPIMAGE_CHILD_ENV_VARS.join(" ")));
+    }
+}
+
 fn windows_uv_installer(requirements: &RuntimeRequirements) -> String {
     requirements
         .sources
@@ -132,6 +143,8 @@ fn posix_runtime_install_script(
         "echo 'AgentSeek Desktop runtime installation'".to_string(),
         "echo '================================='".to_string(),
     ];
+
+    append_posix_runtime_environment_cleanup(&mut lines, cfg!(target_os = "linux"));
 
     if !status.uv_compatible {
         lines.extend([
@@ -401,26 +414,6 @@ fn prepare_runtime_install_plan(
 }
 
 #[cfg(any(target_os = "linux", test))]
-const APPIMAGE_CHILD_ENV_VARS: [&str; 16] = [
-    "APPDIR",
-    "APPIMAGE",
-    "ARGV0",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "GIO_EXTRA_MODULES",
-    "GIO_MODULE_DIR",
-    "GTK_PATH",
-    "GDK_PIXBUF_MODULE_FILE",
-    "GDK_PIXBUF_MODULEDIR",
-    "GST_PLUGIN_PATH",
-    "GST_PLUGIN_SYSTEM_PATH",
-    "GST_PLUGIN_SCANNER",
-    "QT_PLUGIN_PATH",
-    "QML2_IMPORT_PATH",
-    "XDG_DATA_DIRS",
-];
-
-#[cfg(any(target_os = "linux", test))]
 fn linux_system_command(program: &str) -> Command {
     let mut command = Command::new(program);
     command.env(
@@ -428,10 +421,12 @@ fn linux_system_command(program: &str) -> Command {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
     );
     // AppImage runtime paths are valid for the bundled app only. System GUI
-    // programs must load the host's GTK, GLib, GIO, GStreamer, and Qt libraries.
-    for variable in APPIMAGE_CHILD_ENV_VARS {
+    // programs and their install scripts must use the host runtime instead.
+    remove_python_environment(&mut command);
+    for variable in LINUX_PYTHON_CHILD_ENV_VARS {
         command.env_remove(variable);
     }
+    remove_appimage_environment(&mut command);
     command
 }
 
@@ -772,6 +767,19 @@ mod tests_runtime_install {
         assert!(!posix
             .chars()
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)));
+
+        let mut linux_cleanup = Vec::new();
+        append_posix_runtime_environment_cleanup(&mut linux_cleanup, true);
+        let linux_cleanup = linux_cleanup.join("\n");
+        assert!(linux_cleanup.contains("PYTHONHOME"));
+        assert!(linux_cleanup.contains("PYTHONPATH"));
+        assert!(linux_cleanup.contains("UV_PYTHON"));
+        assert!(linux_cleanup.contains("LD_LIBRARY_PATH"));
+        assert!(linux_cleanup.contains("APPDIR"));
+
+        let mut non_linux_cleanup = Vec::new();
+        append_posix_runtime_environment_cleanup(&mut non_linux_cleanup, false);
+        assert!(non_linux_cleanup.is_empty());
         #[cfg(unix)]
         {
             let script_path =
@@ -844,6 +852,12 @@ mod tests_runtime_install {
             .collect::<HashSet<_>>();
 
         for variable in APPIMAGE_CHILD_ENV_VARS {
+            assert!(removed.contains(variable), "{variable} should be removed");
+        }
+        for variable in PYTHON_CHILD_ENV_VARS {
+            assert!(removed.contains(variable), "{variable} should be removed");
+        }
+        for variable in LINUX_PYTHON_CHILD_ENV_VARS {
             assert!(removed.contains(variable), "{variable} should be removed");
         }
         for variable in [

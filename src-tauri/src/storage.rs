@@ -105,9 +105,10 @@ fn write_storage_backup(data_dir: &Path, data: &AppStore) -> Result<(), String> 
 }
 
 struct SeekDbBridge {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
 }
 
 impl SeekDbBridge {
@@ -123,7 +124,9 @@ impl SeekDbBridge {
         }
         let helper = data_dir.join("runtime/seekdb_storage.py");
         fs::write(&helper, SEEKDB_STORAGE_HELPER).map_err(|error| error.to_string())?;
-        let mut child = Command::new(&python)
+        let mut command = Command::new(&python);
+        configure_python_command(&mut command);
+        let mut child = command
             .arg(&helper)
             .arg(config_path)
             .stdin(Stdio::piped())
@@ -139,10 +142,15 @@ impl SeekDbBridge {
             .stdout
             .take()
             .ok_or_else(|| "Failed to connect SeekDB output stream".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Failed to connect SeekDB error stream".to_string())?;
         let mut bridge = Self {
-            _child: child,
+            child,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
         };
         let ready = bridge.read_response()?;
         if !ready
@@ -165,7 +173,20 @@ impl SeekDbBridge {
             .read_line(&mut line)
             .map_err(|error| error.to_string())?;
         if line.trim().is_empty() {
-            return Err("SeekDB storage runtime exited unexpectedly".to_string());
+            // The bridge cannot recover after its protocol stream closes.
+            // Reap it before draining stderr so a lingering process cannot block.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let mut detail = String::new();
+            let _ = self.stderr.read_to_string(&mut detail);
+            return Err(if detail.trim().is_empty() {
+                "SeekDB storage runtime exited unexpectedly".to_string()
+            } else {
+                format!(
+                    "SeekDB storage runtime exited unexpectedly:\n{}",
+                    detail.trim()
+                )
+            });
         }
         serde_json::from_str(&line).map_err(|error| format!("SeekDB response format error: {error}"))
     }
