@@ -346,7 +346,7 @@ fn parse_atof_spans(content: &str) -> Vec<RawSpan> {
                 .as_ref()
                 .or(pair.end.as_ref())
                 .and_then(|e| e.parent_uuid.as_deref())
-                .map_or(true, |parent| !uuids.contains(parent))
+                .is_none_or(|parent| !uuids.contains(parent))
         })
         .map(|(uuid, _)| uuid.clone())
         .collect();

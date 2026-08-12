@@ -112,7 +112,7 @@ fn replace_port_in_context(content: &str, old_port: u16, new_port: u16) -> Strin
                 && keyword[..keyword.len().saturating_sub(4)]
                     .chars()
                     .last()
-                    .map_or(true, |c| c == '"' || c == '\'' || c.is_whitespace())
+                    .is_none_or(|c| c == '"' || c == '\'' || c.is_whitespace())
         };
         let in_port_context = trimmed_before.ends_with(':') || port_key_assignment || port_keyword;
         if in_port_context {
@@ -1153,11 +1153,11 @@ fn stop_instance_process(
             None,
         );
         if is_hybrid {
-            let docker_output = Command::new("docker")
+            if let Ok(out) = configured_command("docker")
                 .args(["compose", "stop"])
                 .current_dir(&instance.work_dir)
-                .output();
-            if let Ok(out) = docker_output {
+                .output()
+            {
                 if !out.status.success() {
                     state.log(
                         Some(&instance.id),
@@ -1175,7 +1175,7 @@ fn stop_instance_process(
         }
         Ok(stopped)
     } else {
-        let output = Command::new("docker")
+        let output = configured_command("docker")
             .args(["compose", "stop"])
             .current_dir(&instance.work_dir)
             .output()
@@ -1260,7 +1260,7 @@ fn find_compose_files_recursive(root: &Path, max_depth: usize) -> Vec<PathBuf> {
 /// matches `work_dir`. This is a fallback for when the compose file has been
 /// deleted or is not at the expected location.
 fn cleanup_docker_containers_by_label(work_dir: &str) -> Result<usize, String> {
-    let output = Command::new("docker")
+    let output = configured_command("docker")
         .args([
             "ps",
             "-a",
@@ -1293,19 +1293,20 @@ fn cleanup_docker_containers_by_label(work_dir: &str) -> Result<usize, String> {
     if matching_ids.is_empty() {
         return Ok(0);
     }
+    let matching_count = matching_ids.len();
     let mut args = vec!["rm".to_string(), "-f".to_string()];
-    args.extend(matching_ids.clone());
-    let remove_output = Command::new("docker")
+    args.extend(matching_ids);
+    let remove_output = configured_command("docker")
         .args(&args)
         .output()
         .map_err(|error| format!("Failed to execute docker rm: {error}"))?;
     if remove_output.status.success() {
-        Ok(matching_ids.len())
+        Ok(matching_count)
     } else {
         let stderr = String::from_utf8_lossy(&remove_output.stderr);
         Err(format!(
             "Failed to remove {} container(s) by label: {}",
-            matching_ids.len(),
+            matching_count,
             stderr.trim()
         ))
     }
@@ -1317,6 +1318,7 @@ fn cleanup_docker_containers_by_label(work_dir: &str) -> Result<usize, String> {
 /// 2. Falls back to label-based cleanup: finds containers whose
 ///    `com.docker.compose.project.working_dir` label matches `work_dir`
 ///    and removes them via `docker rm -f`.
+///
 /// Returns `Ok(true)` if any containers were cleaned up, `Ok(false)` if
 /// no compose files or matching containers were found.
 fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
@@ -1340,7 +1342,7 @@ fn cleanup_docker_containers(work_dir: &str) -> Result<bool, String> {
                 continue;
             }
         }
-        let output = Command::new("docker")
+        let output = configured_command("docker")
             .args(["compose", "down", "--remove-orphans"])
             .current_dir(compose_dir)
             .output();

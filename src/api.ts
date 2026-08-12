@@ -243,7 +243,7 @@ export const desktopApi = {
 
   async listInstances(): Promise<InstanceRecord[]> {
     if (isTauri()) return invoke("list_instances");
-    return loadMock().instances.sort((a, b) => b.createdAt - a.createdAt);
+    return loadMock().instances.sort((left, right) => right.id.localeCompare(left.id));
   },
 
   async listVault(): Promise<EnvVariable[]> {

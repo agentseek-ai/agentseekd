@@ -253,9 +253,9 @@ fn merge_env_entries(source: &[EnvVariable], vault: &[EnvVariable]) -> Vec<EnvVa
                     && url_host(&saved.value)
                         .map(|host| !host.contains('.'))
                         .unwrap_or(false);
-                if !is_local_service_port_key(&entry.key)
-                    && !saved.value.trim().is_empty()
-                    && !(template_is_loopback && vault_is_container_host)
+                if !(is_local_service_port_key(&entry.key)
+                    || saved.value.trim().is_empty()
+                    || (template_is_loopback && vault_is_container_host))
                 {
                     entry.value = saved.value.clone();
                     entry.source = "vault".to_string();

@@ -110,6 +110,7 @@ interface DockerConfirmationState {
   checking: boolean;
   starting: boolean;
   error: string;
+  restoreInstallModal: boolean;
 }
 
 interface CommentTooltipState {
@@ -1053,9 +1054,11 @@ export default function App() {
 
   const filteredInstances = useMemo(() => {
     const query = search.trim().toLowerCase();
-    return instances.filter((instance) =>
-      !query || [instance.name, instance.templateId, instance.workDir, instance.note].some((value) => value.toLowerCase().includes(query)),
-    );
+    return instances
+      .filter((instance) =>
+        !query || [instance.name, instance.templateId, instance.workDir, instance.note].some((value) => value.toLowerCase().includes(query)),
+      )
+      .sort((left, right) => right.id.localeCompare(left.id));
   }, [instances, search]);
 
   const totalInstancePages = Math.max(1, Math.ceil(filteredInstances.length / INSTANCES_PER_PAGE));
@@ -1145,32 +1148,40 @@ export default function App() {
   };
 
   const closeDockerConfirmation = (approved: boolean) => {
+    const restoreInstallModal = dockerConfirmation?.restoreInstallModal;
     dockerConfirmationRequestId.current += 1;
     dockerConfirmationResolver.current?.(approved);
     dockerConfirmationResolver.current = null;
     setDockerConfirmation(null);
+    if (restoreInstallModal) setInstallModalVisible(true);
   };
 
-  const requestDockerConfirmation = (instance: InstanceRecord, action: DockerConfirmationAction) => {
+  const requestDockerConfirmation = async (
+    instance: InstanceRecord,
+    action: DockerConfirmationAction,
+    options?: { hideInstallModal?: boolean },
+  ) => {
     dockerConfirmationResolver.current?.(false);
     const requestId = dockerConfirmationRequestId.current + 1;
     dockerConfirmationRequestId.current = requestId;
-    setDockerConfirmation({ instance, action, status: null, checking: true, starting: false, error: "" });
-    const result = new Promise<boolean>((resolve) => {
+    const restoreInstallModal = Boolean(options?.hideInstallModal);
+    try {
+      const status = await desktopApi.getInstanceDockerStatus(instance.id);
+      if (dockerConfirmationRequestId.current !== requestId) return false;
+      if (!status) {
+        dockerConfirmationResolver.current = null;
+        return true;
+      }
+      if (restoreInstallModal) setInstallModalVisible(false);
+      setDockerConfirmation({ instance, action, status, checking: false, starting: false, error: "", restoreInstallModal });
+    } catch (error) {
+      if (dockerConfirmationRequestId.current !== requestId) return false;
+      if (restoreInstallModal) setInstallModalVisible(false);
+      setDockerConfirmation({ instance, action, status: null, checking: false, starting: false, error: errorMessage(error), restoreInstallModal });
+    }
+    return new Promise<boolean>((resolve) => {
       dockerConfirmationResolver.current = resolve;
     });
-    void desktopApi.getInstanceDockerStatus(instance.id).then((status) => {
-      if (dockerConfirmationRequestId.current !== requestId) return;
-      if (!status) {
-        closeDockerConfirmation(true);
-        return;
-      }
-      setDockerConfirmation((current) => current?.instance.id === instance.id ? { ...current, status, checking: false } : current);
-    }).catch((error) => {
-      if (dockerConfirmationRequestId.current !== requestId) return;
-      setDockerConfirmation((current) => current?.instance.id === instance.id ? { ...current, checking: false, error: errorMessage(error) } : current);
-    });
-    return result;
   };
 
   const recheckDockerConfirmation = async () => {
@@ -1314,12 +1325,9 @@ export default function App() {
   const continueInstall = async () => {
     if (!installState?.instance || !installState.generated) return;
     const targetInstanceId = installState.instance.id;
-    setInstallModalVisible(false);
-    if (!(await requestDockerConfirmation(installState.instance, "deploy"))) {
-      setInstallModalVisible(true);
+    if (!(await requestDockerConfirmation(installState.instance, "deploy", { hideInstallModal: true }))) {
       return;
     }
-    setInstallModalVisible(true);
     const deployingInstance = { ...installState.instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) };
     setInstallState({ ...installState, instance: deployingInstance, step: "deploying", deploymentStage: "tasks", dockerStatus: null, dockerChecking: false, error: "" });
     replaceInstance(deployingInstance);
@@ -1373,12 +1381,9 @@ export default function App() {
       dockerStatus: null,
       dockerChecking: false,
     });
-    setInstallModalVisible(false);
-    if (!(await requestDockerConfirmation(instance, "deploy"))) {
-      setInstallModalVisible(true);
+    if (!(await requestDockerConfirmation(instance, "deploy", { hideInstallModal: true }))) {
       return;
     }
-    setInstallModalVisible(true);
     const targetInstanceId = instance.id;
     setInstallState((current) => current ? { ...current, step: "deploying", dockerStatus: null, dockerChecking: false, instance: { ...instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) } } : current);
     replaceInstance({ ...instance, status: "installing", updatedAt: Math.floor(Date.now() / 1000) });

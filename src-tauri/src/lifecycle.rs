@@ -418,8 +418,7 @@ fn sync_docker_compose_npm_mirror(content: &str) -> String {
         // Scan the entire service scope (all lines indented deeper than
         // the service key) for `npm install`.
         let mut service_has_npm_install = false;
-        for j in (i + 1)..lines.len() {
-            let next = &lines[j];
+        for next in lines.iter().skip(i + 1) {
             if next.trim().is_empty() {
                 continue;
             }
