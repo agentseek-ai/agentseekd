@@ -307,7 +307,11 @@ resolve_template_checkout() {
   if [[ -n "$TEMPLATE_PROXY" ]]; then
     proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
   fi
-  TEMPLATE_CHECKOUT=$(env "${proxy_env[@]}" git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  if [[ ${#proxy_env[@]} -gt 0 ]]; then
+    TEMPLATE_CHECKOUT=$(env "${proxy_env[@]}" git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  else
+    TEMPLATE_CHECKOUT=$(git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  fi
   if [[ -z "$TEMPLATE_CHECKOUT" ]]; then
     log_warn "Could not resolve template repo HEAD for $TEMPLATE_REPO"
     return 1
@@ -331,9 +335,15 @@ discover_templates() {
   if [[ -n "$TEMPLATE_PROXY" ]]; then
     proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
   fi
-  ids=$(env "${proxy_env[@]}" agentseek create --list-templates \
-    --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>/dev/null \
-    | grep -oE '^[[:space:]]{2,}[a-z0-9._-]+/[a-z0-9._-]+' | tr -d ' ')
+  if [[ ${#proxy_env[@]} -gt 0 ]]; then
+    ids=$(env "${proxy_env[@]}" agentseek create --list-templates \
+      --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>/dev/null \
+      | grep -oE '^[[:space:]]{2,}[a-z0-9._-]+/[a-z0-9._-]+' | tr -d ' ')
+  else
+    ids=$(agentseek create --list-templates \
+      --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>/dev/null \
+      | grep -oE '^[[:space:]]{2,}[a-z0-9._-]+/[a-z0-9._-]+' | tr -d ' ')
+  fi
   if [[ -z "$ids" ]]; then
     TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
     log_warn "agentseek --list-templates returned no templates — using built-in fallback list"
@@ -378,6 +388,39 @@ log_step()  { echo -e "${BLUE}---${NC} $*"; }
 # Check if a command exists
 has_command() {
   command -v "$1" >/dev/null 2>&1
+}
+
+# Read rendered HTTP health checks from an instance lifecycle.toml.
+# Usage: get_lifecycle_http_checks <instance_dir>
+# Output format: one "<target>|<name>" entry per line.
+get_lifecycle_http_checks() {
+  local instance_dir="$1"
+  local lifecycle_path="${instance_dir}/.agentseek/lifecycle.toml"
+  if [[ ! -f "$lifecycle_path" ]]; then
+    return 0
+  fi
+  python3 - "$lifecycle_path" <<'PY'
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(0)
+
+path = sys.argv[1]
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+
+checks = data.get("checks", {})
+for name, cfg in checks.items():
+    if not isinstance(cfg, dict):
+        continue
+    if cfg.get("type") != "http":
+        continue
+    target = cfg.get("target")
+    if isinstance(target, str) and target:
+        print(f"{target}|{name}")
+PY
 }
 
 # Wait for an HTTP endpoint to return 200 (or any 2xx) status.
@@ -952,11 +995,20 @@ test_template() {
   if [[ -n "$TEMPLATE_PROXY" ]]; then
     proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
   fi
-  if ! env "${proxy_env[@]}" agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" \
-      --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>&1 | tail -5; then
-    log_fail "  Failed to create instance"
-    FAILED+=("$tpl_id (create failed)")
-    return 1
+  if [[ ${#proxy_env[@]} -gt 0 ]]; then
+    if ! env "${proxy_env[@]}" agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" \
+        --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>&1 | tail -5; then
+      log_fail "  Failed to create instance"
+      FAILED+=("$tpl_id (create failed)")
+      return 1
+    fi
+  else
+    if ! agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" \
+        --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>&1 | tail -5; then
+      log_fail "  Failed to create instance"
+      FAILED+=("$tpl_id (create failed)")
+      return 1
+    fi
   fi
 
   # Find the newly created directory by comparing before/after.
@@ -1073,13 +1125,19 @@ test_template() {
 
   # Step 6: Wait for health checks.
   local health_urls=()
-  if [[ "$tpl_type" == "bub" ]]; then
-    if [[ -n "$gateway_url" ]]; then
-      health_urls+=("${gateway_url}/health|gateway")
-    fi
-  elif [[ "$tpl_type" == "langgraph" || "$tpl_type" == "langgraph-rubric" ]]; then
-    if [[ -n "$backend_url" ]]; then
-      health_urls+=("${backend_url}|langgraph")
+  while IFS= read -r check; do
+    [[ -n "$check" ]] && health_urls+=("$check")
+  done < <(get_lifecycle_http_checks "$instance_dir")
+
+  if [[ ${#health_urls[@]} -eq 0 ]]; then
+    if [[ "$tpl_type" == "bub" ]]; then
+      if [[ -n "$gateway_url" ]]; then
+        health_urls+=("${gateway_url}/health|gateway")
+      fi
+    elif [[ "$tpl_type" == "langgraph" || "$tpl_type" == "langgraph-rubric" ]]; then
+      if [[ -n "$backend_url" ]]; then
+        health_urls+=("${backend_url}|langgraph")
+      fi
     fi
   fi
 
