@@ -1727,7 +1727,7 @@ export default function App() {
                       setStorageConfigDirty(true);
                     }}>
                       <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
-                      {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
+                      <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                       <option value="seekdb_server">{tr("seekdbServer")}</option>
                     </select><ChevronDown /></div>
                   </label>
@@ -2220,7 +2220,7 @@ export default function App() {
                   setStorageConfigDirty(true);
                 }}>
                   <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
-                  {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
+                  <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                   <option value="seekdb_server">{tr("seekdbServer")}</option>
                 </select><ChevronDown /></div>
               </label>
