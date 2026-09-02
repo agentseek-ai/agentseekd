@@ -248,6 +248,16 @@ fn windows_runtime_install_script(
     let uv_installer = windows_uv_installer(requirements);
     let mut lines = vec![
         "$ErrorActionPreference = 'Stop'".to_string(),
+        // Windows PowerShell 5.1 defaults ServicePointManager.SecurityProtocol
+        // to Ssl3|Tls; astral.sh and nodejs.org reject those handshakes and
+        // Invoke-WebRequest silently hangs until the OS TCP timeout fires,
+        // which is what makes the terminal look frozen on first launch.
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12".to_string(),
+        // The Invoke-WebRequest progress bar combined with Start-Transcript
+        // deadlocks the conhost UI on Windows PowerShell 5.1 during the
+        // 50 MB Node.js download. Silence progress and rely on Write-Host.
+        "$ProgressPreference = 'SilentlyContinue'".to_string(),
+        "$InformationPreference = 'Continue'".to_string(),
         format!(
             "$StatusFile = {}",
             powershell_quote(&status_file.to_string_lossy())
@@ -445,7 +455,17 @@ fn launch_runtime_install_terminal(script_path: &Path) -> Result<(), String> {
     }
     if cfg!(windows) {
         configured_command("cmd")
-            .args(["/C", "start", "", "powershell.exe", "-NoProfile", "-File"])
+            .args([
+                "/C",
+                "start",
+                "",
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
             .arg(script_path)
             .spawn()
             .map_err(|error| format!("Failed to open PowerShell: {error}"))?;
@@ -817,6 +837,9 @@ mod tests_runtime_install {
             windows_runtime_install_script(&requirements, &status, task_dir, runtime_root);
         assert!(windows.contains("https://astral.sh/uv/install.ps1"));
         assert!(windows.contains("Invoke-DownloadWithRetry"));
+        assert!(windows.contains("[Net.ServicePointManager]::SecurityProtocol"));
+        assert!(windows.contains("[Net.SecurityProtocolType]::Tls12"));
+        assert!(windows.contains("$ProgressPreference = 'SilentlyContinue'"));
         assert!(!windows.contains("https://astral.sh/uv/install.sh"));
         assert!(!windows.contains("Read-Host"));
         assert!(!windows.contains("-NoExit"));
