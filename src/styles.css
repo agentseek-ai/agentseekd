@@ -424,6 +424,8 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; fo
 }
 .detail-body dl { grid-template-columns: 105px minmax(0, 1fr); }
 .application-entry { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 14px; border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border)); border-radius: 7px; background: var(--primary-soft); }
+.application-entry.secondary { background: var(--surface); border-color: var(--border); margin-top: 8px; }
+.application-entry.secondary .application-entry-icon { background: var(--primary-soft); color: var(--primary); }
 .application-entry.inactive { opacity: .7; }
 .application-entry-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 6px; background: var(--primary); color: #fff; }
 .application-entry-copy { min-width: 0; }
