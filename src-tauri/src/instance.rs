@@ -1217,7 +1217,72 @@ fn remove_instance_work_dir(work_dir: &str) -> Result<(), String> {
     {
         return Err("Refusing to delete AgentSeek Desktop current working directory".to_string());
     }
-    fs::remove_dir_all(&canonical).map_err(|error| format!("Failed to delete instance working directory: {error}"))
+    // Retry with backoff: recently-terminated processes (e.g. embedded SeekDB)
+    // may still hold open file descriptors on macOS, causing EBUSY / ENOTEMPTY.
+    let mut last_error = None;
+    for attempt in 0..4 {
+        match fs::remove_dir_all(&canonical) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(format!("Failed to delete instance working directory: {}", last_error.unwrap()))
+}
+
+/// Remove the embedded SeekDB data directory referenced by `SEEKDB_EMBED_DIR`
+/// in the instance `.env` file. This directory lives outside the working
+/// directory (typically under `~/.agentseek/<instance_name>/seekdb`) and must
+/// be cleaned up separately during instance deletion.
+fn cleanup_seekdb_embed_dir(work_dir: &str) {
+    let env_path = PathBuf::from(work_dir).join(".env");
+    let Ok(content) = fs::read_to_string(&env_path) else {
+        return;
+    };
+    let embed_dir = parse_env(&content)
+        .into_iter()
+        .find(|entry| entry.key == "SEEKDB_EMBED_DIR")
+        .map(|entry| entry.value)
+        .filter(|v| !v.trim().is_empty());
+    let Some(raw_dir) = embed_dir else {
+        return;
+    };
+    // Expand leading `~` / `~/` to the user's home directory.
+    let expanded = if let Some(rest) = raw_dir.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(|home| Path::new(&home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(&raw_dir))
+    } else if raw_dir == "~" {
+        env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&raw_dir))
+    } else {
+        PathBuf::from(&raw_dir)
+    };
+    if !expanded.exists() {
+        return;
+    }
+    let Ok(metadata) = fs::symlink_metadata(&expanded) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(canonical) = fs::canonicalize(&expanded) else {
+        return;
+    };
+    // Safety: never delete the home directory itself or any ancestor.
+    if let Some(home) = env::var_os("HOME") {
+        if fs::canonicalize(home).is_ok_and(|home| canonical.starts_with(&home) && canonical == home) {
+            return;
+        }
+    }
+    let _ = fs::remove_dir_all(&canonical);
 }
 
 fn docker_compose_file(project_dir: &Path) -> Option<PathBuf> {
@@ -2138,6 +2203,7 @@ async fn delete_instance(
                     ));
                 }
             };
+            cleanup_seekdb_embed_dir(&instance.work_dir);
             remove_instance_work_dir(&instance.work_dir)?;
             remove_runtime_log_spool(&state, &instance.id);
             state.remove_persisted_instance(&instance_id)?;
@@ -2317,6 +2383,58 @@ mod tests_instance {
         remove_instance_work_dir(&root.to_string_lossy()).expect("remove instance directory");
 
         assert!(!root.exists());
+    }
+    #[test]
+    fn cleanup_seekdb_embed_dir_removes_external_data_directory() {
+        // Create a fake work directory with a .env that points SEEKDB_EMBED_DIR
+        // to an external location (mimicking ~/.agentseek/<name>/seekdb).
+        let work_dir = env::temp_dir().join(format!("agentseek-seekdb-cleanup-{}", unique_stamp()));
+        fs::create_dir_all(&work_dir).expect("create work dir");
+
+        let embed_dir = env::temp_dir().join(format!("agentseek-seekdb-data-{}", unique_stamp()));
+        fs::create_dir_all(embed_dir.join("run")).expect("create embed dir");
+        fs::write(embed_dir.join("metadata.db"), "fake").expect("write fake db");
+
+        let env_content = format!(
+            "SEEKDB_EMBED=true\nSEEKDB_EMBED_DIR={}\nOCEANBASE_DB_NAME=test\n",
+            embed_dir.to_string_lossy()
+        );
+        fs::write(work_dir.join(".env"), &env_content).expect("write .env");
+
+        assert!(embed_dir.exists());
+        cleanup_seekdb_embed_dir(&work_dir.to_string_lossy());
+        assert!(!embed_dir.exists(), "SeekDB embed directory should be removed");
+
+        fs::remove_dir_all(&work_dir).ok();
+    }
+    #[test]
+    fn cleanup_seekdb_embed_dir_expands_tilde() {
+        let stamp = unique_stamp();
+        let work_dir = env::temp_dir().join(format!("agentseek-seekdb-tilde-{stamp}"));
+        fs::create_dir_all(&work_dir).expect("create work dir");
+
+        let home = env::var("HOME").expect("HOME must be set");
+        let dir_name = format!(".agentseek-test-{stamp}");
+        let embed_dir = PathBuf::from(&home).join(&dir_name);
+        fs::create_dir_all(&embed_dir).expect("create embed dir");
+
+        let env_content = format!("SEEKDB_EMBED_DIR=~/{dir_name}\n");
+        fs::write(work_dir.join(".env"), &env_content).expect("write .env");
+
+        assert!(embed_dir.exists(), "embed dir must exist before cleanup");
+        cleanup_seekdb_embed_dir(&work_dir.to_string_lossy());
+        assert!(!embed_dir.exists(), "tilde-expanded SeekDB directory should be removed");
+
+        fs::remove_dir_all(&work_dir).ok();
+    }
+    #[test]
+    fn cleanup_seekdb_embed_dir_no_op_when_missing() {
+        let work_dir = env::temp_dir().join(format!("agentseek-seekdb-noop-{}", unique_stamp()));
+        fs::create_dir_all(&work_dir).expect("create work dir");
+        fs::write(work_dir.join(".env"), "SEEKDB_EMBED=false\n").expect("write .env");
+        // Should not panic when SEEKDB_EMBED_DIR is absent.
+        cleanup_seekdb_embed_dir(&work_dir.to_string_lossy());
+        fs::remove_dir_all(&work_dir).ok();
     }
     #[test]
     fn instance_working_directory_is_parent_plus_instance_name() {
