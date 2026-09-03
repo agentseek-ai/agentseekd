@@ -606,7 +606,9 @@ fn accepts_port_flag(tokens: &[String]) -> bool {
     tokens.iter().any(|t| {
         let lower = t.to_ascii_lowercase();
         lower == "langgraph" || lower == "vite" || lower == "uvicorn"
+            || lower == "agentseek-api"
             || lower.contains("langgraph") || lower.contains("uvicorn")
+            || lower.contains("agentseek-api")
     })
 }
 
@@ -1366,6 +1368,14 @@ url = \"http://127.0.0.1:5174\"\n";
             "-lc".to_string(),
             "uv run langgraph dev".to_string()
         ]));
+        // agentseek-api dev also accepts --port
+        assert!(accepts_port_flag(&[
+            "uv".to_string(),
+            "run".to_string(),
+            "agentseek-api".to_string(),
+            "dev".to_string()
+        ]));
+        assert!(accepts_port_flag(&["agentseek-api".to_string(), "dev".to_string()]));
     }
     #[test]
     fn sync_process_command_ports_still_injects_port_for_non_npm_commands() {
@@ -1382,6 +1392,25 @@ url = \"http://127.0.0.1:5174\"\n";
         assert!(
             updated.contains("\"54584\""),
             "langgraph command should carry the port, got:\n{updated}"
+        );
+    }
+    #[test]
+    fn sync_process_command_ports_injects_port_for_agentseek_api() {
+        // agentseek-api dev must also get --port injected (regression: rubric
+        // template uses ["uv", "run", "agentseek-api", "dev"] and was starting
+        // on the default port 2024 instead of the resolved port).
+        let lifecycle = "version = 2\n\
+[services.langgraph]\nurl = \"http://127.0.0.1:60496\"\n\
+[processes.langgraph]\ncommand = [\"uv\", \"run\", \"agentseek-api\", \"dev\"]\n";
+        let entries = parse_env("LANGGRAPH_PORT=60496\n");
+        let updated = sync_process_command_ports(lifecycle, &entries);
+        assert!(
+            updated.contains("--port"),
+            "agentseek-api command should get --port, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("\"60496\""),
+            "agentseek-api command should carry the resolved port, got:\n{updated}"
         );
     }
     #[test]
