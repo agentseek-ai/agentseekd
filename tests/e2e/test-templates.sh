@@ -238,24 +238,23 @@ declare -a SKIPPED=()
 #   Field format: tpl_id|tpl_type|graph_id|needs_docker|extra_env|ci_only_skip|tpl_exports
 #   tpl_exports: comma-separated KEY=VALUE pairs exported when running tasks
 TEMPLATE_OVERRIDES=(
+  # Format: tpl_id|tpl_type|graph_id|needs_docker|extra_env|ci_only_skip|tpl_exports
+  # graph_id is auto-detected from langgraph.json — only set it when auto-detect
+  # would pick the wrong graph (e.g. cookiecutter variables not yet rendered).
   "bub/default|bub|||||"
   "deepagents/default|bub|||||"
-  "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
-  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
-  "deepagents/content-builder|langgraph|content_builder|0|||"
+  "deepagents/streaming|langgraph||0|||"
+  "deepagents/subagents-dynamic|langgraph||0|||"
+  "deepagents/research|langgraph||0|TAVILY_API_KEY||"
+  "deepagents/sandbox|langgraph||0|DAYTONA_API_KEY||"
+  "deepagents/content-builder|langgraph||0|||"
   "langchain/default|bub||1|||"
   "langchain/agentic-rag|||1|||"
   "langchain/agentic-rag-hybrid|||1|||"
   "langchain/agentic-rag-openvino|||1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
-  # graph_id is a cookiecutter variable ({{ cookiecutter.assistant_id }});
-  # pin it to the rendered value.
-  "langchain/cli-remote|langgraph|agent|0|||"
   # AG-UI gateway served via docker compose (no LangGraph protocol);
   # TAVILY_API_KEY is declared required in its lifecycle.toml doctor.
-  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
-  # rubric is a code-evaluation pipeline (not a chat agent); uses a custom
-  # input schema (request.rubric + request.max_iterations) and returns a report.
-  "langchain/rubric|langgraph-rubric|rubric-live|0|||"
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY|||"
 )
 
 # Templates are resolved through the agentseek CLI's explicit-catalog mode
@@ -271,20 +270,20 @@ TEMPLATE_PROXY="${E2E_TEMPLATE_PROXY:-}"
 FALLBACK_TEMPLATES=(
   "bub/default|bub||0|||"
   "deepagents/default|bub||0|||"
-  "deepagents/mcp|langgraph|mcp|0|||"
-  "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
-  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
-  "deepagents/content-builder|langgraph|content_builder|0|||"
+  "deepagents/streaming|langgraph||0|||"
+  "deepagents/subagents-dynamic|langgraph||0|||"
+  "deepagents/mcp|langgraph||0|||"
+  "deepagents/research|langgraph||0|TAVILY_API_KEY||"
+  "deepagents/sandbox|langgraph||0|DAYTONA_API_KEY||"
+  "deepagents/content-builder|langgraph||0|||"
   "langchain/default|bub||1|||"
-  "langchain/cli-remote|langgraph|agent|0|||"
-  "langchain/agentic-rag|langgraph|rag|1|||"
-  "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1|||"
-  "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
-  "langchain/markdown-messages|langgraph|agent|0|||"
-  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
-  # rubric is a code-evaluation pipeline (not a chat agent); uses a custom
-  # input schema (request.rubric + request.max_iterations) and returns a report.
-  "langchain/rubric|langgraph-rubric|rubric-live|0|||"
+  "langchain/cli-remote|langgraph||0|||"
+  "langchain/agentic-rag|||1|||"
+  "langchain/agentic-rag-hybrid|||1|||"
+  "langchain/agentic-rag-openvino|||1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
+  "langchain/markdown-messages|langgraph||0|||"
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY|||"
+  "langchain/rubric|langgraph-rubric||0|||"
 )
 
 # Filled by discover_templates() before the test loop runs.
@@ -421,6 +420,76 @@ for name, cfg in checks.items():
     if isinstance(target, str) and target:
         print(f"{target}|{name}")
 PY
+}
+
+# Auto-detect the first graph key from an instance's langgraph.json.
+# This eliminates the need to manually maintain graph_id mappings in
+# TEMPLATE_OVERRIDES / FALLBACK_TEMPLATES — new templates work out of the box.
+# Usage: detect_graph_id <instance_dir>
+# Output: first graph key, or empty string if not found.
+detect_graph_id() {
+  local instance_dir="$1"
+  local lg_file
+  lg_file=$(find "$instance_dir" -maxdepth 2 -name 'langgraph.json' -type f 2>/dev/null | head -1)
+  [[ -z "$lg_file" ]] && return 0
+  python3 - "$lg_file" <<'PY'
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        sys.exit(0)
+    # Standard format: graph names are nested under "graphs" key.
+    graphs = data.get("graphs")
+    if isinstance(graphs, dict) and graphs:
+        print(next(iter(graphs)))
+        sys.exit(0)
+    # Fallback: some templates may use top-level keys (non-metadata) as graph names.
+    for key in data:
+        if key not in ("dependencies", "env", "http", "persist", "graphs"):
+            print(key)
+            break
+except Exception:
+    pass
+PY
+}
+
+# Discover graph_id by querying the running LangGraph API.
+# Sends a probe request with empty assistant_id; the error response lists
+# all registered graphs. Works universally for any LangGraph template
+# regardless of langgraph.json format or presence.
+# Usage: discover_graph_id_from_api <base_url>
+# Output: first registered graph name, or empty string.
+discover_graph_id_from_api() {
+  local base_url="$1"
+  [[ -z "$base_url" ]] && return 0
+  # Create a temporary thread for the probe.
+  local thread_resp thread_id
+  thread_resp=$(curl -s -m 10 -X POST "${base_url}/threads" \
+    -H "Content-Type: application/json" \
+    -d '{"metadata": {}}' 2>/dev/null || echo "")
+  thread_id=$(echo "$thread_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('thread_id',''))" 2>/dev/null || echo "")
+  [[ -z "$thread_id" ]] && return 0
+  # Send a probe run with empty assistant_id to trigger the error response.
+  local probe_resp
+  probe_resp=$(curl -s -m 15 -X POST "${base_url}/threads/${thread_id}/runs/stream" \
+    -H "Content-Type: application/json" \
+    -d '{"assistant_id": "", "input": {"messages": []}}' 2>/dev/null || echo "")
+  # Parse the error detail to extract registered graph names.
+  echo "$probe_resp" | python3 -c "
+import sys, json, re
+try:
+    data = json.load(sys.stdin)
+    detail = data.get('detail', '')
+    # Match: 'One of the registered graphs: name1, name2, ...'
+    m = re.search(r'registered graphs:\s*(.+)', detail)
+    if m:
+        names = [n.strip() for n in m.group(1).split(',') if n.strip()]
+        if names:
+            print(names[0])
+except Exception:
+    pass
+" 2>/dev/null
 }
 
 # Wait for an HTTP endpoint to return 200 (or any 2xx) status.
@@ -1044,6 +1113,17 @@ test_template() {
     mv "$created_dir" "$instance_dir"
   fi
 
+  # Auto-detect graph_id from langgraph.json if not set by override.
+  # This is the key change that makes new templates work without script edits.
+  if [[ -z "$graph_id" ]] && [[ "$tpl_type" == "langgraph" || "$tpl_type" == "langgraph-rubric" ]]; then
+    local detected
+    detected=$(detect_graph_id "$instance_dir")
+    if [[ -n "$detected" ]]; then
+      graph_id="$detected"
+      log_info "  Auto-detected graph_id: $graph_id"
+    fi
+  fi
+
   # Step 2: Configure .env.
   log_info "  Configuring .env..."
   configure_env "$instance_dir" "$tpl_type" "$extra_env" "$needs_docker"
@@ -1164,6 +1244,20 @@ test_template() {
     cleanup_instance "$dev_pid" "$instance_dir"
     FAILED+=("$tpl_id (health check failed)")
     return 1
+  fi
+
+  # Step 6b: Discover graph_id from API if still unknown.
+  # This is the universal fallback — works for every LangGraph template
+  # regardless of langgraph.json format or presence.
+  if [[ -z "$graph_id" ]] && [[ "$tpl_type" == "langgraph" || "$tpl_type" == "langgraph-rubric" ]]; then
+    if [[ -n "$backend_url" ]]; then
+      local api_graph
+      api_graph=$(discover_graph_id_from_api "$backend_url")
+      if [[ -n "$api_graph" ]]; then
+        graph_id="$api_graph"
+        log_info "  Discovered graph_id from API: $graph_id"
+      fi
+    fi
   fi
 
   # Step 7: Send test message.
