@@ -586,6 +586,14 @@ pub(crate) struct LifecycleManifest {
 pub(crate) struct LifecycleServiceSpec {
     #[serde(default)]
     pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) primary: Option<bool>,
+    #[serde(default)]
+    pub(crate) display: String,
+    #[serde(default)]
+    pub(crate) description: String,
 }
 
 /// Truncate a string to at most `max` characters (char-boundary safe).

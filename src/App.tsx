@@ -1632,7 +1632,7 @@ export default function App() {
     if (normalized.includes("frontend") || normalized === "app" || normalized === "web") return "web";
     if (normalized.includes("gateway") || normalized === "agent") return "protocol";
     if (normalized.includes("copilotkit") || normalized.includes("langgraph")) return "api";
-    if (normalized.includes("studio") || normalized.includes("langsmith") || normalized.includes("phoenix")) return "web";
+    if (normalized.includes("studio") || normalized.includes("langsmith") || normalized.includes("phoenix") || normalized.includes("agentbase")) return "web";
     return "other";
   };
   const detailEndpoints = detailInstance

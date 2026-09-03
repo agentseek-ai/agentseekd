@@ -123,11 +123,11 @@ fn enrich_service_endpoints(instance: &mut InstanceRecord) -> bool {
         .services
         .into_iter()
         .filter(|(_, service)| !service.url.trim().is_empty())
-        .map(|(name, service)| {
-            let url = service_env_port(&name, &env)
+        .map(|(name, mut service)| {
+            service.url = service_env_port(&name, &env)
                 .map(|port| replace_url_port(&service.url, port))
                 .unwrap_or(service.url);
-            (name, url)
+            (name, service)
         })
         .collect::<Vec<_>>();
     services.sort_by_key(|(name, _)| match name.to_ascii_lowercase().as_str() {
@@ -139,21 +139,33 @@ fn enrich_service_endpoints(instance: &mut InstanceRecord) -> bool {
     });
     instance.service_endpoints = services
         .iter()
-        .map(|(name, url)| {
-            let (kind, primary) = service_kind(name);
+        .map(|(name, service)| {
+            // Prefer kind/primary from lifecycle.toml; fall back to name inference.
+            let (inferred_kind, inferred_primary) = service_kind(name);
+            let kind = if service.kind.is_empty() {
+                inferred_kind
+            } else {
+                &service.kind
+            };
+            let primary = service.primary.unwrap_or(inferred_primary);
+            let display_name = if service.display.is_empty() {
+                service_display_name(name)
+            } else {
+                service.display.clone()
+            };
             ServiceEndpoint {
-                name: service_display_name(name),
-                url: url.clone(),
+                name: display_name,
+                url: service.url.clone(),
                 kind: kind.to_string(),
                 primary,
             }
         })
         .collect();
-    for (name, url) in services {
+    for (name, service) in &services {
         match name.to_ascii_lowercase().as_str() {
-            "gateway" | "agent" => instance.agent_url = Some(url),
-            "app" | "frontend" | "web" => instance.ui_url = Some(url),
-            "studio" | "langsmith" => instance.studio_url = Some(url),
+            "gateway" | "agent" => instance.agent_url = Some(service.url.clone()),
+            "app" | "frontend" | "web" => instance.ui_url = Some(service.url.clone()),
+            "studio" | "langsmith" => instance.studio_url = Some(service.url.clone()),
             _ => {}
         }
     }
