@@ -168,8 +168,26 @@ fn curl_program() -> &'static str {
     }
 }
 
+fn version_command(program: &str, arg: &str) -> Command {
+    #[cfg(windows)]
+    {
+        // CreateProcess cannot execute .cmd/.bat shims (e.g. the managed
+        // npm.cmd), so route those through cmd.exe /C. Node-style .exe
+        // programs still launch directly.
+        let lowered = program.to_ascii_lowercase();
+        if lowered.ends_with(".cmd") || lowered.ends_with(".bat") {
+            let mut command = configured_command("cmd.exe");
+            command.args(["/C", program, arg]);
+            return command;
+        }
+    }
+    let mut command = configured_command(program);
+    command.arg(arg);
+    command
+}
+
 fn command_version(program: &str, arg: &str) -> Option<String> {
-    let output = configured_command(program).arg(arg).output().ok()?;
+    let output = version_command(program, arg).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -308,7 +326,10 @@ fn program_from_login_shell(program: &str) -> Option<String> {
         return None;
     }
     #[cfg(windows)]
-    let output = Command::new("where.exe").arg(program).output().ok()?;
+    let output = configured_command("where.exe")
+        .arg(program)
+        .output()
+        .ok()?;
     #[cfg(not(windows))]
     let output = {
         let shell = env::var_os("SHELL")
