@@ -1886,19 +1886,61 @@ async fn continue_install(
             run_and_log(&state, &instance, &["doctor"], "execution")?;
             state.set_deployment_stage(&instance_id, "dry-run");
             run_and_log(&state, &instance, &["dev", "--dry-run"], "execution")?;
+            // Acquire deployment permit to limit concurrent heavy startups.
+            let _deployment_permit = state.deployment_gate.acquire();
             state.set_deployment_stage(&instance_id, "starting");
-            spawn_instance(&state, &mut instance, true)?;
-            instance.status = "starting".to_string();
-            instance.updated_at = timestamp();
-            update_instance(&state, instance.clone())?;
-            if let Err(error) = wait_for_instance_ready(&state, &instance) {
-                let process_already_exited = instance
-                    .pid
-                    .is_some_and(|pid| !process_exists(pid));
-                if !process_already_exited {
-                    let _ = stop_instance_process(&state, &instance, "install");
+
+            // Retry spawn+wait up to 3 attempts to survive transient memory pressure
+            // during batch deployment (each embedded SeekDB reserves ~1GB; concurrent
+            // starts can cause swap storms that make health checks time out).
+            const MAX_STARTUP_ATTEMPTS: u32 = 3;
+            let mut last_error = String::new();
+            let mut started = false;
+            for attempt in 1..=MAX_STARTUP_ATTEMPTS {
+                if attempt > 1 {
+                    let delay = Duration::from_secs(10 * u64::from(attempt - 1));
+                    state.log(
+                        Some(&instance.id),
+                        &instance.name,
+                        "install",
+                        "info",
+                        format!(
+                            "Startup attempt {}/{} after {}s backoff (previous: {})",
+                            attempt,
+                            MAX_STARTUP_ATTEMPTS,
+                            delay.as_secs(),
+                            last_error.lines().next().unwrap_or("unknown"),
+                        ),
+                        None,
+                    );
+                    std::thread::sleep(delay);
                 }
-                return Err(error);
+                match (|| -> Result<(), String> {
+                    spawn_instance(&state, &mut instance, attempt == 1)?;
+                    instance.status = "starting".to_string();
+                    instance.updated_at = timestamp();
+                    update_instance(&state, instance.clone())?;
+                    wait_for_instance_ready(&state, &instance)?;
+                    Ok(())
+                })() {
+                    Ok(()) => {
+                        started = true;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = error.clone();
+                        // Stop the failed process before retrying.
+                        let process_already_exited =
+                            instance.pid.is_some_and(|pid| !process_exists(pid));
+                        if !process_already_exited {
+                            let _ = stop_instance_process(&state, &instance, "install");
+                        }
+                        instance.pid = None;
+                    }
+                }
+            }
+            if !started {
+                return Err(last_error);
             }
             instance.status = "running".to_string();
             instance.needs_doctor = false;
@@ -2030,6 +2072,7 @@ async fn restart_instance(
                 "--- Instance restarting ---".to_string(),
                 None,
             );
+            let _deployment_permit = state.deployment_gate.acquire();
             spawn_instance(&state, &mut instance, false)?;
             instance.status = "starting".to_string();
             instance.updated_at = timestamp();
