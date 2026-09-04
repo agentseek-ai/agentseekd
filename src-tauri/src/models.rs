@@ -592,8 +592,6 @@ pub(crate) struct LifecycleServiceSpec {
     pub(crate) primary: Option<bool>,
     #[serde(default)]
     pub(crate) display: String,
-    #[serde(default)]
-    pub(crate) description: String,
 }
 
 /// Truncate a string to at most `max` characters (char-boundary safe).
