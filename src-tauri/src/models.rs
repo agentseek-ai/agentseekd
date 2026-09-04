@@ -335,11 +335,7 @@ pub(crate) const HF_MIRROR: &str = "https://hf-mirror.com";
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            mode: if cfg!(windows) {
-                "sqlite_embedded".to_string()
-            } else {
-                "seekdb_embedded".to_string()
-            },
+            mode: "seekdb_embedded".to_string(),
             path: String::new(),
             host: String::new(),
             port: default_database_port(),
@@ -590,6 +586,12 @@ pub(crate) struct LifecycleManifest {
 pub(crate) struct LifecycleServiceSpec {
     #[serde(default)]
     pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) primary: Option<bool>,
+    #[serde(default)]
+    pub(crate) display: String,
 }
 
 /// Truncate a string to at most `max` characters (char-boundary safe).

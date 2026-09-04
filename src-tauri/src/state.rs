@@ -56,6 +56,55 @@ fn instance_has_completed_deployment(
         .has_completed_deployment(&instance.id)
 }
 
+/// Blocking counting semaphore that limits concurrent instance deployments.
+/// Each deployment acquires a permit before spawning heavy processes (agentseek dev
+/// + embedded SeekDB initialization) to avoid CPU/IO contention causing timeouts.
+struct DeploymentGate {
+    max_concurrent: usize,
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+/// RAII guard returned by [`DeploymentGate::acquire`]; releases the permit on drop.
+struct DeploymentPermit {
+    gate: Arc<DeploymentGate>,
+}
+
+impl Drop for DeploymentPermit {
+    fn drop(&mut self) {
+        let mut active = self.gate.active.lock().unwrap();
+        *active -= 1;
+        self.gate.available.notify_one();
+    }
+}
+
+impl DeploymentGate {
+    fn new(max_concurrent: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_concurrent,
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        })
+    }
+
+    /// Block the current thread until a deployment slot is available, then acquire it.
+    fn acquire(self: &Arc<Self>) -> DeploymentPermit {
+        let mut active = self.active.lock().unwrap();
+        while *active >= self.max_concurrent {
+            active = self.available.wait(active).unwrap();
+        }
+        *active += 1;
+        DeploymentPermit {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+/// Maximum number of instances that may be spawning/waiting-for-ready concurrently.
+/// Embedded SeekDB initialization is I/O and CPU intensive; serializing partially
+/// prevents cold-start contention during batch template deployment.
+const MAX_CONCURRENT_DEPLOYMENTS: usize = 3;
+
 #[derive(Clone)]
 struct DesktopState {
     data_dir: PathBuf,
@@ -71,6 +120,7 @@ struct DesktopState {
     next_log_sequence: Arc<Mutex<u64>>,
     runtime_log_sync: Arc<Mutex<()>>,
     deployment_stages: Arc<Mutex<HashMap<String, String>>>,
+    deployment_gate: Arc<DeploymentGate>,
 }
 
 impl DesktopState {
@@ -343,6 +393,7 @@ impl DesktopState {
             next_log_sequence: Arc::new(Mutex::new(next_log_sequence)),
             runtime_log_sync: Arc::new(Mutex::new(())),
             deployment_stages: Arc::new(Mutex::new(HashMap::new())),
+            deployment_gate: DeploymentGate::new(MAX_CONCURRENT_DEPLOYMENTS),
         }
     }
 

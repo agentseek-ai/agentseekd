@@ -1297,12 +1297,6 @@ async fn configure_storage(
         if !allowed.contains(&config.mode.as_str()) {
             return Err("Unsupported desktop storage type".to_string());
         }
-        // Embedded SeekDB requires a Python runtime (pyseekdb) that is not
-        // supported on Windows. Reject the mode early so the frontend can
-        // surface a clear error instead of failing at runtime.
-        if cfg!(windows) && config.mode == "seekdb_embedded" {
-            return Err("Embedded SeekDB is not supported on Windows. Use SQLite or a remote server.".to_string());
-        }
         config.setup_completed = true;
         normalize_storage_database(&mut config);
         if !(1..=3_650).contains(&config.runtime_log_retention_days) {

@@ -1632,7 +1632,7 @@ export default function App() {
     if (normalized.includes("frontend") || normalized === "app" || normalized === "web") return "web";
     if (normalized.includes("gateway") || normalized === "agent") return "protocol";
     if (normalized.includes("copilotkit") || normalized.includes("langgraph")) return "api";
-    if (normalized.includes("studio") || normalized.includes("langsmith") || normalized.includes("phoenix")) return "web";
+    if (normalized.includes("studio") || normalized.includes("langsmith") || normalized.includes("phoenix") || normalized.includes("agentbase")) return "web";
     return "other";
   };
   const detailEndpoints = detailInstance
@@ -1649,8 +1649,9 @@ export default function App() {
           detailInstance.studioUrl ? { name: "Studio", label: tr("studioUrl"), url: detailInstance.studioUrl, kind: "web", primary: false } : null,
         ].filter((endpoint): endpoint is NonNullable<typeof endpoint> => endpoint !== null)
     : [];
-  const primaryEndpoint = detailEndpoints.find((endpoint) => endpoint.primary && endpoint.kind === "web");
-  const integrationEndpoints = detailEndpoints.filter((endpoint) => endpoint !== primaryEndpoint);
+  const webEndpoints = detailEndpoints.filter((endpoint) => endpoint.kind === "web");
+  const primaryEndpoint = webEndpoints.find((endpoint) => endpoint.primary) ?? webEndpoints[0];
+  const integrationEndpoints = detailEndpoints.filter((endpoint) => endpoint.kind !== "web");
   const observationEndpoints = detailEndpoints.filter((endpoint) => {
     if (endpoint.kind !== "web") return false;
     const fingerprint = `${endpoint.name} ${endpoint.label} ${endpoint.url}`.toLowerCase();
@@ -1727,7 +1728,7 @@ export default function App() {
                       setStorageConfigDirty(true);
                     }}>
                       <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
-                      {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
+                      <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                       <option value="seekdb_server">{tr("seekdbServer")}</option>
                     </select><ChevronDown /></div>
                   </label>
@@ -2045,8 +2046,8 @@ export default function App() {
               {/* ── Tab: Application entry ── */}
               {detailTab === "entry" && (
                 <>
-                  <section className="application-section"><h3>{tr("webEntry")}</h3>{primaryEndpoint ? <div className={`application-entry ${!detailIsRunning ? "inactive" : ""}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{primaryEndpoint.label}</span><strong>{primaryEndpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(primaryEndpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(primaryEndpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{tr("openApplication")}</button></div></div> : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
-                  {integrationEndpoints.length > 0 && <section><h3>{tr("integrationEndpoints")}</h3>{integrationEndpoints.map((endpoint) => <div className={`endpoint ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div>{endpoint.kind === "web" && <button className="icon-button" disabled={!detailIsRunning} title={tr("openAddress")} aria-label={tr("openAddress")} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink /></button>}</div>)}</section>}
+                  <section className="application-section"><h3>{tr("webEntry")}</h3>{webEndpoints.length > 0 ? webEndpoints.map((endpoint) => <div className={`application-entry ${endpoint === primaryEndpoint ? "" : "secondary"} ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div className="application-entry-icon"><ExternalLink /></div><div className="application-entry-copy"><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div><div className="endpoint-actions"><button className="icon-button" title={tr("copyAddress")} aria-label={tr("copyAddress")} onClick={() => { void navigator.clipboard.writeText(endpoint.url); notify(tr("copied")); }} type="button"><Copy /></button><button className="button primary" disabled={!detailIsRunning} onClick={() => { void desktopApi.openExternalUrl(endpoint.url).catch((error) => notify(errorMessage(error))); }} type="button"><ExternalLink />{endpoint === primaryEndpoint ? tr("openApplication") : tr("openAddress")}</button></div></div>) : <div className="no-application-entry"><CircleAlert /><span>{tr("noApplicationEntry")}</span></div>}</section>
+                  {integrationEndpoints.length > 0 && <section><h3>{tr("integrationEndpoints")}</h3>{integrationEndpoints.map((endpoint) => <div className={`endpoint ${!detailIsRunning ? "inactive" : ""}`} key={`${endpoint.label}-${endpoint.url}`}><div><span>{endpoint.label}</span><strong>{endpoint.url}</strong>{!detailIsRunning && <small>{tr("availableAfterDeploy")}</small>}</div></div>)}</section>}
                 </>
               )}
 
@@ -2220,7 +2221,7 @@ export default function App() {
                   setStorageConfigDirty(true);
                 }}>
                   <option value="sqlite_embedded">{tr("embeddedSqlite")}</option>
-                  {cliStatus?.platform !== "windows" && <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>}
+                  <option value="seekdb_embedded">{tr("embeddedSeekdb")}</option>
                   <option value="seekdb_server">{tr("seekdbServer")}</option>
                 </select><ChevronDown /></div>
               </label>
