@@ -777,10 +777,10 @@ fn system_info(state: State<'_, DesktopState>) -> SystemInfo {
         .map(|mode| mode.clone())
         .unwrap_or_else(|_| "sqlite_embedded".to_string());
     let (data_path, storage) = match effective_mode.as_str() {
-        "seekdb_embedded" => (config.path, "Embedded SeekDB".to_string()),
+        "seekdb_embedded" => (config.path, "Embedded seekdb".to_string()),
         "seekdb_server" | "oceanbase_server" => (
             format!("{}:{} / {}", config.host, config.port, config.database),
-            "SeekDB / OceanBase Server".to_string(),
+            "seekdb / OceanBase Server".to_string(),
         ),
         _ => (
             sqlite_database_path(&state.data_dir, &config)

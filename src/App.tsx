@@ -176,7 +176,7 @@ function errorMessage(error: unknown) {
 function storageModeLabel(mode: StorageStatus["mode"] | StorageStatus["effectiveMode"]) {
   if (mode === "sqlite_embedded") return "sqlite";
   if (mode === "seekdb_embedded") return "seekdb";
-  return "SeekDB / OceanBase Server";
+  return "seekdb / OceanBase Server";
 }
 
 function storagePathForMode(config: StorageStatus, mode: StorageStatus["mode"]) {

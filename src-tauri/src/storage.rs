@@ -120,7 +120,7 @@ impl SeekDbBridge {
             runtime.join("bin/python")
         };
         if !python.is_file() {
-            return Err("SeekDB private runtime not yet installed".to_string());
+            return Err("seekdb private runtime not yet installed".to_string());
         }
         let helper = data_dir.join("runtime/seekdb_storage.py");
         fs::write(&helper, SEEKDB_STORAGE_HELPER).map_err(|error| error.to_string())?;
@@ -133,19 +133,19 @@ impl SeekDbBridge {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("Failed to start SeekDB storage runtime: {error}"))?;
+            .map_err(|error| format!("Failed to start seekdb storage runtime: {error}"))?;
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "Failed to connect SeekDB input stream".to_string())?;
+            .ok_or_else(|| "Failed to connect seekdb input stream".to_string())?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "Failed to connect SeekDB output stream".to_string())?;
+            .ok_or_else(|| "Failed to connect seekdb output stream".to_string())?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| "Failed to connect SeekDB error stream".to_string())?;
+            .ok_or_else(|| "Failed to connect seekdb error stream".to_string())?;
         let mut bridge = Self {
             child,
             stdin,
@@ -161,7 +161,7 @@ impl SeekDbBridge {
             return Err(ready
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("SeekDB initialization failed")
+                .unwrap_or("seekdb initialization failed")
                 .to_string());
         }
         Ok(bridge)
@@ -180,15 +180,15 @@ impl SeekDbBridge {
             let mut detail = String::new();
             let _ = self.stderr.read_to_string(&mut detail);
             return Err(if detail.trim().is_empty() {
-                "SeekDB storage runtime exited unexpectedly".to_string()
+                "seekdb storage runtime exited unexpectedly".to_string()
             } else {
                 format!(
-                    "SeekDB storage runtime exited unexpectedly:\n{}",
+                    "seekdb storage runtime exited unexpectedly:\n{}",
                     detail.trim()
                 )
             });
         }
-        serde_json::from_str(&line).map_err(|error| format!("SeekDB response format error: {error}"))
+        serde_json::from_str(&line).map_err(|error| format!("seekdb response format error: {error}"))
     }
 
     fn request(&mut self, request: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -208,7 +208,7 @@ impl SeekDbBridge {
             Err(response
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("SeekDB operation failed")
+                .unwrap_or("seekdb operation failed")
                 .to_string())
         }
     }
@@ -697,7 +697,7 @@ impl StorageEngine {
                     response
                         .get("page")
                         .cloned()
-                        .ok_or_else(|| "SeekDB log pagination response missing page".to_string())?,
+                        .ok_or_else(|| "seekdb log pagination response missing page".to_string())?,
                 )
                 .map_err(|error| error.to_string())
             }
@@ -721,7 +721,7 @@ impl StorageEngine {
                 .request(serde_json::json!({"op": "max_log_sequence"}))?
                 .get("sequence")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "SeekDB log sequence response invalid".to_string()),
+                .ok_or_else(|| "seekdb log sequence response invalid".to_string()),
         }
     }
 
@@ -741,7 +741,7 @@ impl StorageEngine {
                 .get("count")
                 .and_then(serde_json::Value::as_u64)
                 .map(|value| value as usize)
-                .ok_or_else(|| "SeekDB log count response invalid".to_string()),
+                .ok_or_else(|| "seekdb log count response invalid".to_string()),
         }
     }
 
@@ -772,7 +772,7 @@ impl StorageEngine {
                 }))?
                 .get("completed")
                 .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| "SeekDB deployment status response invalid".to_string()),
+                .ok_or_else(|| "seekdb deployment status response invalid".to_string()),
         }
     }
 
@@ -843,7 +843,7 @@ impl StorageEngine {
                 .get("removed")
                 .and_then(serde_json::Value::as_u64)
                 .map(|value| value as usize)
-                .ok_or_else(|| "SeekDB log cleanup response invalid".to_string()),
+                .ok_or_else(|| "seekdb log cleanup response invalid".to_string()),
         }
     }
 
@@ -1149,16 +1149,16 @@ fn ensure_seekdb_runtime(data_dir: &Path) -> Result<PathBuf, String> {
         runtime.join("bin/python")
     };
     if !python.is_file() {
-        let uv = uv_program().ok_or_else(|| "Please install uv before configuring SeekDB".to_string())?;
+        let uv = uv_program().ok_or_else(|| "Please install uv before configuring seekdb".to_string())?;
         run_dependency_command(
             &uv,
             &["venv", &runtime.to_string_lossy(), "--python", "3.12"],
-            "Creating AgentSeek Desktop SeekDB private Python environment",
+            "Creating AgentSeek Desktop seekdb private Python environment"
         )?;
     }
     let marker = runtime.join(".pyseekdb-installed");
     if !marker.is_file() {
-        let uv = uv_program().ok_or_else(|| "Please install uv before configuring SeekDB".to_string())?;
+        let uv = uv_program().ok_or_else(|| "Please install uv before configuring seekdb".to_string())?;
         // Version resolution: versions.pyseekdb.pinned in the runtime
         // requirements manifest. When unset, install the latest PyPI release.
         let package = load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS)
