@@ -148,10 +148,11 @@ fn enrich_service_endpoints(instance: &mut InstanceRecord) -> bool {
                 &service.kind
             };
             let primary = service.primary.unwrap_or(inferred_primary);
-            let display_name = if service.display.is_empty() {
+            // Use TOML name as label; fall back to name-based inference.
+            let display_name = if service.name.is_empty() {
                 service_display_name(name)
             } else {
-                service.display.clone()
+                service.name.clone()
             };
             ServiceEndpoint {
                 name: display_name,

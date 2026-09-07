@@ -587,6 +587,8 @@ pub(crate) struct LifecycleServiceSpec {
     #[serde(default)]
     pub(crate) url: String,
     #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
     pub(crate) kind: String,
     #[serde(default)]
     pub(crate) primary: Option<bool>,
