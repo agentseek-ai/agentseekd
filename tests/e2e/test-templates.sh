@@ -255,6 +255,12 @@ TEMPLATE_OVERRIDES=(
   # AG-UI gateway served via docker compose (no LangGraph protocol);
   # TAVILY_API_KEY is declared required in its lifecycle.toml doctor.
   "langchain/relay-observability|bub||1|TAVILY_API_KEY|||"
+  # RAG + AIOps agent backed by a real AgentBase service. Its lifecycle.toml
+  # doctor marks AGENTBASE_PROJECT_ID/AGENTBASE_API_KEY required, so agentseek
+  # dev aborts startup without them and the backend/frontend health checks
+  # never come up. Gate on those credentials: skipped in mock CI (same as
+  # deepagents/sandbox / DAYTONA_API_KEY) and exercised when they are provided.
+  "langchain/agentbase-rag-agentops|langgraph||0|AGENTBASE_PROJECT_ID,AGENTBASE_API_KEY||"
 )
 
 # Templates are resolved through the agentseek CLI's explicit-catalog mode

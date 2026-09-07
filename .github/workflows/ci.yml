@@ -151,5 +151,9 @@ jobs:
           E2E_MODEL: ${{ secrets.E2E_MODEL }}
           TAVILY_API_KEY: ${{ secrets.E2E_TAVILY_API_KEY }}
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          # When these AgentBase credentials are defined, the e2e script runs
+          # langchain/agentbase-rag-agentops; unset, it is skipped (mock CI).
+          AGENTBASE_PROJECT_ID: ${{ secrets.AGENTBASE_PROJECT_ID }}
+          AGENTBASE_API_KEY: ${{ secrets.AGENTBASE_API_KEY }}
           SKIP_CI_ONLY: 1
         run: npm run test:e2e
