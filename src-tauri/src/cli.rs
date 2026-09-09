@@ -1,6 +1,23 @@
 // CLI runtime detection: version comparison, dependency checking,
 // agentseek/uv program resolution, and CLI process execution.
 
+/// Candidate user-home directories, ordered. Windows GUI processes normally
+/// expose the profile through `USERPROFILE` instead of `HOME`, so tools the
+/// install script drops under `%USERPROFILE%\.local\bin` stay discoverable.
+/// On macOS/Linux only `HOME` is set, preserving the previous behavior.
+fn home_dirs() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = env::var_os(key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() && !homes.contains(&path) {
+                homes.push(path);
+            }
+        }
+    }
+    homes
+}
+
 fn runtime_path() -> std::ffi::OsString {
     let mut paths = Vec::new();
     if let Some(runtime_root) = env::var_os("AGENTSEEK_DESKTOP_RUNTIME_DIR") {
@@ -23,11 +40,11 @@ fn runtime_path() -> std::ffi::OsString {
     if let Some(managed_node_bin) = env::var_os("AGENTSEEK_DESKTOP_NODE_BIN") {
         paths.push(PathBuf::from(managed_node_bin));
     }
-    if let Some(home) = env::var_os("HOME") {
-        paths.push(PathBuf::from(&home).join(".local/bin"));
-        paths.push(PathBuf::from(&home).join(".cargo/bin"));
-        paths.push(PathBuf::from(&home).join(".pyenv/shims"));
-        paths.push(PathBuf::from(home).join(".pyenv/bin"));
+    for home in home_dirs() {
+        paths.push(home.join(".local").join("bin"));
+        paths.push(home.join(".cargo").join("bin"));
+        paths.push(home.join(".pyenv").join("shims"));
+        paths.push(home.join(".pyenv").join("bin"));
     }
     paths.extend([
         PathBuf::from("/opt/homebrew/bin"),
@@ -157,6 +174,19 @@ fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     // External runtimes must not inherit Python or AppImage paths from the
     // desktop process. Those paths can point at a transient AppImage mount.
     configure_python_command(&mut command);
+    #[cfg(windows)]
+    {
+        // This app runs as a windowless GUI subsystem (see main.rs). Without
+        // CREATE_NO_WINDOW every console child (uv.exe, node.exe, where.exe,
+        // cmd.exe, curl.exe) is given a fresh console that flashes on screen
+        // and closes on exit. The dependency probe launches many of these in a
+        // row, which is exactly the repeated terminal popup seen on Windows.
+        // The install terminal is still shown because it is spawned through
+        // `start`, which always opens its own console.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command
 }
 
@@ -375,10 +405,11 @@ fn uv_program() -> Option<String> {
         }
     }
     let mut candidates = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(&home).join(".local/bin/uv"));
-        candidates.push(PathBuf::from(&home).join(".cargo/bin/uv"));
-        candidates.push(PathBuf::from(home).join(".pyenv/shims/uv"));
+    let uv_name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    for home in home_dirs() {
+        candidates.push(home.join(".local").join("bin").join(uv_name));
+        candidates.push(home.join(".cargo").join("bin").join(uv_name));
+        candidates.push(home.join(".pyenv").join("shims").join(uv_name));
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/uv"),
@@ -823,6 +854,23 @@ mod tests_cli {
 
         for variable in PYTHON_CHILD_ENV_VARS {
             assert!(removed.contains(variable), "{variable} should be removed");
+        }
+    }
+
+    #[test]
+    fn home_dirs_are_non_empty_and_deduplicated() {
+        let homes = home_dirs();
+        for home in &homes {
+            assert!(!home.as_os_str().is_empty(), "home_dirs must drop empty values");
+        }
+        let unique: HashSet<_> = homes.iter().collect();
+        assert_eq!(unique.len(), homes.len(), "home_dirs must not repeat a directory");
+        // When HOME is present it must lead, so macOS/Linux resolution keeps
+        // preferring the shell home before the Windows USERPROFILE fallback.
+        if let Some(home) = env::var_os("HOME") {
+            if !home.is_empty() {
+                assert_eq!(homes.first(), Some(&PathBuf::from(home)));
+            }
         }
     }
 
