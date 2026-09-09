@@ -272,7 +272,7 @@ fn windows_runtime_install_script(
         ),
         "New-Item -ItemType Directory -Force -Path (Split-Path $StatusFile) | Out-Null".to_string(),
         "$Stage = 'starting'".to_string(),
-        "'{\"status\":\"running\",\"stage\":\"starting\"}' | Set-Content -Encoding UTF8 $StatusFile".to_string(),
+        "[IO.File]::WriteAllText($StatusFile, '{\"status\":\"running\",\"stage\":\"starting\"}')".to_string(),
         "Start-Transcript -Path $LogFile -Force".to_string(),
         "function Invoke-DownloadWithRetry {".to_string(),
         "  param([string]$Uri, [string]$OutFile, [string]$Label)".to_string(),
@@ -292,7 +292,7 @@ fn windows_runtime_install_script(
         "  Write-Host 'AgentSeek Desktop runtime installation'".to_string(),
     ];
     if !status.uv_compatible {
-        lines.push("  $Stage = 'uv'; ('{\"status\":\"running\",\"stage\":\"uv\"}') | Set-Content -Encoding UTF8 $StatusFile".to_string());
+        lines.push("  $Stage = 'uv'; [IO.File]::WriteAllText($StatusFile, '{\"status\":\"running\",\"stage\":\"uv\"}')".to_string());
         if status.uv_available && !status.uv_path.is_empty() {
             lines.push("  Write-Host 'An outdated uv was found. The required version will be installed in the current user tool directory without changing the system installation.'".to_string());
         } else {
@@ -310,7 +310,7 @@ fn windows_runtime_install_script(
     }
     if !status.node_compatible || !status.npm_compatible {
         lines.extend([
-            "  $Stage = 'node'; ('{\"status\":\"running\",\"stage\":\"node\"}') | Set-Content -Encoding UTF8 $StatusFile".to_string(),
+            "  $Stage = 'node'; [IO.File]::WriteAllText($StatusFile, '{\"status\":\"running\",\"stage\":\"node\"}')".to_string(),
             format!("  $ArchiveName = {}", powershell_quote(&archive_name)),
             "  $Archive = Join-Path $env:TEMP $ArchiveName".to_string(),
             "  $Checksums = Join-Path $env:TEMP 'agentseek-node-SHASUMS256.txt'".to_string(),
@@ -335,7 +335,7 @@ fn windows_runtime_install_script(
     }
     if !status.cli_compatible || status.cli_update_available {
         lines.extend([
-            "  $Stage = 'agentseek'; ('{\"status\":\"running\",\"stage\":\"agentseek\"}') | Set-Content -Encoding UTF8 $StatusFile".to_string(),
+            "  $Stage = 'agentseek'; [IO.File]::WriteAllText($StatusFile, '{\"status\":\"running\",\"stage\":\"agentseek\"}')".to_string(),
             "  if (-not (Test-Path $UvBin)) { $UvBin = (Get-Command uv).Source }".to_string(),
             "  & $UvBin tool install --upgrade agentseek".to_string(),
             "  if ($LASTEXITCODE -ne 0) { throw \"AgentSeek CLI installation failed with exit code $LASTEXITCODE\" }".to_string(),
@@ -344,10 +344,10 @@ fn windows_runtime_install_script(
         ]);
     }
     lines.extend([
-        "  $Stage = 'complete'; '{\"status\":\"success\",\"stage\":\"complete\",\"code\":0}' | Set-Content -Encoding UTF8 $StatusFile".to_string(),
+        "  $Stage = 'complete'; [IO.File]::WriteAllText($StatusFile, '{\"status\":\"success\",\"stage\":\"complete\",\"code\":0}')".to_string(),
         "} catch {".to_string(),
         "  $Message = $_.Exception.Message.Replace('\\','\\\\').Replace('\"','\\\"')".to_string(),
-        "  ('{\"status\":\"failed\",\"stage\":\"' + $Stage + '\",\"code\":1,\"message\":\"' + $Message + '\"}') | Set-Content -Encoding UTF8 $StatusFile".to_string(),
+        "  [IO.File]::WriteAllText($StatusFile, ('{\"status\":\"failed\",\"stage\":\"' + $Stage + '\",\"code\":1,\"message\":\"' + $Message + '\"}'))".to_string(),
         "  Write-Error $_".to_string(),
         "} finally {".to_string(),
         "  Stop-Transcript".to_string(),
@@ -540,6 +540,19 @@ fn runtime_install_task_dir(state: &DesktopState, task_id: &str) -> Result<PathB
     Ok(state.data_dir.join("runtime-install").join(task_id))
 }
 
+/// Parse a runtime-install `status.json` body, tolerating a leading UTF-8 BOM.
+/// Windows PowerShell 5.1 (which runs `install.ps1`) writes the status file via
+/// `Set-Content -Encoding UTF8`, and on that engine the encoding emits a BOM.
+/// `str::trim` does not strip `U+FEFF`, so a bare `serde_json::from_str` would
+/// reject every stage update and leave progress stuck on "pending" and the
+/// completion poll unable to see "success" until a restart re-detected the
+/// already-installed runtime. macOS is unaffected because the POSIX script
+/// writes the same JSON with `printf`, which has no BOM.
+fn parse_runtime_install_status(content: &str) -> Option<serde_json::Value> {
+    let content = content.trim().trim_start_matches('\u{FEFF}').trim();
+    serde_json::from_str(content).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Runtime install commands
 // ---------------------------------------------------------------------------
@@ -554,7 +567,7 @@ async fn runtime_install_progress(
         let task_dir = runtime_install_task_dir(&state, &task_id)?;
         let status = fs::read_to_string(task_dir.join("status.json"))
             .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(content.trim()).ok())
+            .and_then(|content| parse_runtime_install_status(&content))
             .unwrap_or_else(|| serde_json::json!({"status": "pending", "stage": "pending"}));
         Ok(RuntimeInstallProgress {
             status: status
@@ -623,9 +636,7 @@ async fn execute_runtime_install(
                 std::thread::sleep(Duration::from_millis(500));
                 let status = fs::read_to_string(&status_path)
                     .ok()
-                    .and_then(|content| {
-                        serde_json::from_str::<serde_json::Value>(content.trim()).ok()
-                    })
+                    .and_then(|content| parse_runtime_install_status(&content))
                     .and_then(|status| {
                         status
                             .get("status")
@@ -649,8 +660,7 @@ async fn execute_runtime_install(
             let Ok(content) = fs::read_to_string(&status_path) else {
                 continue;
             };
-            let Ok(status): Result<serde_json::Value, _> = serde_json::from_str(content.trim())
-            else {
+            let Some(status) = parse_runtime_install_status(&content) else {
                 continue;
             };
             match status.get("status").and_then(serde_json::Value::as_str) {
@@ -898,5 +908,27 @@ mod tests_runtime_install {
                 "{variable} must remain available to the desktop terminal"
             );
         }
+    }
+
+    #[test]
+    fn status_json_tolerates_leading_utf8_bom() {
+        // Windows PowerShell 5.1's `Set-Content -Encoding UTF8` prefixes the
+        // status file with a BOM; str::trim does not strip U+FEFF, so parsing
+        // must remove it or every stage update is silently dropped.
+        let clean = "{\"status\":\"success\",\"stage\":\"complete\",\"code\":0}".to_string();
+        let with_bom = format!("\u{FEFF}{clean}");
+        let padded = format!("  {with_bom}  ");
+        for case in [clean.as_str(), with_bom.as_str(), padded.as_str()] {
+            let parsed = parse_runtime_install_status(case).expect("status json should parse");
+            assert_eq!(
+                parsed.get("status").and_then(serde_json::Value::as_str),
+                Some("success")
+            );
+            assert_eq!(
+                parsed.get("stage").and_then(serde_json::Value::as_str),
+                Some("complete")
+            );
+        }
+        assert!(parse_runtime_install_status("not json").is_none());
     }
 }
