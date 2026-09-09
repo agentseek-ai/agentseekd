@@ -165,6 +165,20 @@ fn configure_python_command(command: &mut Command) {
     }
 }
 
+/// Suppress the console window that Windows allocates for a console-subsystem
+/// child launched from the windowless GUI process (see main.rs). Without it,
+/// every console child (uv.exe, node.exe, where.exe, cmd.exe, python.exe) gets
+/// a fresh console that flashes on screen and closes on exit. A no-op on macOS
+/// and Linux, so it never changes command behavior off Windows.
+fn hide_console_window(_command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env("PATH", runtime_path());
@@ -174,19 +188,11 @@ fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     // External runtimes must not inherit Python or AppImage paths from the
     // desktop process. Those paths can point at a transient AppImage mount.
     configure_python_command(&mut command);
-    #[cfg(windows)]
-    {
-        // This app runs as a windowless GUI subsystem (see main.rs). Without
-        // CREATE_NO_WINDOW every console child (uv.exe, node.exe, where.exe,
-        // cmd.exe, curl.exe) is given a fresh console that flashes on screen
-        // and closes on exit. The dependency probe launches many of these in a
-        // row, which is exactly the repeated terminal popup seen on Windows.
-        // The install terminal is still shown because it is spawned through
-        // `start`, which always opens its own console.
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    // The dependency probe launches many console children in a row, which is
+    // exactly the repeated terminal popup seen on Windows. The install terminal
+    // is still shown because it is spawned through `start`, which always opens
+    // its own console.
+    hide_console_window(&mut command);
     command
 }
 
