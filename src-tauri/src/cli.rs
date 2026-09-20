@@ -1,6 +1,23 @@
 // CLI runtime detection: version comparison, dependency checking,
 // agentseek/uv program resolution, and CLI process execution.
 
+/// Candidate user-home directories, ordered. Windows GUI processes normally
+/// expose the profile through `USERPROFILE` instead of `HOME`, so tools the
+/// install script drops under `%USERPROFILE%\.local\bin` stay discoverable.
+/// On macOS/Linux only `HOME` is set, preserving the previous behavior.
+fn home_dirs() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = env::var_os(key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() && !homes.contains(&path) {
+                homes.push(path);
+            }
+        }
+    }
+    homes
+}
+
 fn runtime_path() -> std::ffi::OsString {
     let mut paths = Vec::new();
     if let Some(runtime_root) = env::var_os("AGENTSEEK_DESKTOP_RUNTIME_DIR") {
@@ -23,11 +40,11 @@ fn runtime_path() -> std::ffi::OsString {
     if let Some(managed_node_bin) = env::var_os("AGENTSEEK_DESKTOP_NODE_BIN") {
         paths.push(PathBuf::from(managed_node_bin));
     }
-    if let Some(home) = env::var_os("HOME") {
-        paths.push(PathBuf::from(&home).join(".local/bin"));
-        paths.push(PathBuf::from(&home).join(".cargo/bin"));
-        paths.push(PathBuf::from(&home).join(".pyenv/shims"));
-        paths.push(PathBuf::from(home).join(".pyenv/bin"));
+    for home in home_dirs() {
+        paths.push(home.join(".local").join("bin"));
+        paths.push(home.join(".cargo").join("bin"));
+        paths.push(home.join(".pyenv").join("shims"));
+        paths.push(home.join(".pyenv").join("bin"));
     }
     paths.extend([
         PathBuf::from("/opt/homebrew/bin"),
@@ -148,15 +165,45 @@ fn configure_python_command(command: &mut Command) {
     }
 }
 
+/// Suppress the console window that Windows allocates for a console-subsystem
+/// child launched from the windowless GUI process (see main.rs). Without it,
+/// every console child (uv.exe, node.exe, where.exe, cmd.exe, python.exe) gets
+/// a fresh console that flashes on screen and closes on exit. A no-op on macOS
+/// and Linux, so it never changes command behavior off Windows.
+fn hide_console_window(_command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env("PATH", runtime_path());
+    // Force child Python to write UTF-8 to redirected pipes. Without this,
+    // Windows uses the locale ANSI code page (GBK on zh-CN), so a single
+    // non-UTF-8 byte (e.g. a box-drawing separator in `create --describe`
+    // output) makes the capture below stop mid-stream and the parser sees
+    // truncated text. Setting these removes the need for a per-machine
+    // `setx PYTHONUTF8`. No-op off Windows.
+    #[cfg(windows)]
+    {
+        command.env("PYTHONUTF8", "1");
+        command.env("PYTHONIOENCODING", "utf-8");
+    }
     // Prevent Python from importing a local agentseek source tree
     // that may shadow the installed package when CWD contains agentseek/.
     command.current_dir(std::env::temp_dir());
     // External runtimes must not inherit Python or AppImage paths from the
     // desktop process. Those paths can point at a transient AppImage mount.
     configure_python_command(&mut command);
+    // The dependency probe launches many console children in a row, which is
+    // exactly the repeated terminal popup seen on Windows. The install terminal
+    // is still shown because it is spawned through `start`, which always opens
+    // its own console.
+    hide_console_window(&mut command);
     command
 }
 
@@ -375,10 +422,11 @@ fn uv_program() -> Option<String> {
         }
     }
     let mut candidates = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(&home).join(".local/bin/uv"));
-        candidates.push(PathBuf::from(&home).join(".cargo/bin/uv"));
-        candidates.push(PathBuf::from(home).join(".pyenv/shims/uv"));
+    let uv_name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    for home in home_dirs() {
+        candidates.push(home.join(".local").join("bin").join(uv_name));
+        candidates.push(home.join(".cargo").join("bin").join(uv_name));
+        candidates.push(home.join(".pyenv").join("shims").join(uv_name));
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/uv"),
@@ -702,14 +750,17 @@ fn run_cli_with_input(
     let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
     let stdout_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout_pipe.read_to_string(&mut s);
-        let _ = stdout_tx.send(s);
+        // Read raw bytes and decode lossily: a stray non-UTF-8 byte from the
+        // child would otherwise make `read_to_string` truncate the whole stream
+        // at that offset (Windows GBK pipes), silently dropping later sections.
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        let _ = stdout_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
     let stderr_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr_pipe.read_to_string(&mut s);
-        let _ = stderr_tx.send(s);
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        let _ = stderr_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
 
     // Poll with timeout (10 minutes) to prevent infinite hang on EOF deadlock.
@@ -823,6 +874,23 @@ mod tests_cli {
 
         for variable in PYTHON_CHILD_ENV_VARS {
             assert!(removed.contains(variable), "{variable} should be removed");
+        }
+    }
+
+    #[test]
+    fn home_dirs_are_non_empty_and_deduplicated() {
+        let homes = home_dirs();
+        for home in &homes {
+            assert!(!home.as_os_str().is_empty(), "home_dirs must drop empty values");
+        }
+        let unique: HashSet<_> = homes.iter().collect();
+        assert_eq!(unique.len(), homes.len(), "home_dirs must not repeat a directory");
+        // When HOME is present it must lead, so macOS/Linux resolution keeps
+        // preferring the shell home before the Windows USERPROFILE fallback.
+        if let Some(home) = env::var_os("HOME") {
+            if !home.is_empty() {
+                assert_eq!(homes.first(), Some(&PathBuf::from(home)));
+            }
         }
     }
 

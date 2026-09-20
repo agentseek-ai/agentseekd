@@ -37,6 +37,10 @@
 #
 # Optional (templates are skipped if the corresponding secret is missing):
 #   TAVILY_API_KEY        — deepagents/research (Tavily search, free tier available)
+#   POWERCONTEXT_URL      — deepagents/powercontext (external PowerContext Server
+#                           started by its `powercontext server run` lifecycle task
+#                           on port 8000; the mock API only replaces the LLM, not
+#                           that server, so the template is skipped without a URL)
 #
 # Notes:
 #   langchain/agentic-rag-openvino — runs in CI (model download is supported,
@@ -243,6 +247,11 @@ TEMPLATE_OVERRIDES=(
   # would pick the wrong graph (e.g. cookiecutter variables not yet rendered).
   "bub/default|bub|||||"
   "deepagents/default|bub|||||"
+  # PowerContext needs an external PowerContext Server (its `powercontext server
+  # run` lifecycle task pulls powercontext==1.0.0 from PyPI and binds port 8000);
+  # the mock API only replaces the LLM, not that server. Gate on POWERCONTEXT_URL
+  # so mock CI skips it and it runs only when a real server URL is provided.
+  "deepagents/powercontext|langgraph||0|POWERCONTEXT_URL||"
   "deepagents/streaming|langgraph||0|||"
   "deepagents/subagents-dynamic|langgraph||0|||"
   "deepagents/research|langgraph||0|TAVILY_API_KEY||"
@@ -279,6 +288,7 @@ FALLBACK_TEMPLATES=(
   "deepagents/streaming|langgraph||0|||"
   "deepagents/subagents-dynamic|langgraph||0|||"
   "deepagents/mcp|langgraph||0|||"
+  "deepagents/powercontext|langgraph||0|POWERCONTEXT_URL||"
   "deepagents/research|langgraph||0|TAVILY_API_KEY||"
   "deepagents/sandbox|langgraph||0|DAYTONA_API_KEY||"
   "deepagents/content-builder|langgraph||0|||"

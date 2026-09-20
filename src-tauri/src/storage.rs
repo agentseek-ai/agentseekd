@@ -126,6 +126,10 @@ impl SeekDbBridge {
         fs::write(&helper, SEEKDB_STORAGE_HELPER).map_err(|error| error.to_string())?;
         let mut command = Command::new(&python);
         configure_python_command(&mut command);
+        // The seekdb bridge runs the private venv's python.exe, a console child.
+        // Without this the windowless GUI process flashes a terminal every time
+        // the bridge starts (e.g. on storage init/connect). No-op on macOS/Linux.
+        hide_console_window(&mut command);
         let mut child = command
             .arg(&helper)
             .arg(config_path)

@@ -536,6 +536,213 @@ fn restore_non_loopback_url_defaults(work_dir: &str, entries: &mut [EnvVariable]
     }
 }
 
+/// Outcome of probing a PowerContext Server health endpoint on a loopback port.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PowerContextProbe {
+    /// HTTP 2xx from `/health/ready` — a real PowerContext Server is listening.
+    Ready,
+    /// Nothing is listening (connection refused) — the port is free.
+    Free,
+    /// Something else answers (non-2xx / non-HTTP / read timeout) — a foreign
+    /// process occupies the port.
+    Foreign,
+}
+
+/// Pure decision behind the PowerContext port adaptation: only a loopback URL
+/// whose port is held by a *foreign* process must move. A real PowerContext
+/// server (Ready) is reused in place, a free port (Free) is left for the
+/// server to self-bootstrap, and remote (non-loopback) URLs are never
+/// relocated here (they must be started externally).
+fn powercontext_port_needs_reallocation(is_loopback: bool, probe: PowerContextProbe) -> bool {
+    matches!(probe, PowerContextProbe::Foreign) && is_loopback
+}
+
+/// Probe `http://{host}:{port}/health/ready` with a short timeout, mirroring the
+/// PowerContext startup script's own readiness check. Loopback-only: the server
+/// binds exactly the port encoded in `POWERCONTEXT_URL`, so this is how the
+/// desktop tells "reuse a running server" from "port is free" from "some other
+/// process holds it".
+fn probe_powercontext_health(host: &str, port: u16) -> PowerContextProbe {
+    let timeout = Duration::from_millis(1500);
+    // 0.0.0.0 / :: are wildcard bind addresses, not valid connect targets.
+    let connect_host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    let addrs: Vec<SocketAddr> = match (connect_host, port).to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(_) => return PowerContextProbe::Foreign,
+    };
+    let mut stream = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            // Nothing bound on this loopback port -> free (server will bind it).
+            Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return PowerContextProbe::Free;
+            }
+            Err(_) => continue,
+        }
+    }
+    let mut stream = match stream {
+        Some(stream) => stream,
+        None => return PowerContextProbe::Foreign,
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let authority = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+    let request = format!(
+        "GET /health/ready HTTP/1.1\r\nHost: {}\r\nUser-Agent: agentseek-desktop\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        authority
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return PowerContextProbe::Foreign;
+    }
+    let mut buffer = [0u8; 128];
+    let received = match stream.read(&mut buffer) {
+        Ok(0) | Err(_) => return PowerContextProbe::Foreign,
+        Ok(count) => buffer[..count].to_vec(),
+    };
+    let head = String::from_utf8_lossy(&received);
+    // Status line looks like "HTTP/1.1 200 OK"; a 2xx means a live server that
+    // answers the readiness route, which the template only serves from PowerContext.
+    let status_code = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    match status_code {
+        Some(code) if (200..300).contains(&code) => PowerContextProbe::Ready,
+        _ => PowerContextProbe::Foreign,
+    }
+}
+
+/// Button-only PowerContext port adaptation.
+///
+/// The generic lifecycle resolver treats `POWERCONTEXT_URL` as a downstream
+/// slave of `[services.powercontext]` and always rebases it to that service's
+/// resolved port, ignoring the port the user configured. PowerContext is
+/// special: its server binds exactly the port encoded in `POWERCONTEXT_URL`, so
+/// that URL must be authoritative. Given the user's original URL, decide the
+/// final port via a `/health/ready` probe, then write the decision back into the
+/// env entries, patch `[services.powercontext]` in lifecycle.toml (so the UI
+/// endpoint list and stop/teardown target the right port), and record a
+/// `PortChange` when the port actually moved.
+fn adapt_powercontext_port(
+    entries: &mut Vec<EnvVariable>,
+    lifecycle_path: &Path,
+    original_url: Option<&str>,
+    changes: &mut Vec<PortChange>,
+) -> Result<(), String> {
+    let Some(original) = original_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(configured_port) = extract_url_port(original) else {
+        return Ok(());
+    };
+    let is_loopback = LOOPBACK_URL_PREFIXES
+        .iter()
+        .any(|prefix| original.starts_with(prefix));
+    let host = url_host(original).unwrap_or("127.0.0.1");
+
+    let final_port = if is_loopback {
+        let probe = probe_powercontext_health(host, configured_port);
+        if powercontext_port_needs_reallocation(is_loopback, probe) {
+            // Avoid colliding with ports already claimed by this instance's other
+            // services (recorded changes plus any *_PORT / loopback URL values).
+            let mut used: HashSet<u16> = changes.iter().map(|change| change.new_port).collect();
+            for entry in entries.iter() {
+                let key = entry.key.to_ascii_uppercase();
+                if key.eq_ignore_ascii_case("POWERCONTEXT_PORT")
+                    || key.eq_ignore_ascii_case("POWERCONTEXT_URL")
+                {
+                    continue;
+                }
+                if let Some(port) = entry
+                    .value
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .or_else(|| extract_url_port(&entry.value))
+                {
+                    used.insert(port);
+                }
+            }
+            let mut replacement = available_ephemeral_port()?;
+            while !port_is_available(replacement) || used.contains(&replacement) {
+                replacement = available_ephemeral_port()?;
+            }
+            replacement
+        } else {
+            configured_port
+        }
+    } else {
+        // Remote endpoint: honor the explicit user configuration untouched.
+        configured_port
+    };
+
+    let moved = final_port != configured_port;
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.key.eq_ignore_ascii_case("POWERCONTEXT_URL"))
+    {
+        // Restore the authoritative URL (undoing the generic rebase) and apply
+        // the probed decision.
+        let updated = replace_url_port(original, final_port);
+        if updated != entry.value {
+            entry.value = updated;
+            entry.modified = true;
+        }
+    }
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.key.eq_ignore_ascii_case("POWERCONTEXT_PORT"))
+    {
+        let value = final_port.to_string();
+        if entry.value != value {
+            entry.value = value;
+            entry.modified = true;
+        }
+    }
+
+    // Keep lifecycle.toml's [services.powercontext] URL aligned with the decision
+    // for UI display and stop/teardown consistency.
+    if let Ok(content) = fs::read_to_string(lifecycle_path) {
+        if let Ok(manifest) = toml::from_str::<LifecycleManifest>(&content) {
+            if let Some(service) = manifest.services.get("powercontext") {
+                let current_port = extract_url_port(&service.url).unwrap_or(0);
+                if current_port != 0 && current_port != final_port {
+                    let new_url = replace_url_port(&service.url, final_port);
+                    let updated = content.replace(&service.url, &new_url);
+                    if updated != content {
+                        fs::write(lifecycle_path, &updated)
+                            .map_err(|error| format!("Failed to write {}: {error}", lifecycle_path.display()))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Drop the generic resolver's (mis)resolution for powercontext and report
+    // only the authoritative move, if any.
+    changes.retain(|change| !change.key.eq_ignore_ascii_case("POWERCONTEXT_PORT"));
+    if moved {
+        changes.push(PortChange {
+            key: "POWERCONTEXT_PORT".to_string(),
+            old_port: configured_port,
+            new_port: final_port,
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn save_instance_env(
     state: State<'_, DesktopState>,
@@ -552,8 +759,17 @@ fn save_instance_env(
     // Drop rows whose key is empty (e.g. a row added on the client and left
     // blank); otherwise render_env would write a broken "=value" line.
     entries.retain(|entry| !entry.key.trim().is_empty());
+    // PowerContext binds exactly the port encoded in POWERCONTEXT_URL (see the
+    // template's powercontext_server.py), so that URL must be authoritative. The
+    // generic resolver below rebases it to the [services.powercontext] port and
+    // ignores the configured value; capture it first so the dedicated adaptation
+    // can decide keep/reuse/reallocate from the user's actual URL.
+    let powercontext_url = entries
+        .iter()
+        .find(|entry| entry.key.eq_ignore_ascii_case("POWERCONTEXT_URL"))
+        .map(|entry| entry.value.clone());
     let lifecycle_path = Path::new(&instance.work_dir).join(".agentseek/lifecycle.toml");
-    let port_changes = if deployment_completed || !lifecycle_path.is_file() {
+    let mut port_changes = if deployment_completed || !lifecycle_path.is_file() {
         if !deployment_completed {
             resolve_port_conflicts(&mut entries)?
         } else {
@@ -568,6 +784,14 @@ fn save_instance_env(
     } else {
         resolve_and_sync_lifecycle_ports(&instance, &lifecycle_path, &state, &mut entries)?
     };
+    // Button-only PowerContext adaptation: probe the configured URL's
+    // /health/ready and only move the port when a foreign process holds it.
+    adapt_powercontext_port(
+        &mut entries,
+        &lifecycle_path,
+        powercontext_url.as_deref(),
+        &mut port_changes,
+    )?;
     // Ensure LangSmith tracing is disabled by default to prevent 403 Forbidden
     // warnings from langgraph_api.metadata when no LANGCHAIN_API_KEY is configured.
     // Respect user's explicit LANGSMITH_TRACING setting if present in .env.
@@ -1376,5 +1600,17 @@ mod tests_env {
             "user-customized remote endpoint must be kept"
         );
         assert_eq!(endpoint.source, "vault");
+    }
+
+    #[test]
+    fn powercontext_port_needs_reallocation_matrix() {
+        // A real PowerContext server (Ready) or a free port (Free) is always kept.
+        assert!(!powercontext_port_needs_reallocation(true, PowerContextProbe::Ready));
+        assert!(!powercontext_port_needs_reallocation(true, PowerContextProbe::Free));
+        assert!(!powercontext_port_needs_reallocation(false, PowerContextProbe::Ready));
+        // Only a foreign occupant on a loopback URL forces a reallocation; a remote
+        // URL is never relocated by the desktop.
+        assert!(powercontext_port_needs_reallocation(true, PowerContextProbe::Foreign));
+        assert!(!powercontext_port_needs_reallocation(false, PowerContextProbe::Foreign));
     }
 }

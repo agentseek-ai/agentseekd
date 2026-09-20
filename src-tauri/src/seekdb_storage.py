@@ -28,9 +28,52 @@ DEFAULT_PORT = 2881
 DEFAULT_DATABASE = "agentseek_desktop"
 DEFAULT_USER = "root"
 
+# Statement size guards. The embedded engine builds one SQL statement per call, and
+# its plan-generation memory grows superlinearly with an `IN` list, so a bulk delete
+# of the full log history trips "Exceed query memory limit" (error 11049).
+MAX_IDS_PER_STATEMENT = 500
+MAX_ROWS_PER_STATEMENT = 200
+MAX_PAYLOAD_BYTES_PER_STATEMENT = 4 * 1024 * 1024
+
 
 def respond(**payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def id_batches(ids):
+    unique = list(dict.fromkeys(ids))
+    for start in range(0, len(unique), MAX_IDS_PER_STATEMENT):
+        yield unique[start:start + MAX_IDS_PER_STATEMENT]
+
+
+def delete_in_batches(collection, ids):
+    for batch in id_batches(ids):
+        collection.delete(ids=batch)
+
+
+def row_batches(rows):
+    """Chunk (id, payload) pairs by row count and by estimated statement size."""
+    batch = []
+    budget = 0
+    for row_id, payload in rows:
+        size = len(payload) + 64
+        if batch and (
+            len(batch) >= MAX_ROWS_PER_STATEMENT or budget + size > MAX_PAYLOAD_BYTES_PER_STATEMENT
+        ):
+            yield batch
+            batch, budget = [], 0
+        batch.append((row_id, payload))
+        budget += size
+    if batch:
+        yield batch
+
+
+def upsert_in_batches(collection, rows):
+    for batch in row_batches(rows):
+        collection.upsert(
+            ids=[row_id for row_id, _ in batch],
+            metadatas=[{"payload": payload} for _, payload in batch],
+        )
 
 
 def open_client(config):
@@ -110,23 +153,19 @@ def read_logs(collection):
 
 def replace_collection(collection, rows, id_field):
     existing = collection.get(include=["metadatas"])
-    if existing.get("ids"):
-        collection.delete(ids=existing["ids"])
+    delete_in_batches(collection, existing.get("ids") or [])
     if not rows:
         return
-    ids = []
-    metadatas = []
+    prepared = []
     for index, row in enumerate(rows):
         stable_id = row.get(id_field) if id_field else None
-        ids.append(str(stable_id or f"row-{index:08d}"))
-        metadatas.append({"payload": json.dumps(row, ensure_ascii=False)})
-    collection.upsert(ids=ids, metadatas=metadatas)
+        prepared.append((str(stable_id or f"row-{index:08d}"), json.dumps(row, ensure_ascii=False)))
+    upsert_in_batches(collection, prepared)
 
 
 def clear_collection(collection):
     existing = collection.get(include=["metadatas"])
-    if existing.get("ids"):
-        collection.delete(ids=existing["ids"])
+    delete_in_batches(collection, existing.get("ids") or [])
 
 
 def load_domain_data(collections, legacy):
@@ -273,21 +312,18 @@ def main():
                     )[:remove_limit]
                     candidate_ids = {item["id"] for item in candidates}
                     removed_ids.extend(candidate_ids)
-                if removed_ids:
-                    collections["logs"].delete(ids=list(set(removed_ids)))
-                respond(ok=True, removed=len(set(removed_ids)))
+                unique_removed = list(dict.fromkeys(removed_ids))
+                delete_in_batches(collections["logs"], unique_removed)
+                respond(ok=True, removed=len(unique_removed))
             elif request["op"] == "clear_logs":
                 clear_collection(collections["logs"])
                 respond(ok=True)
             elif request["op"] == "append_logs":
                 entries = request.get("entries") or []
-                if entries:
-                    collections["logs"].upsert(
-                        ids=[entry["id"] for entry in entries],
-                        metadatas=[
-                            {"payload": json.dumps(entry, ensure_ascii=False)} for entry in entries
-                        ],
-                    )
+                upsert_in_batches(
+                    collections["logs"],
+                    [(entry["id"], json.dumps(entry, ensure_ascii=False)) for entry in entries],
+                )
                 respond(ok=True)
             elif request["op"] == "append_log":
                 entry = request["entry"]
@@ -295,9 +331,7 @@ def main():
                     ids=[entry["id"]],
                     metadatas=[{"payload": json.dumps(entry, ensure_ascii=False)}],
                 )
-                removed_ids = request.get("removedIds") or []
-                if removed_ids:
-                    collections["logs"].delete(ids=removed_ids)
+                delete_in_batches(collections["logs"], request.get("removedIds") or [])
                 respond(ok=True)
             elif request["op"] == "upsert_instance":
                 instance = request["instance"]
@@ -313,8 +347,7 @@ def main():
                 replace_collection(collections["vault"], request.get("entries", []), None)
                 respond(ok=True)
             elif request["op"] == "delete_logs":
-                if request.get("ids"):
-                    collections["logs"].delete(ids=request["ids"])
+                delete_in_batches(collections["logs"], request.get("ids") or [])
                 respond(ok=True)
             elif request["op"] == "ping":
                 for collection in collections.values():
