@@ -68,8 +68,16 @@ fn frontend_display_name(template_dir: &Path) -> Option<String> {
 }
 
 /// Return the template cache directory path.
+///
+/// Windows GUI processes expose the user profile through `USERPROFILE` rather
+/// than `HOME`, so resolve the home via [`home_dirs`] (HOME → USERPROFILE)
+/// instead of reading `HOME` alone — otherwise the template cache cannot be
+/// located on Windows and the template list stays empty.
 fn template_cache_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| Path::new(&home).join(".cookiecutters").join("agentseek"))
+    home_dirs()
+        .into_iter()
+        .next()
+        .map(|home| home.join(".cookiecutters").join("agentseek"))
 }
 
 /// Read templates directly from the cached `templates/index.json`.
@@ -281,7 +289,7 @@ fn template_cache_commit_sha() -> Option<String> {
 /// - If `checkout` is empty: try latest GitHub release tag → fall back to `main` branch.
 fn clone_template_repo(repo_url: &str, checkout: &str) -> Result<(), String> {
     let Some(cache_dir) = template_cache_dir() else {
-        return Err("HOME environment variable is not set".to_string());
+        return Err("Could not determine the user home directory (HOME/USERPROFILE not set)".to_string());
     };
     let effective_ref: String;
     let effective_ref: &str = if !checkout.is_empty() {
