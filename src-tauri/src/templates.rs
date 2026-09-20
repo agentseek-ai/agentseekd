@@ -27,6 +27,46 @@ fn display_name(template_id: &str) -> String {
         .join(" ")
 }
 
+/// Locate a template's `frontend/package.json`, tolerating the literal
+/// `{{cookiecutter.project_slug}}` project folder that wraps the rendered tree.
+fn find_frontend_package_json(root: &Path, max_depth: usize) -> Option<PathBuf> {
+    if max_depth == 0 {
+        return None;
+    }
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().is_some_and(|name| name == "frontend") {
+            let manifest = path.join("package.json");
+            if manifest.is_file() {
+                return Some(manifest);
+            }
+        }
+        if let Some(found) = find_frontend_package_json(&path, max_depth - 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Read the branded `displayName` from a template's frontend `package.json`.
+///
+/// Returns `None` when the template has no frontend, the manifest is missing
+/// or unreadable, or the name is blank / still carries Cookiecutter
+/// expressions; callers then fall back to the ID-derived [`display_name`].
+fn frontend_display_name(template_dir: &Path) -> Option<String> {
+    let manifest = find_frontend_package_json(template_dir, 4)?;
+    let raw = fs::read_to_string(&manifest).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let name = value.get("displayName").and_then(|v| v.as_str())?.trim();
+    if name.is_empty() || name.contains("{{") || name.contains("{%") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Return the template cache directory path.
 fn template_cache_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| Path::new(&home).join(".cookiecutters").join("agentseek"))
@@ -38,10 +78,9 @@ fn template_cache_dir() -> Option<PathBuf> {
 /// internally: the registry is `templates/index.json` keyed by `<type>/<name>`
 /// with the description as the value.
 fn read_template_index() -> Result<Vec<TemplateInfo>, String> {
-    let index_path = template_cache_dir()
-        .ok_or_else(|| "Cannot determine template cache directory".to_string())?
-        .join("templates")
-        .join("index.json");
+    let cache_dir = template_cache_dir()
+        .ok_or_else(|| "Cannot determine template cache directory".to_string())?;
+    let index_path = cache_dir.join("templates").join("index.json");
     let raw = fs::read_to_string(&index_path)
         .map_err(|e| format!("Failed to read templates/index.json: {e}"))?;
     let map: HashMap<String, String> = serde_json::from_str(&raw)
@@ -50,9 +89,14 @@ fn read_template_index() -> Result<Vec<TemplateInfo>, String> {
         .into_iter()
         .map(|(id, description)| {
             let framework = id.split('/').next().unwrap_or_default().to_string();
+            // Prefer the branded displayName from the template's frontend
+            // package.json; fall back to the ID-derived label when there is
+            // no frontend or the metadata is missing/invalid.
+            let name = frontend_display_name(&cache_dir.join("templates").join(&id))
+                .unwrap_or_else(|| display_name(&id));
             TemplateInfo {
                 id: id.clone(),
-                name: display_name(&id),
+                name,
                 description,
                 framework,
             }
@@ -1050,6 +1094,43 @@ mod tests_templates {
         assert_eq!(cfg.repo_url, "https://github.com/agentseek-ai/agentseek-templates.git");
         assert!(cfg.checkout.is_empty());
         assert!(cfg.catalog_url.is_empty());
+    }
+
+    #[test]
+    fn frontend_display_name_reads_branded_label() {
+        let dir = patch_test_dir("tpl-display");
+        let frontend = dir.join("{{cookiecutter.project_slug}}").join("frontend");
+        fs::create_dir_all(&frontend).expect("mkdir frontend");
+        fs::write(
+            frontend.join("package.json"),
+            r#"{ "name": "x-frontend", "displayName": "Deep Agents PowerContext" }"#,
+        )
+        .expect("write manifest");
+        assert_eq!(
+            frontend_display_name(&dir).as_deref(),
+            Some("Deep Agents PowerContext")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frontend_display_name_falls_back_when_missing_or_invalid() {
+        // No frontend at all.
+        let dir = patch_test_dir("tpl-display-none");
+        assert_eq!(frontend_display_name(&dir), None);
+
+        // Blank name falls back to the ID-derived label.
+        let frontend = dir.join("{{cookiecutter.project_slug}}").join("frontend");
+        fs::create_dir_all(&frontend).expect("mkdir frontend");
+        let manifest = frontend.join("package.json");
+        fs::write(&manifest, r#"{ "displayName": "   " }"#).expect("write blank");
+        assert_eq!(frontend_display_name(&dir), None);
+
+        // Unrendered Cookiecutter expression is rejected.
+        fs::write(&manifest, r#"{ "displayName": "{{ cookiecutter.brand }}" }"#)
+            .expect("write templated");
+        assert_eq!(frontend_display_name(&dir), None);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
