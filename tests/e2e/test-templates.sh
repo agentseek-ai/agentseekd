@@ -73,6 +73,14 @@ SKIP_CI_ONLY="${SKIP_CI_ONLY:-0}"
 MOCK_API_PORT="${MOCK_API_PORT:-8899}"
 TEST_MESSAGE="Hello, what can you help me with?"
 
+# Templates skipped unconditionally, regardless of environment or flags.
+# Auto-discovery still lists them; test_template short-circuits to SKIPPED
+# before creating an instance. Add a template here when it is known-broken or
+# depends on services that no environment (CI or local) can currently provide.
+SKIP_TEMPLATES=(
+  "langchain/jev-harness"
+)
+
 # Track mock server PID for cleanup.
 MOCK_API_PID=""
 
@@ -1022,6 +1030,16 @@ test_template() {
   local instance_dir="${E2E_WORK_DIR}/${instance_name}"
 
   log_step "Testing template: $tpl_id"
+
+  # Honor the explicit skip list before doing any work.
+  local skip_id
+  for skip_id in "${SKIP_TEMPLATES[@]}"; do
+    if [[ "$skip_id" == "$tpl_id" ]]; then
+      log_warn "  Skipping (listed in SKIP_TEMPLATES)"
+      SKIPPED+=("$tpl_id (explicitly skipped)")
+      return 0
+    fi
+  done
 
   # Skip templates that need local hardware or external services.
   if [[ -n "$ci_only_skip" ]]; then
