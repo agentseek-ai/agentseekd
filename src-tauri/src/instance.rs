@@ -919,9 +919,7 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord, truncate:
     command
         .args(&prefix)
         .args(["dev"])
-        .current_dir(&instance.work_dir)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .current_dir(&instance.work_dir);
     let environment_summary = runtime_environment_summary(&environment);
     if !environment_summary.is_empty() {
         state.log(
@@ -935,24 +933,169 @@ fn spawn_instance(state: &DesktopState, instance: &mut InstanceRecord, truncate:
             None,
         );
     }
-    #[cfg(unix)]
+    // On Windows the desktop suppresses the console (CREATE_NO_WINDOW) and
+    // captures output through redirected handles, so the dev tree has no real
+    // console. Frameworks that build a Win32 console object at startup (e.g.
+    // prompt_toolkit via `bub gateway`'s CLI channel) crash with
+    // NoConsoleScreenBufferError, and `concurrently -k` tears the whole group
+    // down. Running the tree inside a hidden ConPTY pseudo-console gives every
+    // descendant a real console while we still merge output into the log spool.
+    #[cfg(windows)]
     {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        let _ = stderr;
+        spawn_dev_on_conpty(state, instance, &command, stdout, truncate)
     }
-    let mut child = command.spawn().map_err(|error| {
-        if truncate {
-            remove_runtime_log_spool(state, &instance.id);
+    #[cfg(not(windows))]
+    {
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
-        format!(
-            "Failed to start instance: cannot execute {} (working directory: {}): {}",
-            program, instance.work_dir, error
+        let mut child = command.spawn().map_err(|error| {
+            if truncate {
+                remove_runtime_log_spool(state, &instance.id);
+            }
+            format!(
+                "Failed to start instance: cannot execute {} (working directory: {}): {}",
+                program, instance.work_dir, error
+            )
+        })?;
+        instance.pid = Some(child.id());
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+}
+
+/// Windows only: record a ConPTY startup failure in the instance log (cleaning
+/// up the spool when this was a fresh start) and return the message as `Err`.
+#[cfg(windows)]
+fn conpty_startup_failure(
+    state: &DesktopState,
+    instance: &InstanceRecord,
+    truncate: bool,
+    message: String,
+) -> String {
+    if truncate {
+        remove_runtime_log_spool(state, &instance.id);
+    }
+    state.log(
+        Some(&instance.id),
+        &instance.name,
+        "install",
+        "error",
+        &message,
+        None,
+    );
+    message
+}
+
+/// Windows only: spawn `agentseek dev` attached to a hidden ConPTY so its whole
+/// descendant tree inherits a real console (fixing `NoConsoleScreenBufferError`
+/// in prompt_toolkit-based gateways). The merged stdout/stderr is streamed into
+/// the same runtime log spool file the non-Windows path writes to, so the log
+/// centre and failure tail keep working.
+#[cfg(windows)]
+fn spawn_dev_on_conpty(
+    state: &DesktopState,
+    instance: &mut InstanceRecord,
+    command: &Command,
+    log_file: fs::File,
+    truncate: bool,
+) -> Result<(), String> {
+    use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize, PtySystem};
+    use std::io::{Read, Write};
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 50,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| {
+            conpty_startup_failure(
+                state,
+                instance,
+                truncate,
+                format!("Failed to create ConPTY for instance dev: {error}"),
+            )
+        })?;
+
+    // Rebuild the fully-configured std::Command into a CommandBuilder so the
+    // ConPTY spawn inherits the same program/args/env/cwd (PATH override,
+    // python-env removals and the instance .env were applied earlier).
+    let mut builder = CommandBuilder::new(command.get_program());
+    for arg in command.get_args() {
+        builder.arg(arg);
+    }
+    builder.cwd(&instance.work_dir);
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => builder.env(key, value),
+            None => builder.env_remove(key),
+        }
+    }
+    // Colours are stripped for display anyway; keep the stream plain UTF-8.
+    builder.env("PYTHONUTF8", "1");
+    builder.env("PYTHONIOENCODING", "utf-8");
+    builder.env("NO_COLOR", "1");
+
+    let mut child = pair.slave.spawn_command(builder).map_err(|error| {
+        conpty_startup_failure(
+            state,
+            instance,
+            truncate,
+            format!("Failed to spawn instance dev under ConPTY: {error}"),
         )
     })?;
-    instance.pid = Some(child.id());
+    let pid = child.process_id().ok_or_else(|| {
+        conpty_startup_failure(
+            state,
+            instance,
+            truncate,
+            "ConPTY dev process reported no pid".to_string(),
+        )
+    })?;
+    instance.pid = Some(pid);
+
+    let mut reader = pair.master.try_clone_reader().map_err(|error| {
+        conpty_startup_failure(
+            state,
+            instance,
+            truncate,
+            format!("Failed to open ConPTY reader: {error}"),
+        )
+    })?;
+    // Keep the master end alive for the child's lifetime so the pseudo-console
+    // is not torn down while the process tree is running.
+    let master = pair.master;
+
     std::thread::spawn(move || {
+        let _master = master;
+        let mut file = log_file;
+        let mut buffer = [0u8; 8 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if file.write_all(&buffer[..n]).is_err() || file.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
         let _ = child.wait();
     });
+
     Ok(())
 }
 

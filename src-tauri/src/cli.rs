@@ -182,6 +182,17 @@ fn hide_console_window(_command: &mut Command) {
 fn configured_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     command.env("PATH", runtime_path());
+    // Force child Python to write UTF-8 to redirected pipes. Without this,
+    // Windows uses the locale ANSI code page (GBK on zh-CN), so a single
+    // non-UTF-8 byte (e.g. a box-drawing separator in `create --describe`
+    // output) makes the capture below stop mid-stream and the parser sees
+    // truncated text. Setting these removes the need for a per-machine
+    // `setx PYTHONUTF8`. No-op off Windows.
+    #[cfg(windows)]
+    {
+        command.env("PYTHONUTF8", "1");
+        command.env("PYTHONIOENCODING", "utf-8");
+    }
     // Prevent Python from importing a local agentseek source tree
     // that may shadow the installed package when CWD contains agentseek/.
     command.current_dir(std::env::temp_dir());
@@ -739,14 +750,17 @@ fn run_cli_with_input(
     let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
     let stdout_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout_pipe.read_to_string(&mut s);
-        let _ = stdout_tx.send(s);
+        // Read raw bytes and decode lossily: a stray non-UTF-8 byte from the
+        // child would otherwise make `read_to_string` truncate the whole stream
+        // at that offset (Windows GBK pipes), silently dropping later sections.
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        let _ = stdout_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
     let stderr_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr_pipe.read_to_string(&mut s);
-        let _ = stderr_tx.send(s);
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        let _ = stderr_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
 
     // Poll with timeout (10 minutes) to prevent infinite hang on EOF deadlock.
