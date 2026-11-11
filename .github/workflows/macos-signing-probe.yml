@@ -1,0 +1,75 @@
+name: macOS signing probe
+
+on:
+  push:
+    branches: [codex/macos-signing-probe-20261111]
+    paths: [.github/workflows/macos-signing-probe.yml]
+
+permissions: {}
+
+jobs:
+  probe:
+    name: Sign and notarize Hello World
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Verify Developer ID signing and Apple notarization
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for secret_name in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD \
+                             APPLE_SIGNING_IDENTITY APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!secret_name}" ]]; then
+              printf 'Missing repository secret %s\n' "$secret_name" >&2
+              exit 1
+            fi
+          done
+
+          probe_dir=$(mktemp -d "$RUNNER_TEMP/macos-signing-probe.XXXXXXXX")
+          keychain="$probe_dir/probe.keychain-db"
+          trap 'security delete-keychain "$keychain" >/dev/null 2>&1 || true; rm -rf "$probe_dir"' EXIT
+          keychain_password=$(openssl rand -hex 32)
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$probe_dir/signing.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$probe_dir/signing.p12" -k "$keychain" \
+            -f pkcs12 -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$probe_dir/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+
+          printf '%s\n' '#include <stdio.h>' 'int main(void) { return puts("Hello World") < 0; }' > "$probe_dir/hello.c"
+          xcrun clang -Wall -Wextra -Werror "$probe_dir/hello.c" -o "$probe_dir/hello"
+          codesign --force --options runtime --timestamp --identifier org.agentseek.signing-probe \
+            --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$probe_dir/hello"
+          codesign --verify --strict "$probe_dir/hello"
+          signature=$(codesign -d --verbose=4 "$probe_dir/hello" 2>&1)
+          printf '%s\n' "$signature" | awk -v team="$APPLE_TEAM_ID" '
+            /^Authority=Developer ID Application:/ { developer_id = 1 }
+            $0 == "TeamIdentifier=" team { matching_team = 1 }
+            /^CodeDirectory .*flags=.*\(.*runtime/ { runtime = 1 }
+            /^Timestamp=/ { timestamp = 1 }
+            END { exit !(developer_id && matching_team && runtime && timestamp) }
+          '
+          test "$("$probe_dir/hello")" = "Hello World"
+          printf '%s\n' 'Developer ID signature, Team ID, hardened runtime, timestamp, and execution verified.' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          ditto -c -k --norsrc --keepParent "$probe_dir/hello" "$probe_dir/hello.zip"
+          notary_auth=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD")
+          xcrun notarytool submit "$probe_dir/hello.zip" "${notary_auth[@]}" \
+            --output-format json > "$probe_dir/submission.json"
+          submission_id=$(jq -er '.id | select(type == "string" and test("^[a-fA-F0-9-]{36}$"))' "$probe_dir/submission.json")
+          printf 'Apple notarization submission %s\n' "$submission_id" | tee -a "$GITHUB_STEP_SUMMARY"
+          xcrun notarytool wait "$submission_id" "${notary_auth[@]}" \
+            --timeout 15m --output-format json > "$probe_dir/result.json"
+          status=$(jq -er '.status' "$probe_dir/result.json")
+          printf 'Apple notarization status %s\n' "$status" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$status" = Accepted
